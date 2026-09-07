@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "modules": [
+    {
+      "id": "01",
+      "eyebrow": "discovery",
+      "icon": "travel_explore",
+      "description": "Subdomain Intel",
+      "bin": "amass",
+      "path": "amass",
+      "target_summary": "PROJECT SET",
+      "target_example": "acme.example",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Passive discovery",
+          "options": [
+            {"label": "Recursive", "value": "DISABLED"},
+            {"label": "Resolvers", "value": "DEFAULT"},
+            {"label": "Timeout", "value": "30m"}
+          ],
+          "command": [
+            {"type": "tool", "text": "amass"},
+            {"type": "argument", "text": " enum -d "},
+            {"type": "target", "text": "acme.example"},
+            {"type": "argument", "text": " -passive"}
+          ]
+        },
+        {"name": "Active discovery"},
+        {"name": "Focused enumeration"}
+      ]
+    },
+    {
+      "id": "02",
+      "eyebrow": "dns",
+      "icon": "dns",
+      "description": "Resolve Records",
+      "bin": "dnsx",
+      "path": "dnsx",
+      "target_summary": "18 TARGETS",
+      "target_example": "api.acme.example",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Standard resolution",
+          "options": [
+            {"label": "A / AAAA", "value": "ENABLED"},
+            {"label": "CNAME", "value": "ENABLED"},
+            {"label": "Retries", "value": "2"}
+          ],
+          "command": [
+            {"type": "tool", "text": "dnsx"},
+            {"type": "argument", "text": " -d "},
+            {"type": "target", "text": "api.acme.example"},
+            {"type": "argument", "text": " -a -aaaa -cname -json"}
+          ]
+        },
+        {"name": "All records"},
+        {"name": "Authoritative trace"}
+      ]
+    },
+    {
+      "id": "03",
+      "eyebrow": "network",
+      "icon": "radar",
+      "description": "Port Discovery",
+      "bin": "nmap",
+      "path": "nmap",
+      "target_summary": "ADD TARGET",
+      "target_example": "198.51.100.14",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Top 1000 TCP",
+          "options": [
+            {"label": "Host discovery", "value": "ENABLED"},
+            {"label": "Service probe", "value": "DISABLED"},
+            {"label": "Timing", "value": "T3"}
+          ],
+          "command": [
+            {"type": "tool", "text": "nmap"},
+            {"type": "argument", "text": " -sT --top-ports 1000 "},
+            {"type": "target", "text": "198.51.100.14"},
+            {"type": "argument", "text": " -oX result.xml"}
+          ]
+        },
+        {"name": "Web ports"},
+        {"name": "Service detection"}
+      ]
+    },
+    {
+      "id": "04",
+      "eyebrow": "http",
+      "icon": "http",
+      "description": "Web Probe",
+      "bin": "httpx",
+      "path": "httpx",
+      "target_summary": "DIRECT / 2",
+      "target_example": "https://api.acme.example",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Standard web metadata",
+          "options": [
+            {"label": "Follow redirects", "value": "ENABLED"},
+            {"label": "Capture title", "value": "ENABLED"},
+            {"label": "Concurrency", "value": "25"}
+          ],
+          "command": [
+            {"type": "tool", "text": "httpx"},
+            {"type": "argument", "text": " -u "},
+            {"type": "target", "text": "https://api.acme.example"},
+            {"type": "argument", "text": " -title -tech-detect -fr -json"}
+          ]
+        },
+        {"name": "Light probe"},
+        {"name": "Extended fingerprint"}
+      ]
+    },
+    {
+      "id": "05",
+      "eyebrow": "archive",
+      "icon": "history",
+      "description": "Known URLs",
+      "bin": "gau",
+      "path": "gau",
+      "target_summary": "PROJECT SET",
+      "target_example": "acme.example",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Common providers",
+          "options": [
+            {"label": "Subdomains", "value": "ENABLED"},
+            {"label": "Parameters", "value": "ENABLED"},
+            {"label": "Providers", "value": "ALL"}
+          ],
+          "command": [
+            {"type": "tool", "text": "gau"},
+            {"type": "argument", "text": " --subs "},
+            {"type": "target", "text": "acme.example"},
+            {"type": "argument", "text": " --json"}
+          ]
+        },
+        {"name": "Wayback only"},
+        {"name": "Broad collection"}
+      ]
+    },
+    {
+      "id": "06",
+      "eyebrow": "tls",
+      "icon": "verified_user",
+      "description": "TLS Inspect",
+      "bin": "tlsx",
+      "path": "tlsx",
+      "target_summary": "ADD TARGET",
+      "target_example": "api.acme.example:443",
+      "state": "MISSING",
+      "profiles": [
+        {
+          "name": "Certificate summary",
+          "options": [
+            {"label": "Certificates", "value": "ENABLED"},
+            {"label": "Protocols", "value": "ENABLED"},
+            {"label": "Concurrency", "value": "25"}
+          ],
+          "command": [
+            {"type": "tool", "text": "tlsx"},
+            {"type": "argument", "text": " -host "},
+            {"type": "target", "text": "api.acme.example:443"},
+            {"type": "argument", "text": " -json"}
+          ]
+        },
+        {"name": "Protocol inventory"},
+        {"name": "Full TLS metadata"}
+      ]
+    }
+  ]
+}
