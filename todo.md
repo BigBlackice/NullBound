@@ -102,6 +102,9 @@ The persistent shell should include:
 - [ ] Store project metadata in a versioned `project.json` file.
 - [ ] Add saved target sets containing domains, IPs, CIDRs, and URLs.
 - [ ] Support explicit includes, exclusions, and review-required targets.
+- [ ] Keep authorization status separate from ownership confidence:
+  - `scope_status`: `allowed`, `denied`
+  - `ownership_confidence`: `confirmed`, `likely`, or `unknown`
 - [x] Make the active project and target set visible throughout the UI.
 - [ ] Tag each run with a nullable project ID and a captured project display name.
 - [ ] Determine project association from the active workspace. Module configuration
