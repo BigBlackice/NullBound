@@ -12,6 +12,35 @@ from workspace_data import ASSETS, EVIDENCE, RUNS, SCOPE_RULES
 
 # Shared resources and module data loaded once when the application starts.
 STYLESHEET = Path(__file__).with_name("styles.css")
+ESCAPE_KEY_BEHAVIOR = """
+<script>
+(() => {
+  if (window.__blackwallEscapeBlurInstalled) return;
+  window.__blackwallEscapeBlurInstalled = true;
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    const active = document.activeElement;
+    const writable = active?.matches(
+      'input:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled]), [contenteditable="true"]'
+    );
+    if (writable) {
+      active.blur();
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+
+    // Dialogs opt into Escape dismissal by marking their visible close control.
+    const closeButton = [...document.querySelectorAll('[data-escape-close="true"]')]
+      .find(button => button.getClientRects().length > 0);
+    if (!closeButton) return;
+    closeButton.click();
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+})();
+</script>
+"""
 MODULE_CATALOG = load_default_catalog()
 MODULES = MODULE_CATALOG.modules
 
@@ -136,6 +165,7 @@ class DashboardUI:
 
     def build(self) -> None:
         ui.add_css(STYLESHEET.read_text(encoding="utf-8"))
+        ui.add_head_html(ESCAPE_KEY_BEHAVIOR)
         ui.colors(primary="#22cfff")
         ui.dark_mode(True)
 
@@ -191,6 +221,11 @@ class DashboardUI:
         self.settings_open = False
         self.update_rail_selection()
         self.settings_dialog.close()
+
+    def sync_settings_closed(self) -> None:
+        """Keep rail selection correct when Escape or the backdrop closes Settings."""
+        self.settings_open = False
+        self.update_rail_selection()
 
     def select_settings_section(self, section: str) -> None:
         self.settings_section = section
@@ -902,14 +937,14 @@ class DashboardUI:
     # === START: SETTINGS DIALOG ===
     # Modal-style settings workspace with internal section navigation.
     def render_settings_dialog(self) -> None:
-        with ui.dialog().props("persistent").classes("settings-dialog") as self.settings_dialog:
+        with ui.dialog().classes("settings-dialog").on("hide", self.sync_settings_closed) as self.settings_dialog:
             with ui.card().classes("settings-modal"):
                 with ui.element("header").classes("settings-header"):
                     with ui.element("div"):
                         ui.label("BLACKWALL / CONTROL PLANE").classes("section-kicker")
                         ui.label("Settings").classes("settings-title")
                     with ui.element("button").classes("settings-close").props(
-                        'type=button aria-label="Close settings"'
+                        'type=button aria-label="Close settings" data-escape-close=true'
                     ).on("click", self.close_settings):
                         ui.label("×")
 

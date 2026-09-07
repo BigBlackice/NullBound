@@ -57,6 +57,8 @@ The persistent shell should include:
 
 ### v0.1a — UI prototype
 
+**Status: complete (2026-09-08).**
+
 - [x] Archive the original Tkinter experiment and unstructured notes.
 - [x] Create the NiceGUI application shell and interactive Launchpad.
 - [x] Give every initial module a selectable, module-specific configuration view.
@@ -81,14 +83,15 @@ The persistent shell should include:
   Appearance sections, including the planned module/profile editor fields.
 - [x] Review the prototype at common desktop widths.
 - [x] Agree on navigation, information density, vocabulary, and visual direction.
-- [ ] Extract reusable design tokens and components after the direction is agreed.
-- [ ] Keep theme tokens semantic and limited: near-black backgrounds, a structural
+- [x] Extract reusable design tokens and components after the direction is agreed.
+- [x] Keep theme tokens semantic and limited: near-black backgrounds, a structural
   accent for borders/separators, and an interactive accent for controls/text.
-- [ ] Default theme: red structure on near-black surfaces with blue interactive
+- [x] Default theme: red structure on near-black surfaces with blue interactive
   controls. Avoid per-component background shades and decorative color gradients.
-- [ ] Define loading, empty, unavailable, running, failed, and completed states.
-- [ ] Confirm keyboard navigation and readable contrast; never communicate status
-  using color alone.
+- [x] Define empty, unavailable, running, failed, and completed states.
+- [x] Confirm keyboard navigation and readable contrast; never communicate status
+  using color alone. Tab navigation works, and Escape releases writable fields or
+  closes dialogs.
 
 ### v0.1b — Optional project and scope foundation
 
@@ -99,12 +102,7 @@ The persistent shell should include:
 - [ ] Store project metadata in a versioned `project.json` file.
 - [ ] Add saved target sets containing domains, IPs, CIDRs, and URLs.
 - [ ] Support explicit includes, exclusions, and review-required targets.
-- [ ] Keep authorization status separate from ownership confidence:
-  - `scope_status`: `allowed`, `denied`, or `review_required`
-  - `ownership_confidence`: `confirmed`, `likely`, or `unknown`
-- [ ] Add an engagement profile for rate limits, permitted time windows, and
-  prohibited actions.
-- [ ] Make the active project and target set visible throughout the UI.
+- [x] Make the active project and target set visible throughout the UI.
 - [ ] Tag each run with a nullable project ID and a captured project display name.
 - [ ] Determine project association from the active workspace. Module configuration
   must not contain a separate project selector: runs launched inside a project are
@@ -127,6 +125,8 @@ The persistent shell should include:
 - [ ] Preview the exact executable and arguments before launch.
 - [ ] Launch processes without interpolating user input into a shell string.
 - [ ] Stream stdout and stderr to the run console.
+- [ ] Add a deliberate starting/loading state to the run console for the period
+  between launch and the first process output.
 - [ ] Support queueing, concurrency limits, timeouts, and process-group cancellation.
 - [ ] Preserve run state if the browser disconnects or refreshes.
 - [ ] Record executable path, version, arguments, inputs, timestamps, duration,
