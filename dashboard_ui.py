@@ -6,6 +6,8 @@ from functools import partial
 from pathlib import Path
 
 from nicegui import events, ui
+from blackwall_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
+from blackwall_projects.picker import LocalDirectoryPicker
 from recon_modules import FAVICON_DATA_URL, ModuleDefinition, load_default_catalog
 from workspace_data import ASSETS, EVIDENCE, RUNS, SCOPE_RULES
 
@@ -32,7 +34,7 @@ ESCAPE_KEY_BEHAVIOR = """
 
     // Dialogs opt into Escape dismissal by marking their visible close control.
     const closeButton = [...document.querySelectorAll('[data-escape-close="true"]')]
-      .find(button => button.getClientRects().length > 0);
+      .filter(button => button.getClientRects().length > 0).at(-1);
     if (!closeButton) return;
     closeButton.click();
     event.preventDefault();
@@ -128,7 +130,7 @@ class DashboardUI:
     """Owns per-page UI state and redraws the affected regions."""
 
     # State and application bootstrap.
-    def __init__(self) -> None:
+    def __init__(self, project_store: ProjectStore | None = None) -> None:
         self.active_view = "launchpad"
         self.selected_module_id = "04"
         self.selected_finding_id = FINDINGS[0]["id"]
@@ -146,14 +148,21 @@ class DashboardUI:
         self.settings_open = False
         self.settings_section = "general"
         self.settings_module_id = MODULES[0].id
-        self.projects = [{"id": "P-0142", "name": "NIGHTFALL / ACME"}]
-        self.active_project_id = "P-0142"
-        self.next_project_number = 143
+        self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
 
     # Resolve the selected ID through the module catalog instead of duplicating data.
     @property
     def selected_module(self) -> ModuleDefinition:
         return MODULE_CATALOG.get(self.selected_module_id)
+
+    @property
+    def projects(self) -> list[Project]:
+        """Currently open project tabs supplied by the project workspace layer."""
+        return self.project_workspace.open_projects
+
+    @property
+    def active_project_id(self) -> str | None:
+        return self.project_workspace.active_project_id
 
     @property
     def selected_finding(self) -> dict[str, str]:
@@ -182,6 +191,11 @@ class DashboardUI:
         self.render_inspector()
         self.render_console()
         self.render_settings_dialog()
+        self.render_project_dialogs()
+        self.create_location_picker = LocalDirectoryPicker(
+            "Choose project parent", self.set_create_project_parent
+        )
+        self.open_project_picker = LocalDirectoryPicker("Open project directory", self.open_project)
 
     # Primary navigation and launchpad interaction handlers.
     def navigate(self, view_id: str) -> None:
@@ -232,6 +246,39 @@ class DashboardUI:
         self.render_settings_navigation()
         self.render_settings_content()
 
+    # === START: PROJECT DIALOGS ===
+    # Thin NiceGUI forms; all filesystem work remains in blackwall_projects.
+    def render_project_dialogs(self) -> None:
+        with ui.dialog().classes("project-dialog") as self.create_project_dialog:
+            with ui.card().classes("project-modal"):
+                with ui.element("header").classes("settings-header"):
+                    with ui.element("div"):
+                        ui.label("PROJECT / CREATE").classes("section-kicker")
+                        ui.label("Create project").classes("settings-title")
+                    with ui.element("button").classes("settings-close").props(
+                        'type=button aria-label="Close create project" data-escape-close=true'
+                    ).on("click", self.create_project_dialog.close):
+                        ui.label("×")
+                with ui.element("div").classes("settings-field"):
+                    ui.label("PROJECT NAME").classes("field-label")
+                    self.create_project_name = ui.input().props(
+                        "dense outlined autofocus maxlength=120"
+                    ).classes("config-control")
+                with ui.element("div").classes("settings-field"):
+                    ui.label("PARENT DIRECTORY").classes("field-label")
+                    with ui.element("div").classes("directory-path-row"):
+                        self.create_project_location = ui.input().props("dense outlined").classes(
+                            "config-control directory-path-input"
+                        )
+                        ui.button("BROWSE", on_click=self.browse_create_location).props(
+                            "flat dense no-caps"
+                        ).classes("settings-action")
+                with ui.element("div").classes("settings-actions"):
+                    ui.button("CREATE", icon="create_new_folder", on_click=self.create_project).props(
+                        "flat no-caps"
+                    ).classes("settings-action primary")
+    # === END: PROJECT DIALOGS ===
+
     def select_settings_module(self, module_id: str) -> None:
         self.settings_module_id = module_id
         self.render_settings_content()
@@ -273,29 +320,62 @@ class DashboardUI:
     def set_scope_enforced(self, event: events.ValueChangeEventArguments) -> None:
         self.scope_enforced = bool(event.value)
 
-    # Temporary in-memory project-tab state; persistence will be added later.
+    # Project-tab actions delegate persistence and validation to blackwall_projects.
     def select_project(self, project_id: str) -> None:
-        self.active_project_id = project_id
+        self.project_workspace.select(project_id)
         self.render_topbar()
 
     def add_project_tab(self) -> None:
-        project = {
-            "id": f"P-{self.next_project_number:04d}",
-            "name": f"UNTITLED PROJECT {len(self.projects) + 1:02d}",
-        }
-        self.next_project_number += 1
-        self.projects.append(project)
-        self.active_project_id = project["id"]
+        self.create_project_name.value = f"UNTITLED PROJECT {len(self.projects) + 1:02d}"
+        self.create_project_location.value = str(self.project_workspace.store.root)
+        self.create_project_dialog.open()
+
+    def create_project(self) -> None:
+        try:
+            parent = Path(str(self.create_project_location.value or "")).expanduser()
+            project = self.project_workspace.create(str(self.create_project_name.value or ""), parent)
+        except (OSError, ProjectValidationError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.create_project_dialog.close()
+        ui.notify(f"Created {project.id} / {project.name}", type="positive")
+        self.refresh_project_surfaces()
+
+    def browse_create_location(self) -> None:
+        requested = Path(str(self.create_project_location.value or self.project_workspace.store.root))
+        try:
+            if requested.expanduser().resolve(strict=False) == self.project_workspace.store.root:
+                requested.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            ui.notify(f"Cannot open default project location: {error}", type="negative")
+            return
+        self.create_location_picker.open(requested)
+
+    def set_create_project_parent(self, path: Path) -> None:
+        self.create_project_location.value = str(path)
+
+    def browse_for_project(self) -> None:
+        start = self.project_workspace.store.root.parent
+        start.mkdir(parents=True, exist_ok=True)
+        self.open_project_picker.open(start)
+
+    def open_project(self, reference: str | Path) -> None:
+        try:
+            project = self.project_workspace.open(reference)
+        except (OSError, ProjectValidationError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        ui.notify(f"Opened {project.id} / {project.name}", type="positive")
+        self.refresh_project_surfaces()
+
+    def refresh_project_surfaces(self) -> None:
         self.render_topbar()
+        if self.settings_open and self.settings_section == "projects":
+            self.render_settings_content()
 
     def close_project_tab(self, project_id: str) -> None:
-        index = next(index for index, project in enumerate(self.projects) if project["id"] == project_id)
-        self.projects.pop(index)
-        if self.active_project_id == project_id:
-            self.active_project_id = (
-                self.projects[min(index, len(self.projects) - 1)]["id"] if self.projects else None
-            )
-        self.render_topbar()
+        self.project_workspace.close(project_id)
+        self.refresh_project_surfaces()
 
     # Collapsible console and module-inspector state.
     def toggle_console_minimized(self) -> None:
@@ -404,16 +484,16 @@ class DashboardUI:
                     ).props("dense").classes("project-toggle")
                 with ui.element("nav").classes("project-tabs"):
                     for project in self.projects:
-                        classes = "project-tab active" if self.active_project_id == project["id"] else "project-tab"
+                        classes = "project-tab active" if self.active_project_id == project.id else "project-tab"
                         with ui.element("div").classes(classes):
                             with ui.element("button").classes("project-tab-select").props("type=button").on(
-                                "click", partial(self.select_project, project["id"])
+                                "click", partial(self.select_project, project.id)
                             ):
-                                ui.label(project["name"])
-                                ui.label(project["id"]).classes("project-tab-count")
+                                ui.label(project.name)
+                                ui.label(project.id).classes("project-tab-count")
                             with ui.element("button").classes("project-tab-close").props(
-                                f'type=button aria-label="Close {project["name"]}"'
-                            ).on("click", partial(self.close_project_tab, project["id"])):
+                                f'type=button aria-label="Close {project.name}"'
+                            ).on("click", partial(self.close_project_tab, project.id)):
                                 ui.label("×")
                     with ui.element("button").classes("project-tab-add").props(
                         'type=button aria-label="Create project tab"'
@@ -990,7 +1070,7 @@ class DashboardUI:
         self.render_settings_heading("General", "Local runtime, storage, and execution defaults.")
         with ui.element("section").classes("settings-group"):
             ui.label("APPLICATION").classes("settings-group-title")
-            self.render_setting_field("WORKSPACE DIRECTORY", "C:\\Blackwall\\workspaces")
+            self.render_setting_field("DEFAULT PROJECT LOCATION", str(self.project_workspace.store.root), readonly=True)
             with ui.element("div").classes("settings-field-grid"):
                 self.render_setting_field("NETWORK BIND", "0.0.0.0")
                 self.render_setting_field("PORT", "8080")
@@ -1005,30 +1085,35 @@ class DashboardUI:
             ui.checkbox("Restore open project tabs on startup", value=True).props("dense").classes("setting-check")
 
     def render_project_settings(self) -> None:
-        self.render_settings_heading("Projects", "Create, reopen, and inspect local project workspaces.")
+        self.render_settings_heading("Projects", "Open tabs and portable local project directories.")
         with ui.element("section").classes("settings-group"):
             with ui.element("div").classes("settings-group-head"):
                 ui.label("OPEN PROJECTS").classes("settings-group-title")
-                ui.label(f"{len(self.projects):02d} ACTIVE").classes("settings-meta")
+                ui.label(f"{len(self.projects):02d} OPEN").classes("settings-meta")
             for project in self.projects:
                 with ui.element("div").classes("settings-project-row"):
                     icon("folder_open")
                     with ui.element("div").classes("settings-project-copy"):
-                        ui.label(project["name"]).classes("settings-project-name")
-                        ui.label(f"{project['id']}  /  C:\\Blackwall\\workspaces\\{project['id']}").classes(
+                        ui.label(project.name).classes("settings-project-name")
+                        ui.label(f"{project.id}  /  {project.path}").classes(
                             "settings-project-path"
                         )
-                    ui.label("OPEN").classes("settings-state ready")
+                    ui.button("FOCUS", on_click=partial(self.select_project, project.id)).props(
+                        "flat dense no-caps"
+                    ).classes("settings-action project-open-action")
+
+            if not self.projects:
+                ui.label("NO PROJECT TABS ARE OPEN").classes("settings-note")
 
         with ui.element("section").classes("settings-group"):
             ui.label("PROJECT ACTIONS").classes("settings-group-title")
             with ui.element("div").classes("settings-actions"):
-                ui.button("CREATE PROJECT", icon="create_new_folder", on_click=lambda: ui.notify(
-                    "Project creation is not connected yet"
-                )).props("flat no-caps").classes("settings-action primary")
-                ui.button("OPEN DIRECTORY", icon="folder_open", on_click=lambda: ui.notify(
-                    "Project browsing is not connected yet"
-                )).props("flat no-caps").classes("settings-action")
+                ui.button("CREATE PROJECT", icon="create_new_folder", on_click=self.add_project_tab).props(
+                    "flat no-caps"
+                ).classes("settings-action primary")
+                ui.button("OPEN PROJECT", icon="folder_open", on_click=self.browse_for_project).props(
+                    "flat no-caps"
+                ).classes("settings-action")
 
     def render_proxy_settings(self) -> None:
         self.render_settings_heading(
@@ -1080,7 +1165,8 @@ class DashboardUI:
             self.render_setting_field("PASSWORD", "", password=True)
             self.render_setting_field("INTERCEPTION CA CERTIFICATE (OPTIONAL)", "")
             ui.label(
-                "HTTPS interception through ZAP or Burp requires the launcher environment to trust its CA certificate."
+                "HTTPS interception through ZAP, Burp, or another intercepting proxy requires the launcher "
+                "environment to trust that proxy's CA certificate."
             ).classes("settings-note")
 
         with ui.element("section").classes("settings-group"):

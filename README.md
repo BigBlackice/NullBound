@@ -1,14 +1,34 @@
 # Recon Dashboard
 
 This is the interactive NiceGUI shell for the proposed recon workspace. The
-Launchpad module cards open module-specific configuration panels, while the
-remaining navigation destinations intentionally show a shared not-yet-implemented
-view. Tool execution, project data, and persistence are not connected yet.
+Launchpad module cards open module-specific configuration panels, and the primary
+rail destinations have project-aware prototype views. Tool execution and record
+persistence are not connected yet.
 
 The application entry point is `main.py`, UI composition and state live in
 `dashboard_ui.py`, and visual styling lives in `styles.css`. Module definitions,
 scan profiles, validation, and automatic ID allocation live in the
 `recon_modules` package; the bundled catalog is `recon_modules/definitions.json`.
+Project manifests, validation, filesystem persistence, and open-workspace state
+live in the `blackwall_projects` package.
+
+New projects default to the current user's Blackwall directory on every platform:
+
+```text
+~/.blackwall/projects/P-0001/
+  project.json
+  runs/
+```
+
+The parent directory can be changed while creating a project. Existing project
+directories can be opened from anywhere on the local filesystem as long as they
+contain a valid `project.json`; they do not need to remain below `.blackwall`.
+
+Run the platform-neutral project-store tests with:
+
+```bash
+python -m unittest discover -v
+```
 
 ## Run on Windows
 

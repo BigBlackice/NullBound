@@ -7,6 +7,11 @@ application should let an operator launch compatible tools from a consistent
 interface, optionally organize work into scoped projects, preserve evidence, and
 turn tool output into traceable assets and findings.
 
+Blackwall is intended to provide a free and open-source web-testing workflow built
+around ZAP and other FOSS tools, without requiring Burp or another proprietary
+platform. Over time, Blackwall should become the primary operator interface and use
+ZAP as a headless interception and scanning engine wherever practical.
+
 The first goal is not to replace every security tool. It is to make the common
 recon workflow calmer, faster, and easier to audit.
 
@@ -26,8 +31,13 @@ name and trademark check are completed.
   answer a workflow question.
 - **Local and safe by default.** Bind to localhost, construct commands without
   unsafe shell interpolation, and require explicit configuration for remote use.
+- **Linux-first, portable core.** Treat Linux as the reference runtime and initial
+  packaging target, while keeping the UI, project format, data model, and adapter
+  contracts operating-system agnostic unless a platform difference is unavoidable.
 - **Adapters over special cases.** Tool behavior should eventually be described by
   a common adapter contract instead of being embedded throughout the UI.
+- **FOSS-first integrations.** Core workflows must not depend on proprietary tools
+  or services. Optional integrations must be clearly identified and replaceable.
 - **Original visual identity.** Use an industrial/cyber command-center aesthetic,
   but do not copy proprietary game fonts, icons, logos, or interface assets.
 
@@ -95,11 +105,13 @@ The persistent shell should include:
 
 ### v0.1b — Optional project and scope foundation
 
-- [ ] Create, open, and validate a project directory.
-- [ ] Add an open/browse action for reopening existing projects as workspace tabs.
+- [x] Create, open, and validate portable project directories. Default new projects
+  to `~/.blackwall/projects`, but allow the operator to choose any parent path.
+- [x] Add a local directory browser, starting in `~/.blackwall`, for opening any
+  folder containing a valid `project.json` as a workspace tab.
 - [ ] Allow tools to run with direct targets when no project is open.
 - [ ] Allow a project run to use direct targets without first adding them to scope.
-- [ ] Store project metadata in a versioned `project.json` file.
+- [x] Store project metadata in a versioned, platform-neutral `project.json` file.
 - [ ] Add saved target sets containing domains, IPs, CIDRs, and URLs.
 - [ ] Support explicit includes, exclusions, and review-required targets.
 - [ ] Keep authorization status separate from ownership confidence:
@@ -124,7 +136,9 @@ The persistent shell should include:
   the catalog's default icon whenever no icon is selected.
 - [ ] Support named scan profiles and provide per-module profile creation and
   editing in **Settings > Modules**.
-- [ ] Integrate one low-risk tool from availability check through completed run.
+- [ ] Integrate ProjectDiscovery `httpx` as the first end-to-end adapter: availability
+  check, version capture, direct/project targets, JSONL output, cancellation, and a
+  completed run manifest. Keep it distinct from the Python HTTPX package.
 - [ ] Preview the exact executable and arguments before launch.
 - [ ] Launch processes without interpolating user input into a shell string.
 - [ ] Stream stdout and stderr to the run console.
@@ -200,12 +214,81 @@ physically immutable.
 - [ ] Add per-tool proxy capability declarations and configuration.
 - [ ] Connect **Settings > Proxy** to application-level HTTP/SOCKS configuration
   and show which adapters support the selected protocol.
+- [ ] Keep proxy routing implementation-agnostic: support ZAP, Burp, generic
+  HTTP(S) proxies, and SOCKS jumphosts through the same host, port,
+  authentication, bypass, and CA-trust controls. Burp compatibility is optional
+  interoperability and must never become a dependency or required paid workflow.
 - [ ] Clearly identify tools whose traffic cannot be routed through the configured
   HTTP or SOCKS proxy.
-- [ ] Connect to the ZAP API to manage contexts, start supported scans, monitor
-  progress, and import alerts with provenance.
-- [ ] Provide a direct route to the full ZAP interface for features not represented
-  in the dashboard.
+- [ ] Connect to the ZAP API and treat ZAP as Blackwall's headless interception and
+  scanning engine rather than as the primary operator interface.
+- [ ] Manage ZAP availability, API authentication, sessions, contexts, scope,
+  authentication, users, and scan policies from Blackwall.
+- [ ] Import proxied HTTP history, request/response bodies, passive-scan alerts,
+  active-scan results, spider results, and AJAX-spider results with provenance.
+- [ ] Add Blackwall-native request/response inspection, editing, resend/replay, and
+  comparison so common manual proxy work no longer requires opening the ZAP UI.
+- [ ] Keep a temporary route to the complete ZAP UI for capabilities Blackwall has
+  not exposed yet; record those fallbacks to prioritize later replacement.
+
+### Planned bug-bounty tool integrations
+
+Treat this list as an integration portfolio, not as a requirement that every item
+becomes a Launchpad card. Prefer adapters for executables, service integrations for
+stateful systems, and internal libraries for reusable behavior.
+
+#### Launchpad adapters
+
+- [ ] Add `subfinder` for passive subdomain discovery and normalize discovered
+  names into candidate assets with source provenance.
+- [ ] Add ProjectDiscovery `httpx` for reachability checks, HTTP metadata, and
+  validation of output from `subfinder`, Amass, and other discovery adapters.
+- [ ] Add Amass for passive-first asset discovery; expose active enumeration only
+  through an explicit profile.
+- [ ] Add Katana for scoped crawling and normalize URLs, forms, parameters, and
+  JavaScript references without silently expanding beyond scope.
+- [ ] Add `ffuf` for content, virtual-host, and parameter fuzzing with rate,
+  concurrency, recursion, matcher, and filter controls visible in its profiles.
+- [ ] Add Arjun as a focused hidden-parameter discovery adapter. Keep it separate
+  from `ffuf` because its request model and output semantics differ.
+- [ ] Add Nuclei with pinned template metadata, template/version capture, severity
+  and confidence mapping, and raw JSONL retained beside normalized findings.
+
+#### Stateful and UI-backed integrations
+
+- [ ] Configure ZAP routing in **Settings > Proxy**, control supported operations
+  through its API, and expose the resulting traffic and evidence through
+  Blackwall-native views.
+- [ ] Add Playwright as a managed browser-automation integration for authenticated
+  navigation, screenshots, traces, and operator-authored workflows. Keep browser
+  profiles, cookies, and credentials out of ordinary logs and manifests.
+- [ ] Add Interactsh as an OAST provider integration rather than a one-shot scanner:
+  create or register sessions, protect correlation tokens, poll interactions, and
+  link callbacks to the originating run, request, asset, and finding.
+- [ ] Evaluate GraphQL Voyager as an optional schema visualization inside Evidence
+  after Blackwall can import or introspect a GraphQL schema. It is not a scanner or
+  a general-purpose Launchpad module.
+
+#### Internal capabilities and external interoperability
+
+- [ ] Use Python `asyncio` for bounded orchestration and concurrency, `requests`
+  (or one deliberately selected HTTP client) for controlled HTTP operations,
+  PyJWT for explicit JWT inspection/mutation workflows, and `difflib` for response
+  comparison. These are implementation capabilities, not user-facing modules.
+- [ ] Add reusable request-diff evidence for authorization/IDOR and race-condition
+  workflows only after request redaction, deterministic replay, concurrency limits,
+  and scope checks are in place.
+- [ ] Replace the useful Param Miner workflow with native hidden-input discovery
+  over requests selected from ZAP history or created in Blackwall. Support query,
+  body, header, and cookie insertion points, configurable wordlists, safe batching,
+  and differential response scoring with reproducible evidence.
+- [ ] Do not require `jq` as Blackwall's JSON database or parser. Preserve JSON and
+  JSONL artifacts, parse them natively, and optionally offer copy/export recipes
+  for operators who use `jq` outside Blackwall.
+
+Adapter workflows should compose typed outputs where practical, for example
+`subfinder or Amass -> httpx -> Katana or Nuclei`, while retaining the raw output
+and provenance from every individual stage.
 
 The application must not claim that all traffic is proxied. Environment proxy
 variables do not affect every scanner, DNS client, or raw-socket tool.
@@ -218,8 +301,9 @@ variables do not affect every scanner, DNS client, or raw-socket tool.
 - [ ] Support importable tool packs with explicit version compatibility.
 - [ ] Detect missing executables and provide verified installation guidance.
 - [ ] Evaluate isolated/containerized adapters.
-- [ ] Consider guarded package-manager integration only after the supported
-  operating systems and privilege model are defined.
+- [ ] Consider guarded package-manager integration only after the Linux packaging
+  and privilege model are defined; keep installation optional and separate from
+  portable executable discovery.
 
 ## Deferred ideas
 
@@ -228,15 +312,24 @@ a clear need:
 
 - A general-purpose interactive terminal or custom shell.
 - System-wide transparent proxying.
-- Recreating the complete ZAP or Burp user interface.
+- A one-for-one recreation of the complete ZAP interface. Replace common manual
+  workflows with Blackwall-native views based on actual operator needs instead.
 - Automatic `apt`, `pacman`, or other privileged package-manager calls.
 - Decorative globes, ambient animations, or metrics without operator value.
 - Multiple finished visual themes before the primary design system is stable.
 
 ## Cross-cutting engineering requirements
 
-- [ ] Decide whether the initial supported environment is Linux-only or
-  cross-platform.
+- [ ] Use Linux as the reference environment and first packaging target while
+  continuing to run and test the application on Windows during development.
+- [ ] Keep shared code platform-neutral: use `pathlib`, argument arrays, portable
+  project-relative paths, and Python APIs instead of shell-specific commands or
+  hard-coded drive paths.
+- [ ] Isolate unavoidable differences—executable discovery, process groups,
+  cancellation signals, certificate stores, permissions, and browser launching—
+  behind small platform services with explicit capability checks.
+- [ ] Add automated smoke tests on Linux and Windows; do not let support for either
+  platform distort the persisted project format or adapter schema.
 - [ ] Bind the local application to `127.0.0.1` by default.
 - [ ] Define authentication and isolation requirements before permitting remote
   access.
@@ -251,8 +344,7 @@ a clear need:
 ## Open product decisions
 
 - Public project name and original visual identity.
-- Initial operating system and packaging format.
-- First real adapter used for the end-to-end execution slice.
+- Initial Linux packaging format and the promised Windows support tier.
 - Whether a project may be opened by more than one application instance.
 - Expected project size and retention period.
 - Whether collaboration is ever in scope or the product remains single-user and
