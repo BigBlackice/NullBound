@@ -4,12 +4,28 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
+import re
+import shlex
 
 from nicegui import events, ui
+from app_config import AppConfig
+from blackwall_execution import (
+    ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest,
+    expand_argument_template,
+)
 from blackwall_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
 from blackwall_projects.picker import LocalDirectoryPicker
+from blackwall_scope import (
+    ExecutionContext,
+    ScopeStatus,
+    ScopeStore,
+    ScopeValidationError,
+    Target,
+    TargetSelection,
+    evaluate_targets,
+)
 from recon_modules import FAVICON_DATA_URL, ModuleDefinition, load_default_catalog
-from workspace_data import ASSETS, EVIDENCE, RUNS, SCOPE_RULES
+from workspace_data import ASSETS, EVIDENCE, SCOPE_RULES
 
 
 # Shared resources and module data loaded once when the application starts.
@@ -44,7 +60,6 @@ ESCAPE_KEY_BEHAVIOR = """
 </script>
 """
 MODULE_CATALOG = load_default_catalog()
-MODULES = MODULE_CATALOG.modules
 
 # Temporary finding records used to shape the UI before scanner persistence exists.
 FINDINGS = (
@@ -99,7 +114,7 @@ NAV_ITEMS = (
     ("language", "Assets", "assets", "24"),
     ("link", "Evidence", "evidence", f"{len(EVIDENCE):02d}"),
     ("gpp_good", "Scope", "scope", "27"),
-    ("terminal", "Runs", "runs", f"{len(RUNS):02d}"),
+    ("terminal", "Runs", "runs", ""),
 )
 
 VIEW_NAMES = {
@@ -130,15 +145,26 @@ class DashboardUI:
     """Owns per-page UI state and redraws the affected regions."""
 
     # State and application bootstrap.
-    def __init__(self, project_store: ProjectStore | None = None) -> None:
+    def __init__(
+        self,
+        project_store: ProjectStore | None = None,
+        app_config: AppConfig | None = None,
+        execution_manager: ExecutionManager | None = None,
+    ) -> None:
+        self.app_config = app_config or AppConfig()
         self.active_view = "launchpad"
+        self.module_catalog = MODULE_CATALOG
+        modules = self.module_catalog.modules
         self.selected_module_id = "04"
         self.selected_finding_id = FINDINGS[0]["id"]
         self.selected_asset_id = ASSETS[0]["id"]
         self.selected_evidence_id = EVIDENCE[0]["id"]
         self.selected_scope_id = SCOPE_RULES[0]["id"]
-        self.selected_run_id = RUNS[0]["id"]
-        self.target_modes = {module.id: "direct" for module in MODULES}
+        self.selected_run_id: str | None = None
+        self.target_modes = {module.id: "direct" for module in modules}
+        self.direct_targets = {module.id: module.target_example for module in modules}
+        self.selected_profiles = {module.id: module.default_profile.name for module in modules}
+        self.selected_target_sets: dict[str, str] = {}
         self.search_query = ""
         self.console_minimized = False
         self.console_fullscreen = False
@@ -147,13 +173,16 @@ class DashboardUI:
         self.scope_enforced = False
         self.settings_open = False
         self.settings_section = "general"
-        self.settings_module_id = MODULES[0].id
+        self.settings_module_id = modules[0].id
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
+        self.execution_manager = execution_manager or ExecutionManager()
+        self.active_run_id: str | None = None
+        self._run_unsubscribe = None
 
     # Resolve the selected ID through the module catalog instead of duplicating data.
     @property
     def selected_module(self) -> ModuleDefinition:
-        return MODULE_CATALOG.get(self.selected_module_id)
+        return self.module_catalog.get(self.selected_module_id)
 
     @property
     def projects(self) -> list[Project]:
@@ -165,12 +194,52 @@ class DashboardUI:
         return self.project_workspace.active_project_id
 
     @property
+    def active_project(self) -> Project | None:
+        return next(
+            (project for project in self.projects if project.id == self.active_project_id), None
+        )
+
+    @property
     def selected_finding(self) -> dict[str, str]:
         return next(finding for finding in FINDINGS if finding["id"] == self.selected_finding_id)
 
     @staticmethod
     def _record(records: tuple[dict[str, str], ...], record_id: str) -> dict[str, str]:
         return next(record for record in records if record["id"] == record_id)
+
+    def run_records(self) -> tuple[dict[str, str], ...]:
+        """Adapt durable manifests to the existing dense Runs table component."""
+        project_paths = tuple(project.path for project in self.projects)
+        manifests = self.execution_manager.list_runs(project_paths)
+        return tuple(self._run_record(manifest) for manifest in manifests)
+
+    @staticmethod
+    def _run_record(run: RunManifest) -> dict[str, str]:
+        targets = ", ".join(item["value"] for item in run.targets) or "—"
+        project = f"{run.project_name} / {run.project_id}" if run.project_id else "—"
+        command = shlex.join((run.executable, *run.arguments))
+        context = f"{run.target_source.replace('_', ' ').title()} / " + (
+            "scope enforced" if run.scope_enforced else "scope not enforced"
+        )
+        duration = "—"
+        if run.duration_seconds is not None:
+            minutes, seconds = divmod(int(run.duration_seconds), 60)
+            duration = f"{minutes:02d}:{seconds:02d}"
+        return {
+            "id": run.id,
+            "state": run.state.value.upper(),
+            "module": run.module_bin.upper(),
+            "target": targets,
+            "project": project,
+            "duration": duration,
+            "started": run.started_at or run.created_at,
+            "exit_code": "—" if run.exit_code is None else str(run.exit_code),
+            "artifacts": str(len(run.artifacts)),
+            "profile": run.profile_name,
+            "command": command,
+            "context": context,
+            "summary": run.error or f"Run state: {run.state.value}.",
+        }
 
     def build(self) -> None:
         ui.add_css(STYLESHEET.read_text(encoding="utf-8"))
@@ -217,6 +286,9 @@ class DashboardUI:
 
     def select_record(self, view_id: str, record_id: str) -> None:
         setattr(self, f"selected_{view_id.rstrip('s')}_id", record_id)
+        if view_id == "runs":
+            self.active_run_id = record_id
+            self.render_console()
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
@@ -297,6 +369,10 @@ class DashboardUI:
 
     def select_module(self, module_id: str) -> None:
         self.selected_module_id = module_id
+        module = self.selected_module
+        self.target_modes.setdefault(module.id, "direct")
+        self.direct_targets.setdefault(module.id, module.target_example)
+        self.selected_profiles.setdefault(module.id, module.default_profile.name)
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
@@ -306,6 +382,16 @@ class DashboardUI:
     def set_target_mode(self, mode: str) -> None:
         self.target_modes[self.selected_module_id] = mode
         self.render_inspector()
+
+    def set_direct_target(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
+        self.direct_targets[module_id] = str(event.value or "")
+
+    def set_profile(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
+        self.selected_profiles[module_id] = str(event.value)
+        self.render_inspector()
+
+    def set_target_set(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
+        self.selected_target_sets[module_id] = str(event.value)
 
     def set_search_query(self, event: events.ValueChangeEventArguments) -> None:
         self.search_query = str(event.value or "")
@@ -320,10 +406,90 @@ class DashboardUI:
     def set_scope_enforced(self, event: events.ValueChangeEventArguments) -> None:
         self.scope_enforced = bool(event.value)
 
+    def _selected_profile(self, module: ModuleDefinition):
+        name = self.selected_profiles.get(module.id, module.default_profile.name)
+        return next((profile for profile in module.profiles if profile.name == name), module.default_profile)
+
+    def _target_selection(self, module: ModuleDefinition) -> TargetSelection:
+        if self.target_modes[module.id] == "direct":
+            values = tuple(
+                value.strip() for value in re.split(r"[\r\n]+", self.direct_targets[module.id])
+                if value.strip()
+            )
+            if not values:
+                raise ScopeValidationError("enter at least one target")
+            return TargetSelection.direct(Target.parse(value) for value in values)
+
+        project = self.active_project
+        if project is None:
+            raise ScopeValidationError("open a project before selecting a saved target set")
+        document = ScopeStore(project.path).load()
+        target_set_id = self.selected_target_sets.get(module.id)
+        if not target_set_id and document.target_sets:
+            target_set_id = document.target_sets[0].id
+        if not target_set_id:
+            raise ScopeValidationError("this project has no saved target sets")
+        return TargetSelection.saved(document.get_target_set(target_set_id))
+
+    async def launch_selected_module(self) -> None:
+        """Translate UI state into a typed request; execution remains outside the UI."""
+        module = self.selected_module
+        project = self.active_project
+        try:
+            selection = self._target_selection(module)
+            rules = ScopeStore(project.path).load().rules if project else ()
+            evaluations = evaluate_targets(selection.targets, rules, enforce=self.scope_enforced)
+            blocked = tuple(item for item in evaluations if not item.launch_allowed)
+            if blocked:
+                targets = ", ".join(item.target.value for item in blocked)
+                raise ScopeValidationError(f"scope enforcement blocked: {targets}")
+            context = ExecutionContext(
+                selection=selection,
+                project_id=project.id if project else None,
+                project_name=project.name if project else None,
+                scope_enforced=self.scope_enforced,
+            )
+            request = RunRequest(module=module, profile=self._selected_profile(module), context=context)
+            run = await self.execution_manager.start(request, project.path if project else None)
+        except (ExecutionError, OSError, ScopeValidationError, KeyError) as error:
+            ui.notify(str(error), type="negative")
+            return
+
+        if self._run_unsubscribe:
+            self._run_unsubscribe()
+        self.active_run_id = run.id
+        self.selected_run_id = run.id
+        self._run_unsubscribe = self.execution_manager.subscribe(run.id, self.handle_run_event)
+        self.console_minimized = False
+        self.update_console_layout()
+        self.render_console()
+        ui.notify(f"Started {run.id}", type="positive")
+
+    def handle_run_event(self, event: RunEvent) -> None:
+        """Update the connected console without coupling the runner to NiceGUI."""
+        if event.run.id != self.active_run_id:
+            return
+        if event.text is not None and hasattr(self, "run_output"):
+            prefix = "[stderr] " if event.stream == "stderr" else ""
+            self.run_output.push(prefix + event.text)
+        if hasattr(self, "console_state_label"):
+            self.console_state_label.set_text(f"{event.run.id} / {event.run.state.value.upper()}")
+        if hasattr(self, "cancel_run_button"):
+            self.cancel_run_button.set_visibility(not event.run.state.terminal)
+        if self.active_view == "runs" and event.text is None:
+            self.render_workspace()
+            self.render_inspector()
+
+    async def cancel_active_run(self) -> None:
+        if self.active_run_id and await self.execution_manager.cancel(self.active_run_id):
+            ui.notify(f"Cancellation requested for {self.active_run_id}")
+
     # Project-tab actions delegate persistence and validation to blackwall_projects.
     def select_project(self, project_id: str) -> None:
         self.project_workspace.select(project_id)
         self.render_topbar()
+        if self.active_view == "launchpad":
+            self.render_inspector()
 
     def add_project_tab(self) -> None:
         self.create_project_name.value = f"UNTITLED PROJECT {len(self.projects) + 1:02d}"
@@ -338,6 +504,7 @@ class DashboardUI:
             ui.notify(str(error), type="negative")
             return
         self.create_project_dialog.close()
+        self.execution_manager.recover_incomplete((project.path,))
         ui.notify(f"Created {project.id} / {project.name}", type="positive")
         self.refresh_project_surfaces()
 
@@ -366,6 +533,7 @@ class DashboardUI:
             ui.notify(str(error), type="negative")
             return
         ui.notify(f"Opened {project.id} / {project.name}", type="positive")
+        self.execution_manager.recover_incomplete((project.path,))
         self.refresh_project_surfaces()
 
     def refresh_project_surfaces(self) -> None:
@@ -555,7 +723,7 @@ class DashboardUI:
         ui.label("OPERATIONS / LAUNCHPAD").classes("section-kicker")
         with ui.element("div").classes("title-row"):
             ui.label("Recon modules").classes("page-title")
-            ui.label(f"VIEW 01 / {len(MODULES):02d} MODULES").classes("view-index")
+            ui.label(f"VIEW 01 / {len(self.module_catalog):02d} MODULES").classes("view-index")
 
         with ui.element("div").classes("module-heading"):
             with ui.element("div").classes("filters"):
@@ -567,7 +735,7 @@ class DashboardUI:
         query = self.search_query.strip().casefold()
         visible_modules = tuple(
             module
-            for module in MODULES
+            for module in self.module_catalog
             if not query
             or query in " ".join((module.description, module.bin, module.eyebrow)).casefold()
         )
@@ -657,12 +825,15 @@ class DashboardUI:
         )
 
     def render_runs_workspace(self) -> None:
+        records = self.run_records()
+        if records and self.selected_run_id not in {record["id"] for record in records}:
+            self.selected_run_id = records[0]["id"]
         self.render_record_workspace(
-            view_id="runs", kicker="EXECUTION / RUNS", title="Runs", index=f"{len(RUNS):02d} RECORDS",
-            filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED"), records=RUNS,
+            view_id="runs", kicker="EXECUTION / RUNS", title="Runs", index=f"{len(records):02d} RECORDS",
+            filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED"), records=records,
             columns=(("state", "STATE"), ("module", "MODULE"), ("target", "TARGET"),
                      ("project", "PROJECT"), ("duration", "DURATION"), ("started", "STARTED")),
-            selected_id=self.selected_run_id, tone_key="state",
+            selected_id=self.selected_run_id or "", tone_key="state",
         )
 
     def render_record_workspace(
@@ -804,7 +975,14 @@ class DashboardUI:
             return
         if self.active_view == "runs":
             with self.inspector:
-                record = self._record(RUNS, self.selected_run_id)
+                records = self.run_records()
+                if not records:
+                    with ui.element("div").classes("inspector-header"):
+                        with ui.element("div").classes("inspector-header-copy"):
+                            ui.label("RUNS").classes("panel-number")
+                            ui.label("No persisted runs yet").classes("panel-title")
+                    return
+                record = self._record(records, self.selected_run_id or records[0]["id"])
                 self.render_record_inspector(
                     record, "RUN", record["module"], record["state"],
                     (("TARGET", record["target"]), ("PROJECT", record["project"]),
@@ -819,7 +997,7 @@ class DashboardUI:
             return
 
         module = self.selected_module
-        profile = module.default_profile
+        profile = self._selected_profile(module)
         target_mode = self.target_modes[module.id]
         with self.inspector:
             with ui.element("div").classes("inspector-header"):
@@ -847,20 +1025,35 @@ class DashboardUI:
                                 ui.label(label)
 
                     if target_mode == "direct":
-                        ui.input(value=module.target_example).props("dense outlined").classes("config-control")
+                        ui.textarea(
+                            value=self.direct_targets[module.id],
+                            on_change=partial(self.set_direct_target, module.id),
+                        ).props("dense outlined autogrow").classes("config-control")
                         ui.button(
-                            "+ ADD TARGET",
-                            on_click=lambda: ui.notify("Target list editing is not connected yet"),
+                            "+ ADD TARGET ON A NEW LINE",
+                            on_click=lambda: ui.notify("Enter one target per line"),
                         ).props("flat dense no-caps").classes("text-action")
                     else:
+                        project = self.active_project
+                        target_sets = ScopeStore(project.path).load().target_sets if project else ()
+                        options = {item.id: f"{item.name} / {len(item.targets)} targets" for item in target_sets}
+                        selected_set = self.selected_target_sets.get(module.id)
+                        if not selected_set and target_sets:
+                            selected_set = target_sets[0].id
+                            self.selected_target_sets[module.id] = selected_set
                         ui.select(
-                            ["External Surface / 24 assets", "Confirmed Hosts / 6 assets"],
-                            value="External Surface / 24 assets",
+                            options, value=selected_set,
+                            on_change=partial(self.set_target_set, module.id),
                         ).props("dense outlined options-dense").classes("config-control")
+                        if not target_sets:
+                            ui.label("NO SAVED TARGET SETS IN ACTIVE PROJECT").classes("field-help")
 
                 with ui.element("div").classes("field"):
                     ui.label("SCAN PROFILE").classes("field-label")
-                    ui.select(list(module.profile_names), value=module.profile_names[0]).props(
+                    ui.select(
+                        list(module.profile_names), value=profile.name,
+                        on_change=partial(self.set_profile, module.id),
+                    ).props(
                         "dense outlined options-dense"
                     ).classes("config-control")
                     ui.button(
@@ -878,8 +1071,21 @@ class DashboardUI:
                 with ui.element("div").classes("field"):
                     ui.label("COMMAND PREVIEW").classes("field-label")
                     with ui.element("div").classes("command-preview"):
-                        for token_type, text in profile.command:
-                            ui.label(text).classes(f"command-{token_type}")
+                        ui.label(module.path).classes("command-tool")
+                        try:
+                            selection = self._target_selection(module)
+                            arguments = expand_argument_template(
+                                profile.arguments,
+                                tuple(target.normalized for target in selection.targets),
+                            )
+                            for argument in arguments:
+                                ui.label(f" {shlex.quote(argument)}").classes("command-argument")
+                            if module.adapter == "httpx":
+                                ui.label(" -o <run>/artifacts/httpx.jsonl").classes("command-argument")
+                        except (ExecutionError, ScopeValidationError, KeyError):
+                            for token_type, text in profile.command:
+                                if token_type != "tool":
+                                    ui.label(text).classes(f"command-{token_type}")
 
                 with ui.element("div").classes("run-context"):
                     ui.label("TARGET COUNT")
@@ -890,7 +1096,7 @@ class DashboardUI:
                 ui.button(
                     "LAUNCH",
                     icon="play_arrow",
-                    on_click=lambda: ui.notify(f"{module.bin} execution is not connected yet"),
+                    on_click=self.launch_selected_module,
                 ).props("unelevated no-caps").classes("launch-button")
 
     def render_finding_inspector(self) -> None:
@@ -1072,11 +1278,12 @@ class DashboardUI:
             ui.label("APPLICATION").classes("settings-group-title")
             self.render_setting_field("DEFAULT PROJECT LOCATION", str(self.project_workspace.store.root), readonly=True)
             with ui.element("div").classes("settings-field-grid"):
-                self.render_setting_field("NETWORK BIND", "0.0.0.0")
-                self.render_setting_field("PORT", "8080")
-            ui.label("Binding beyond localhost requires a trusted network and an authentication plan.").classes(
-                "settings-note warning"
-            )
+                self.render_setting_field("NETWORK BIND", self.app_config.host, readonly=True)
+                self.render_setting_field("PORT", str(self.app_config.port), readonly=True)
+            if self.app_config.remote_access_warning:
+                ui.label(self.app_config.remote_access_warning).classes("settings-note warning")
+            else:
+                ui.label("LOCALHOST ONLY / LAN ACCESS DISABLED").classes("settings-note")
 
         with ui.element("section").classes("settings-group"):
             ui.label("EXECUTION").classes("settings-group-title")
@@ -1192,7 +1399,7 @@ class DashboardUI:
                 ).props("type=button").on("click", self.new_settings_module):
                     ui.label("+")
                     ui.label("ADD MODULE")
-                for module in MODULES:
+                for module in self.module_catalog:
                     classes = "settings-module-item active" if module.id == self.settings_module_id else "settings-module-item"
                     with ui.element("button").classes(classes).props("type=button").on(
                         "click", partial(self.select_settings_module, module.id)
@@ -1208,9 +1415,9 @@ class DashboardUI:
             with ui.element("section").classes("settings-module-editor"):
                 if self.settings_module_id == "__new__":
                     module = None
-                    module_id = MODULE_CATALOG.next_id()
+                    module_id = self.module_catalog.next_id()
                 else:
-                    module = MODULE_CATALOG.get(self.settings_module_id)
+                    module = self.module_catalog.get(self.settings_module_id)
                     module_id = module.id
 
                 with ui.element("div").classes("settings-field-grid"):
@@ -1274,16 +1481,32 @@ class DashboardUI:
     # === END: SETTINGS DIALOG ===
 
     # === START: RUN OUTPUT ===
-    # Bottom output region; tool execution is intentionally not connected yet.
+    # Bottom output region backed by persistent stdout/stderr logs.
     def render_console(self) -> None:
         self.console.clear()
+        run = next(
+            (
+                item for item in self.execution_manager.list_runs(
+                    tuple(project.path for project in self.projects)
+                )
+                if item.id == self.active_run_id
+            ),
+            None,
+        )
         with self.console:
             with ui.element("div").classes("console-head"):
                 with ui.element("div").classes("console-title"):
                     icon("terminal")
                     ui.label("RUN OUTPUT")
-                ui.label("IDLE / NO ACTIVE RUN").classes("console-tab active empty")
+                self.console_state_label = ui.label(
+                    f"{run.id} / {run.state.value.upper()}" if run else "IDLE / NO ACTIVE RUN"
+                ).classes("console-tab active" + ("" if run else " empty"))
                 ui.element("div").classes("console-spacer")
+                with ui.element("button").classes("console-action").props(
+                    'type=button aria-label="Cancel active run" title="Cancel active run"'
+                ).on("click", self.cancel_active_run) as self.cancel_run_button:
+                    icon("stop")
+                self.cancel_run_button.set_visibility(bool(run and not run.state.terminal))
                 with ui.element("button").classes("console-action").props(
                     f'type=button aria-label="{"Exit fullscreen" if self.console_fullscreen else "Fullscreen run output"}"'
                 ).on("click", self.toggle_console_fullscreen):
@@ -1296,10 +1519,24 @@ class DashboardUI:
             self.run_output = ui.log(max_lines=5000).classes("console-log").props(
                 'aria-label="Run output" role=log aria-live=polite'
             )
+            if run and run.run_path:
+                for stream_name in ("stdout", "stderr"):
+                    path = run.run_path / f"{stream_name}.log"
+                    if not path.is_file():
+                        continue
+                    prefix = "[stderr] " if stream_name == "stderr" else ""
+                    try:
+                        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                            self.run_output.push(prefix + line)
+                    except OSError:
+                        self.run_output.push(f"Unable to read {path.name}")
 
     # === END: RUN OUTPUT ===
 
 
 # NiceGUI root callable used by main.py.
-def build_ui() -> None:
-    DashboardUI().build()
+def build_ui(
+    app_config: AppConfig | None = None,
+    execution_manager: ExecutionManager | None = None,
+) -> None:
+    DashboardUI(app_config=app_config, execution_manager=execution_manager).build()

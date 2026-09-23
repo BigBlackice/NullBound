@@ -1,19 +1,36 @@
 """Blackwall NiceGUI entry point."""
 
+from functools import partial
+import sys
+
 from nicegui import ui
 
+from app_config import AppConfig
+from blackwall_execution import ExecutionManager
 from dashboard_ui import build_ui
 from recon_modules import FAVICON_SVG
 
 
-if __name__ == "__main__":
+def run(argv: list[str] | None = None) -> None:
+    """Validate startup configuration before exposing the NiceGUI application."""
+    config = AppConfig.from_args(argv)
+    if config.remote_access_warning:
+        print(f"WARNING: {config.remote_access_warning}", file=sys.stderr)
+
+    execution_manager = ExecutionManager()
+    execution_manager.recover_incomplete()
+
     ui.run(
-        root=build_ui,
+        root=partial(build_ui, app_config=config, execution_manager=execution_manager),
         title="Blackwall - All your base are belong to me",
         favicon=FAVICON_SVG,
         dark=True,
-        host="0.0.0.0",
-        port=8080,
+        host=config.host,
+        port=config.port,
         reload=False,
         show=False,
     )
+
+
+if __name__ == "__main__":
+    run()

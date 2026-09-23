@@ -111,6 +111,11 @@ class Project:
     def runs_path(self) -> Path:
         return self.path / "runs"
 
+    @property
+    def scope_path(self) -> Path:
+        """Optional versioned target/scope data stored beside project metadata."""
+        return self.path / "scope.json"
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectIssue:

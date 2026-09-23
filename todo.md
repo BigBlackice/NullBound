@@ -109,17 +109,21 @@ The persistent shell should include:
   to `~/.blackwall/projects`, but allow the operator to choose any parent path.
 - [x] Add a local directory browser, starting in `~/.blackwall`, for opening any
   folder containing a valid `project.json` as a workspace tab.
-- [ ] Allow tools to run with direct targets when no project is open.
-- [ ] Allow a project run to use direct targets without first adding them to scope.
+- [x] Model direct-target execution when no project is open. Tool process launch is
+  implemented separately in v0.1c.
+- [x] Allow a project execution context to use direct targets without first adding
+  them to scope.
 - [x] Store project metadata in a versioned, platform-neutral `project.json` file.
-- [ ] Add saved target sets containing domains, IPs, CIDRs, and URLs.
-- [ ] Support explicit includes, exclusions, and review-required targets.
-- [ ] Keep authorization status separate from ownership confidence:
+- [x] Add portable saved target sets containing domains, IPv4/IPv6 addresses,
+  CIDRs, and URLs.
+- [x] Support explicit includes, exclusions, and review-required targets through a
+  versioned, independently editable `scope.json` document.
+- [x] Keep authorization status separate from ownership confidence:
   - `scope_status`: `allowed`, `denied`
   - `ownership_confidence`: `confirmed`, `likely`, or `unknown`
 - [x] Make the active project and target set visible throughout the UI.
-- [ ] Tag each run with a nullable project ID and a captured project display name.
-- [ ] Determine project association from the active workspace. Module configuration
+- [x] Tag each run with a nullable project ID and a captured project display name.
+- [x] Determine project association from the active workspace. Module configuration
   must not contain a separate project selector: runs launched inside a project are
   filed into it automatically, while launchpad runs outside a project remain
   unattached.
@@ -128,7 +132,8 @@ The persistent shell should include:
 
 ### v0.1c — One complete execution path
 
-- [ ] Define the first tool-adapter schema.
+- [x] Define an argv-based, data-driven tool-adapter schema which runtime-added
+  modules and profiles can use without changing the process runner.
 - [ ] Build **Settings > Modules** to list, add, and edit modules. The editor must
   show an automatically allocated, read-only numeric ID after the module type,
   plus `eyebrow`, optional `icon`, `description`, `bin`, and executable `path`.
@@ -136,17 +141,17 @@ The persistent shell should include:
   the catalog's default icon whenever no icon is selected.
 - [ ] Support named scan profiles and provide per-module profile creation and
   editing in **Settings > Modules**.
-- [ ] Integrate ProjectDiscovery `httpx` as the first end-to-end adapter: availability
+- [x] Integrate ProjectDiscovery `httpx` as the first end-to-end adapter: availability
   check, version capture, direct/project targets, JSONL output, cancellation, and a
   completed run manifest. Keep it distinct from the Python HTTPX package.
 - [ ] Preview the exact executable and arguments before launch.
-- [ ] Launch processes without interpolating user input into a shell string.
-- [ ] Stream stdout and stderr to the run console.
-- [ ] Add a deliberate starting/loading state to the run console for the period
+- [x] Launch processes without interpolating user input into a shell string.
+- [x] Stream stdout and stderr to the run console and persistent log files.
+- [x] Add a deliberate starting/loading state to the run console for the period
   between launch and the first process output.
 - [ ] Support queueing, concurrency limits, timeouts, and process-group cancellation.
-- [ ] Preserve run state if the browser disconnects or refreshes.
-- [ ] Record executable path, version, arguments, inputs, timestamps, duration,
+- [x] Preserve run state if the browser disconnects or refreshes.
+- [x] Record executable path, version, arguments, inputs, timestamps, duration,
   exit code, and artifact hashes in a run manifest.
 - [ ] Add run history and artifact download/open actions.
 
@@ -330,7 +335,8 @@ a clear need:
   behind small platform services with explicit capability checks.
 - [ ] Add automated smoke tests on Linux and Windows; do not let support for either
   platform distort the persisted project format or adapter schema.
-- [ ] Bind the local application to `127.0.0.1` by default.
+- [x] Bind the local application to `127.0.0.1` by default, with validated
+  `--host`/`--port` overrides and a warning for explicit non-loopback access.
 - [ ] Define authentication and isolation requirements before permitting remote
   access.
 - [ ] Escape or sanitize tool output before rendering it in the browser.

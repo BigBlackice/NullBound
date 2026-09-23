@@ -14,11 +14,17 @@ CATALOG_SCHEMA_VERSION = 1
 
 @dataclass(frozen=True, slots=True)
 class ScanProfile:
-    """A named collection of module options and command-preview tokens."""
+    """A named, serializable command template for a module adapter.
+
+    ``arguments`` is an argv template, not a shell command. The ``{target}``
+    token is expanded by the adapter and every other item remains one argument.
+    """
 
     name: str
     options: tuple[tuple[str, str], ...] = ()
     command: tuple[tuple[str, str], ...] = ()
+    arguments: tuple[str, ...] = ()
+    output_format: str = "text"
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> ScanProfile:
@@ -29,6 +35,8 @@ class ScanProfile:
             name=name,
             options=tuple((str(item["label"]), str(item["value"])) for item in data.get("options", ())),
             command=tuple((str(item["type"]), str(item["text"])) for item in data.get("command", ())),
+            arguments=tuple(str(item) for item in data.get("arguments", ())),
+            output_format=str(data.get("output_format", "text")).strip() or "text",
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -36,6 +44,8 @@ class ScanProfile:
             "name": self.name,
             "options": [{"label": label, "value": value} for label, value in self.options],
             "command": [{"type": kind, "text": text} for kind, text in self.command],
+            "arguments": list(self.arguments),
+            "output_format": self.output_format,
         }
 
 
@@ -49,6 +59,7 @@ class ModuleDefinition:
     description: str
     bin: str
     path: str
+    adapter: str = "declarative"
     target_summary: str = "ADD TARGET"
     target_example: str = ""
     state: str = "MISSING"
@@ -75,6 +86,7 @@ class ModuleDefinition:
             description=required["description"],
             bin=required["bin"],
             path=required["path"],
+            adapter=str(data.get("adapter", "declarative")).strip() or "declarative",
             target_summary=str(data.get("target_summary", "ADD TARGET")),
             target_example=str(data.get("target_example", "")),
             state=str(data.get("state", "MISSING")),
@@ -103,6 +115,7 @@ class ModuleDefinition:
             "description": self.description,
             "bin": self.bin,
             "path": self.path,
+            "adapter": self.adapter,
             "target_summary": self.target_summary,
             "target_example": self.target_example,
             "state": self.state,
@@ -147,6 +160,7 @@ class ModuleCatalog:
         bin: str,
         path: str,
         icon: str | None = None,
+        adapter: str = "declarative",
         profiles: Iterable[ScanProfile] = (),
     ) -> ModuleDefinition:
         """Create and register a module; its display/index ID is always allocated here."""
@@ -158,6 +172,7 @@ class ModuleCatalog:
                 "description": description,
                 "bin": bin,
                 "path": path,
+                "adapter": adapter,
                 "profiles": [profile.to_mapping() for profile in profiles],
             }
         )

@@ -95,6 +95,7 @@
       "description": "Web Probe",
       "bin": "httpx",
       "path": "httpx",
+      "adapter": "httpx",
       "target_summary": "DIRECT / 2",
       "target_example": "https://api.acme.example",
       "state": "READY",
@@ -111,10 +112,20 @@
             {"type": "argument", "text": " -u "},
             {"type": "target", "text": "https://api.acme.example"},
             {"type": "argument", "text": " -title -tech-detect -fr -json"}
-          ]
+          ],
+          "arguments": ["-u", "{target}", "-title", "-tech-detect", "-fr", "-json"],
+          "output_format": "jsonl"
         },
-        {"name": "Light probe"},
-        {"name": "Extended fingerprint"}
+        {
+          "name": "Light probe",
+          "arguments": ["-u", "{target}", "-status-code", "-title", "-json"],
+          "output_format": "jsonl"
+        },
+        {
+          "name": "Extended fingerprint",
+          "arguments": ["-u", "{target}", "-status-code", "-title", "-tech-detect", "-web-server", "-ip", "-cname", "-asn", "-cdn", "-location", "-fr", "-json"],
+          "output_format": "jsonl"
+        }
       ]
     },
     {
