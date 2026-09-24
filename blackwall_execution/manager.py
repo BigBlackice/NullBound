@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import time
+import re
 from typing import Callable
 
 from .adapters import AdapterRegistry
@@ -16,6 +17,7 @@ from .store import RunStore
 
 
 RunListener = Callable[[RunEvent], None]
+ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 class ExecutionManager:
@@ -126,9 +128,11 @@ class ExecutionManager:
                 )
                 self._processes[run_id] = process
                 manifest = self._transition(manifest, RunState.RUNNING)
+                # Consume stderr first because many CLI tools write their startup
+                # banner there before emitting result records on stdout.
                 await asyncio.gather(
-                    self._pump(run_id, process.stdout, "stdout"),
                     self._pump(run_id, process.stderr, "stderr"),
+                    self._pump(run_id, process.stdout, "stdout"),
                 )
                 exit_code = await process.wait()
                 state = (
@@ -159,11 +163,18 @@ class ExecutionManager:
             return
         manifest = self._runs[run_id]
         log_path = manifest.run_path / f"{stream_name}.log"
-        with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        console_path = manifest.run_path / "console.log"
+        with (
+            log_path.open("a", encoding="utf-8", errors="replace") as log,
+            console_path.open("a", encoding="utf-8", errors="replace") as console_log,
+        ):
             while line := await stream.readline():
                 text = line.decode(errors="replace").rstrip("\r\n")
+                text = ANSI_ESCAPE.sub("", text)
                 log.write(text + "\n")
                 log.flush()
+                console_log.write(text + "\n")
+                console_log.flush()
                 self._emit(RunEvent(self._runs[run_id], stream_name, text))
 
     def _transition(self, manifest: RunManifest, state: RunState, **changes: object) -> RunManifest:

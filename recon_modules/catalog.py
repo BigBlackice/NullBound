@@ -5,19 +5,55 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable, Iterator, Mapping
 
 
 DEFAULT_ICON = "extension"
 CATALOG_SCHEMA_VERSION = 1
+FIELD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleConfigField:
+    """One optional, data-driven module input mapped to a single argv flag."""
+
+    id: str
+    label: str
+    argument: str
+    placeholder: str = ""
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> ModuleConfigField:
+        field_id = str(data.get("id", "")).strip()
+        label = str(data.get("label", "")).strip()
+        argument = str(data.get("argument", "")).strip()
+        if not FIELD_ID_PATTERN.fullmatch(field_id):
+            raise ValueError(f"invalid module config field id: {field_id!r}")
+        if not label or not argument:
+            raise ValueError(f"module config field {field_id!r} requires label and argument")
+        return cls(
+            id=field_id,
+            label=label,
+            argument=argument,
+            placeholder=str(data.get("placeholder", "")).strip(),
+        )
+
+    def to_mapping(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "argument": self.argument,
+            "placeholder": self.placeholder,
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class ScanProfile:
     """A named, serializable command template for a module adapter.
 
-    ``arguments`` is an argv template, not a shell command. The ``{target}``
-    token is expanded by the adapter and every other item remains one argument.
+    ``arguments`` is an argv template, not a shell command. Adapters expand its
+    typed target tokens while every other item remains one argument.
     """
 
     name: str
@@ -61,9 +97,10 @@ class ModuleDefinition:
     path: str
     adapter: str = "declarative"
     target_summary: str = "ADD TARGET"
-    target_example: str = ""
+    target_placeholder: str = ""
     state: str = "MISSING"
     profiles: tuple[ScanProfile, ...] = ()
+    config_fields: tuple[ModuleConfigField, ...] = ()
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> ModuleDefinition:
@@ -88,9 +125,13 @@ class ModuleDefinition:
             path=required["path"],
             adapter=str(data.get("adapter", "declarative")).strip() or "declarative",
             target_summary=str(data.get("target_summary", "ADD TARGET")),
-            target_example=str(data.get("target_example", "")),
+            # Read the old key as a migration fallback, but never submit it as a value.
+            target_placeholder=str(data.get("target_placeholder", data.get("target_example", ""))),
             state=str(data.get("state", "MISSING")),
             profiles=tuple(ScanProfile.from_mapping(profile) for profile in data.get("profiles", ())),
+            config_fields=tuple(
+                ModuleConfigField.from_mapping(field) for field in data.get("config_fields", ())
+            ),
         )
 
     @property
@@ -117,9 +158,10 @@ class ModuleDefinition:
             "path": self.path,
             "adapter": self.adapter,
             "target_summary": self.target_summary,
-            "target_example": self.target_example,
+            "target_placeholder": self.target_placeholder,
             "state": self.state,
             "profiles": [profile.to_mapping() for profile in self.profiles],
+            "config_fields": [field.to_mapping() for field in self.config_fields],
         }
 
 
@@ -161,7 +203,9 @@ class ModuleCatalog:
         path: str,
         icon: str | None = None,
         adapter: str = "declarative",
+        target_placeholder: str = "",
         profiles: Iterable[ScanProfile] = (),
+        config_fields: Iterable[ModuleConfigField] = (),
     ) -> ModuleDefinition:
         """Create and register a module; its display/index ID is always allocated here."""
         module = ModuleDefinition.from_mapping(
@@ -173,7 +217,9 @@ class ModuleCatalog:
                 "bin": bin,
                 "path": path,
                 "adapter": adapter,
+                "target_placeholder": target_placeholder,
                 "profiles": [profile.to_mapping() for profile in profiles],
+                "config_fields": [field.to_mapping() for field in config_fields],
             }
         )
         self._modules.append(module)
@@ -185,6 +231,8 @@ class ModuleCatalog:
         changes.pop("id", None)
         if "profiles" in changes:
             changes["profiles"] = [profile.to_mapping() for profile in changes["profiles"]]
+        if "config_fields" in changes:
+            changes["config_fields"] = [field.to_mapping() for field in changes["config_fields"]]
         data = current.to_mapping()
         data.update(changes)
         updated = ModuleDefinition.from_mapping(data)

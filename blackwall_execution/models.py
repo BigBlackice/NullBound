@@ -42,6 +42,7 @@ class RunRequest:
     module: ModuleDefinition
     profile: ScanProfile
     context: ExecutionContext
+    options: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,7 @@ class RunManifest:
     profile_name: str
     targets: tuple[dict[str, str], ...]
     target_source: str
+    options: tuple[tuple[str, str], ...]
     project_id: str | None
     project_name: str | None
     scope_enforced: bool
@@ -110,7 +112,9 @@ class RunManifest:
             module_bin=str(data["module_bin"]), module_path=str(data["module_path"]),
             module_version=data.get("module_version"), profile_name=str(data["profile_name"]),
             targets=tuple(dict(item) for item in data.get("targets", ())),
-            target_source=str(data["target_source"]), project_id=data.get("project_id"),
+            target_source=str(data["target_source"]),
+            options=tuple((str(x["id"]), str(x["value"])) for x in data.get("options", ())),
+            project_id=data.get("project_id"),
             project_name=data.get("project_name"), scope_enforced=bool(data["scope_enforced"]),
             executable=str(data["executable"]), arguments=tuple(str(x) for x in data["arguments"]),
             created_at=str(data["created_at"]), started_at=data.get("started_at"),
@@ -128,7 +132,9 @@ class RunManifest:
             "module_name": self.module_name, "module_bin": self.module_bin,
             "module_path": self.module_path, "module_version": self.module_version,
             "profile_name": self.profile_name, "targets": list(self.targets),
-            "target_source": self.target_source, "project_id": self.project_id,
+            "target_source": self.target_source,
+            "options": [{"id": key, "value": value} for key, value in self.options],
+            "project_id": self.project_id,
             "project_name": self.project_name, "scope_enforced": self.scope_enforced,
             "executable": self.executable, "arguments": list(self.arguments),
             "created_at": self.created_at, "started_at": self.started_at,

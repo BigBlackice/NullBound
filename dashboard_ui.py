@@ -162,12 +162,16 @@ class DashboardUI:
         self.selected_scope_id = SCOPE_RULES[0]["id"]
         self.selected_run_id: str | None = None
         self.target_modes = {module.id: "direct" for module in modules}
-        self.direct_targets = {module.id: module.target_example for module in modules}
+        self.direct_targets = {module.id: "" for module in modules}
         self.selected_profiles = {module.id: module.default_profile.name for module in modules}
+        self.module_config_values = {
+            module.id: {field.id: "" for field in module.config_fields} for module in modules
+        }
         self.selected_target_sets: dict[str, str] = {}
         self.search_query = ""
         self.console_minimized = False
         self.console_fullscreen = False
+        self.console_wrap = True
         self.inspector_collapsed = False
         self.proxy_enabled = False
         self.scope_enforced = False
@@ -371,8 +375,11 @@ class DashboardUI:
         self.selected_module_id = module_id
         module = self.selected_module
         self.target_modes.setdefault(module.id, "direct")
-        self.direct_targets.setdefault(module.id, module.target_example)
+        self.direct_targets.setdefault(module.id, "")
         self.selected_profiles.setdefault(module.id, module.default_profile.name)
+        self.module_config_values.setdefault(
+            module.id, {field.id: "" for field in module.config_fields}
+        )
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
@@ -392,6 +399,14 @@ class DashboardUI:
 
     def set_target_set(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
         self.selected_target_sets[module_id] = str(event.value)
+
+    def set_module_config(
+        self,
+        module_id: str,
+        field_id: str,
+        event: events.ValueChangeEventArguments,
+    ) -> None:
+        self.module_config_values.setdefault(module_id, {})[field_id] = str(event.value or "")
 
     def set_search_query(self, event: events.ValueChangeEventArguments) -> None:
         self.search_query = str(event.value or "")
@@ -449,7 +464,16 @@ class DashboardUI:
                 project_name=project.name if project else None,
                 scope_enforced=self.scope_enforced,
             )
-            request = RunRequest(module=module, profile=self._selected_profile(module), context=context)
+            options = tuple(
+                (field.id, self.module_config_values.get(module.id, {}).get(field.id, ""))
+                for field in module.config_fields
+            )
+            request = RunRequest(
+                module=module,
+                profile=self._selected_profile(module),
+                context=context,
+                options=options,
+            )
             run = await self.execution_manager.start(request, project.path if project else None)
         except (ExecutionError, OSError, ScopeValidationError, KeyError) as error:
             ui.notify(str(error), type="negative")
@@ -470,8 +494,7 @@ class DashboardUI:
         if event.run.id != self.active_run_id:
             return
         if event.text is not None and hasattr(self, "run_output"):
-            prefix = "[stderr] " if event.stream == "stderr" else ""
-            self.run_output.push(prefix + event.text)
+            self.push_run_output(event.text)
         if hasattr(self, "console_state_label"):
             self.console_state_label.set_text(f"{event.run.id} / {event.run.state.value.upper()}")
         if hasattr(self, "cancel_run_button"):
@@ -483,6 +506,17 @@ class DashboardUI:
     async def cancel_active_run(self) -> None:
         if self.active_run_id and await self.execution_manager.cancel(self.active_run_id):
             ui.notify(f"Cancellation requested for {self.active_run_id}")
+
+    def push_run_output(self, text: str) -> None:
+        """Append one line to the native, size-constrained console viewport."""
+        with self.run_output:
+            ui.label(text).classes("console-line")
+        while len(self.run_output.default_slot.children) > 5000:
+            self.run_output.remove(0)
+        ui.run_javascript(
+            f'const output = document.querySelector("#c{self.run_output.id}"); '
+            'if (output) output.scrollTop = output.scrollHeight;'
+        )
 
     # Project-tab actions delegate persistence and validation to blackwall_projects.
     def select_project(self, project_id: str) -> None:
@@ -559,6 +593,17 @@ class DashboardUI:
             self.console_minimized = False
         self.update_console_layout()
         self.render_console()
+
+    def set_console_wrap(self, event: events.ValueChangeEventArguments) -> None:
+        self.console_wrap = bool(event.value)
+        if hasattr(self, "run_output"):
+            if self.console_wrap:
+                self.run_output.classes(add="wrap-output")
+                ui.run_javascript(
+                    f'document.querySelector("#c{self.run_output.id}")?.scrollTo({{left: 0}})'
+                )
+            else:
+                self.run_output.classes(remove="wrap-output")
 
     def toggle_inspector_collapsed(self) -> None:
         self.inspector_collapsed = not self.inspector_collapsed
@@ -1027,6 +1072,7 @@ class DashboardUI:
                     if target_mode == "direct":
                         ui.textarea(
                             value=self.direct_targets[module.id],
+                            placeholder=module.target_placeholder,
                             on_change=partial(self.set_direct_target, module.id),
                         ).props("dense outlined autogrow").classes("config-control")
                         ui.button(
@@ -1068,6 +1114,19 @@ class DashboardUI:
                             ui.label(label).classes("check-name")
                             ui.label(value).classes("check-value")
 
+                if module.config_fields:
+                    with ui.element("div").classes("field"):
+                        ui.label("MODULE OPTIONS").classes("field-label")
+                        for config_field in module.config_fields:
+                            ui.label(config_field.label).classes("field-label")
+                            ui.input(
+                                value=self.module_config_values[module.id].get(config_field.id, ""),
+                                placeholder=config_field.placeholder,
+                                on_change=partial(
+                                    self.set_module_config, module.id, config_field.id
+                                ),
+                            ).props("dense outlined clearable").classes("config-control")
+
                 with ui.element("div").classes("field"):
                     ui.label("COMMAND PREVIEW").classes("field-label")
                     with ui.element("div").classes("command-preview"):
@@ -1077,11 +1136,26 @@ class DashboardUI:
                             arguments = expand_argument_template(
                                 profile.arguments,
                                 tuple(target.normalized for target in selection.targets),
+                                target_file="<run>/inputs/targets.txt",
                             )
                             for argument in arguments:
                                 ui.label(f" {shlex.quote(argument)}").classes("command-argument")
-                            if module.adapter == "httpx":
-                                ui.label(" -o <run>/artifacts/httpx.jsonl").classes("command-argument")
+                            for config_field in module.config_fields:
+                                value = self.module_config_values[module.id].get(config_field.id, "").strip()
+                                if value:
+                                    ui.label(
+                                        f" {config_field.argument} {shlex.quote(value)}"
+                                    ).classes("command-argument")
+                            artifact_arguments = {
+                                "amass": " -nocolor -dir <run>/artifacts/amass",
+                                "dnsx": " -json -no-color -o <run>/artifacts/dnsx.jsonl",
+                                "nmap": " -oX <run>/artifacts/nmap.xml",
+                                "httpx": " -no-color -o <run>/artifacts/httpx.jsonl",
+                                "gau": " --json --o <run>/artifacts/gau.jsonl",
+                                "tlsx": " -json -no-color -o <run>/artifacts/tlsx.jsonl",
+                            }
+                            if module.adapter in artifact_arguments:
+                                ui.label(artifact_arguments[module.adapter]).classes("command-argument")
                         except (ExecutionError, ScopeValidationError, KeyError):
                             for token_type, text in profile.command:
                                 if token_type != "tool":
@@ -1421,17 +1495,31 @@ class DashboardUI:
                     module_id = module.id
 
                 with ui.element("div").classes("settings-field-grid"):
-                    self.render_setting_field("TYPE / EYEBROW", module.eyebrow if module else "discovery")
+                    self.render_setting_field(
+                        "TYPE / EYEBROW", module.eyebrow if module else "",
+                        placeholder="e.g. discovery",
+                    )
                     self.render_setting_field("AUTO ID", module_id, readonly=True)
-                self.render_setting_field("DESCRIPTION", module.description if module else "")
+                self.render_setting_field(
+                    "DESCRIPTION", module.description if module else "",
+                    placeholder="what the module does",
+                )
                 with ui.element("div").classes("settings-field-grid"):
-                    self.render_setting_field("BINARY", module.bin if module else "")
-                    self.render_setting_field("ICON (OPTIONAL)", module.icon if module else "")
-                self.render_setting_field("EXECUTABLE PATH", module.path if module else "")
+                    self.render_setting_field(
+                        "BINARY", module.bin if module else "", placeholder="e.g. amass"
+                    )
+                    self.render_setting_field(
+                        "ICON (OPTIONAL)", module.icon if module else "",
+                        placeholder="default icon if empty",
+                    )
+                self.render_setting_field(
+                    "EXECUTABLE PATH", module.path if module else "",
+                    placeholder="binary name or full executable path",
+                )
 
                 ui.label("SCAN PROFILES").classes("settings-group-title profile-heading")
                 with ui.element("div").classes("profile-list"):
-                    profile_names = module.profile_names if module else ("Default",)
+                    profile_names = module.profile_names if module else ()
                     for index, profile_name in enumerate(profile_names):
                         with ui.element("div").classes("profile-row"):
                             ui.label(f"{index + 1:02d}").classes("profile-index")
@@ -1468,11 +1556,19 @@ class DashboardUI:
             ui.checkbox("Show navigation badges", value=True).props("dense").classes("setting-check")
 
     def render_setting_field(
-        self, label: str, value: str, *, readonly: bool = False, password: bool = False
+        self,
+        label: str,
+        value: str,
+        *,
+        readonly: bool = False,
+        password: bool = False,
+        placeholder: str = "",
     ) -> None:
         with ui.element("div").classes("settings-field"):
             ui.label(label).classes("field-label")
-            field = ui.input(value=value).props("dense outlined").classes("config-control settings-input")
+            field = ui.input(value=value, placeholder=placeholder).props("dense outlined").classes(
+                "config-control settings-input"
+            )
             if readonly:
                 field.props("readonly")
             if password:
@@ -1501,6 +1597,9 @@ class DashboardUI:
                 self.console_state_label = ui.label(
                     f"{run.id} / {run.state.value.upper()}" if run else "IDLE / NO ACTIVE RUN"
                 ).classes("console-tab active" + ("" if run else " empty"))
+                ui.checkbox(
+                    "WRAP", value=self.console_wrap, on_change=self.set_console_wrap
+                ).props("dense").classes("console-wrap-toggle")
                 ui.element("div").classes("console-spacer")
                 with ui.element("button").classes("console-action").props(
                     'type=button aria-label="Cancel active run" title="Cancel active run"'
@@ -1516,20 +1615,26 @@ class DashboardUI:
                 ).on("click", self.toggle_console_minimized):
                     icon("keyboard_arrow_up" if self.console_minimized else "keyboard_arrow_down")
 
-            self.run_output = ui.log(max_lines=5000).classes("console-log").props(
+            log_classes = "console-log wrap-output" if self.console_wrap else "console-log"
+            self.run_output = ui.element("div").classes(log_classes).props(
                 'aria-label="Run output" role=log aria-live=polite'
             )
             if run and run.run_path:
-                for stream_name in ("stdout", "stderr"):
-                    path = run.run_path / f"{stream_name}.log"
+                console_path = run.run_path / "console.log"
+                paths = (console_path,) if console_path.is_file() else (
+                    run.run_path / "stderr.log",
+                    run.run_path / "stdout.log",
+                )
+                for path in paths:
                     if not path.is_file():
                         continue
-                    prefix = "[stderr] " if stream_name == "stderr" else ""
                     try:
                         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                            self.run_output.push(prefix + line)
+                            with self.run_output:
+                                ui.label(line).classes("console-line")
                     except OSError:
-                        self.run_output.push(f"Unable to read {path.name}")
+                        with self.run_output:
+                            ui.label(f"Unable to read {path.name}").classes("console-line")
 
     # === END: RUN OUTPUT ===
 

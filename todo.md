@@ -144,6 +144,9 @@ The persistent shell should include:
 - [x] Integrate ProjectDiscovery `httpx` as the first end-to-end adapter: availability
   check, version capture, direct/project targets, JSONL output, cancellation, and a
   completed run manifest. Keep it distinct from the Python HTTPX package.
+- [x] Add initial runnable profiles and raw artifacts for every Launchpad module:
+  Amass, dnsx, Nmap, httpx, gau, and tlsx. Normalization into project evidence
+  remains a separate v0.2 concern.
 - [ ] Preview the exact executable and arguments before launch.
 - [x] Launch processes without interpolating user input into a shell string.
 - [x] Stream stdout and stderr to the run console and persistent log files.
@@ -177,6 +180,8 @@ The persistent shell should include:
 - [ ] Define normalized record envelopes with stable IDs and source provenance.
 - [ ] Implement `parse -> normalize -> deduplicate -> scope review` as explicit,
   independently testable stages.
+- [ ] Import the native Amass OAM `asset.db` run artifact without flattening its
+  asset relationships, source provenance, or confidence metadata.
 - [ ] Preserve every raw value alongside its normalized comparison key.
 - [ ] Treat URL canonicalization conservatively and record the normalization
   version and transformations.

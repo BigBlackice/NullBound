@@ -55,6 +55,8 @@ class AdapterTests(unittest.TestCase):
     def test_httpx_catalog_has_an_executable_argv_profile(self) -> None:
         module = load_default_catalog().get("04")
         self.assertEqual(module.adapter, "httpx")
+        self.assertEqual(module.config_fields[0].id, "resolver")
+        self.assertEqual(module.config_fields[0].argument, "-r")
         for profile in module.profiles:
             self.assertIn("{target}", profile.arguments)
             self.assertEqual(profile.output_format, "jsonl")
@@ -63,6 +65,75 @@ class AdapterTests(unittest.TestCase):
         hostile = "example.com; echo should-not-run"
         arguments = expand_argument_template(("-u", "{target}", "-json"), (hostile,))
         self.assertEqual(arguments, ("-u", hostile, "-json"))
+
+    def test_positional_and_file_target_templates_preserve_boundaries(self) -> None:
+        targets = ("one.example", "two.example")
+        positional = expand_argument_template(("-sT", "{targets}"), targets)
+        from_file = expand_argument_template(
+            ("-l", "{target_file}", "-a"), targets, target_file="inputs/targets.txt"
+        )
+        self.assertEqual(positional, ("-sT", *targets))
+        self.assertEqual(from_file, ("-l", "inputs/targets.txt", "-a"))
+
+    def test_every_builtin_module_builds_a_safe_artifact_command(self) -> None:
+        catalog = load_default_catalog()
+        target_values = {
+            "01": "example.com", "02": "api.example.com", "03": "192.0.2.10",
+            "04": "https://example.com", "05": "example.com", "06": "example.com",
+        }
+        artifact_flags = {
+            "01": "-dir", "02": "-o", "03": "-oX",
+            "04": "-o", "05": "--o", "06": "-o",
+        }
+        registry = AdapterRegistry()
+
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            for module in catalog:
+                with self.subTest(module=module.bin):
+                    request = RunRequest(
+                        module=module,
+                        profile=module.default_profile,
+                        context=ExecutionContext(
+                            selection=TargetSelection.direct((Target.parse(target_values[module.id]),))
+                        ),
+                    )
+                    run_path = root / module.bin
+                    command = registry.get(module.adapter).build_command(
+                        request, run_path, module.bin
+                    )
+                    self.assertEqual(command.executable, module.bin)
+                    self.assertIn(artifact_flags[module.id], command.arguments)
+                    self.assertNotIn(";", command.arguments)
+
+            dns_targets = root / "dnsx" / "inputs" / "targets.txt"
+            self.assertEqual(dns_targets.read_text(encoding="utf-8"), "api.example.com\n")
+
+    def test_amass_uses_current_v5_flags_and_preserves_the_oam_database(self) -> None:
+        module = load_default_catalog().get("01")
+        request = RunRequest(
+            module=module,
+            profile=module.default_profile,
+            context=ExecutionContext(
+                selection=TargetSelection.direct((Target.parse("example.com"),))
+            ),
+        )
+        run_path = Path("portable-run")
+
+        command = AdapterRegistry().get("amass").build_command(request, run_path, "amass")
+
+        self.assertNotIn("-json", command.arguments)
+        self.assertNotIn("-passive", command.arguments)
+        self.assertNotIn("-brute", command.arguments)
+        self.assertEqual(command.arguments[-2:], ("-dir", str(run_path / "artifacts" / "amass")))
+        self.assertEqual(command.output_format, "oam-sqlite")
+
+    def test_catalog_targets_are_placeholders_not_submitted_values(self) -> None:
+        for module in load_default_catalog():
+            self.assertTrue(module.target_placeholder)
+            self.assertNotIn("target_example", module.to_mapping())
+            for profile in module.profiles:
+                self.assertTrue(profile.arguments)
 
     def test_httpx_writes_jsonl_into_the_run_artifact_directory(self) -> None:
         module = load_default_catalog().get("04")
@@ -78,7 +149,32 @@ class AdapterTests(unittest.TestCase):
         command = HttpxAdapter().build_command(request, run_path, "httpx")
 
         self.assertEqual(command.argv[:3], ("httpx", "-u", "https://example.com/"))
+        self.assertNotIn("-silent", command.arguments)
+        self.assertIn("-no-color", command.arguments)
         self.assertEqual(command.arguments[-2:], ("-o", str(run_path / "artifacts" / "httpx.jsonl")))
+
+    def test_httpx_optional_resolver_is_passed_as_safe_argv_elements(self) -> None:
+        module = load_default_catalog().get("04")
+        request = RunRequest(
+            module=module,
+            profile=module.default_profile,
+            context=ExecutionContext(
+                selection=TargetSelection.direct((Target.parse("https://example.com"),))
+            ),
+            options=(("resolver", "udp:10.64.0.1:53"),),
+        )
+
+        command = HttpxAdapter().build_command(request, Path("run"), "httpx")
+
+        resolver_index = command.arguments.index("-r")
+        self.assertEqual(command.arguments[resolver_index + 1], "udp:10.64.0.1:53")
+
+    def test_httpx_version_parser_skips_the_ascii_banner(self) -> None:
+        version = HttpxAdapter().parse_version([
+            "    __    __  __       _  __",
+            "[INF] Current httpx version v1.12.0 (latest)",
+        ])
+        self.assertEqual(version, "v1.12.0")
 
 
 class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -113,6 +209,9 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.module_version, "test-python")
         self.assertIn("hello stdout", (finished.run_path / "stdout.log").read_text())
         self.assertIn("hello stderr", (finished.run_path / "stderr.log").read_text())
+        combined_output = (finished.run_path / "console.log").read_text()
+        self.assertIn("hello stdout", combined_output)
+        self.assertIn("hello stderr", combined_output)
         self.assertEqual(finished.artifacts[0].path, "artifacts/result.jsonl")
         self.assertEqual(len(finished.artifacts[0].sha256), 64)
         self.assertTrue(any(event.text == "hello stdout" for event in events))

@@ -269,7 +269,8 @@ button { font-family: inherit; }
   grid-column: 2;
   grid-row: 2;
   min-width: 0;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: scroll;
   padding: 15px 18px 22px;
 }
 .section-kicker { color: var(--structure); font-size: 9px; letter-spacing: .2em; text-transform: uppercase; }
@@ -838,6 +839,8 @@ button { font-family: inherit; }
   grid-column: 2 / 4;
   grid-row: 3;
   min-width: 0;
+  min-height: 0;
+  max-width: 100%;
   overflow: hidden;
   border-top: 1px solid var(--line);
   background: var(--surface);
@@ -860,7 +863,24 @@ button { font-family: inherit; }
   cursor: pointer;
 }
 .console-action:hover { background: color-mix(in srgb, var(--structure) 12%, transparent); }
+.console-wrap-toggle {
+  align-self: stretch;
+  padding: 0 10px;
+  border-left: 1px solid var(--line);
+  color: var(--structure) !important;
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+.console-wrap-toggle .q-checkbox__inner { color: var(--structure) !important; }
+.console-wrap-toggle .q-checkbox__inner--truthy { color: var(--interactive) !important; }
+.console-wrap-toggle .q-checkbox__bg { border-radius: 0 !important; }
+.console-wrap-toggle .q-checkbox__svg { color: var(--void) !important; }
+.console-wrap-toggle:has(.q-checkbox__inner--truthy) .q-checkbox__label { color: var(--interactive); }
 .console-log {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
   height: calc(100% - 35px);
   padding: 9px 17px;
   overflow: auto;
@@ -869,6 +889,29 @@ button { font-family: inherit; }
   font-family: var(--mono);
   font-size: 9px;
   line-height: 1.55;
+  scrollbar-color: var(--interactive) var(--line);
+  scrollbar-width: thin;
+}
+.console-log::-webkit-scrollbar { width: 6px; height: 6px; }
+.console-log::-webkit-scrollbar-track { background: var(--line); }
+.console-log::-webkit-scrollbar-thumb { border-radius: 0; background: var(--interactive); }
+.console-log.wrap-output .console-line {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+.console-log:not(.wrap-output) .console-line {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  white-space: pre !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
 }
 .app-shell.console-minimized .console-log { display: none; }
 

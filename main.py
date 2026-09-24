@@ -3,7 +3,7 @@
 from functools import partial
 import sys
 
-from nicegui import ui
+from nicegui import app, ui
 
 from app_config import AppConfig
 from blackwall_execution import ExecutionManager
@@ -19,6 +19,8 @@ def run(argv: list[str] | None = None) -> None:
 
     execution_manager = ExecutionManager()
     execution_manager.recover_incomplete()
+    print("Jacking in...", flush=True)
+    app.on_startup(lambda: print("BlackWall ready!", flush=True))
 
     ui.run(
         root=partial(build_ui, app_config=config, execution_manager=execution_manager),
@@ -29,6 +31,7 @@ def run(argv: list[str] | None = None) -> None:
         port=config.port,
         reload=False,
         show=False,
+        show_welcome_message=False,
     )
 
 

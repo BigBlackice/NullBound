@@ -69,6 +69,7 @@ class RunStore:
                 for target in context.selection.targets
             ),
             target_source=context.selection.source.value,
+            options=request.options,
             project_id=context.project_id,
             project_name=context.project_name,
             scope_enforced=context.scope_enforced,
@@ -147,4 +148,3 @@ class RunStore:
                 sha256=digest.hexdigest(),
             ))
         return tuple(records)
-

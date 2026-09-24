@@ -3,7 +3,7 @@
 from base64 import b64encode
 from pathlib import Path
 
-from .catalog import DEFAULT_ICON, ModuleCatalog, ModuleDefinition, ScanProfile
+from .catalog import DEFAULT_ICON, ModuleCatalog, ModuleConfigField, ModuleDefinition, ScanProfile
 
 
 DEFAULT_CATALOG_PATH = Path(__file__).with_name("definitions.json")
@@ -24,6 +24,7 @@ __all__ = [
     "FAVICON_DATA_URL",
     "FAVICON_SVG",
     "ModuleCatalog",
+    "ModuleConfigField",
     "ModuleDefinition",
     "ScanProfile",
     "load_default_catalog",
