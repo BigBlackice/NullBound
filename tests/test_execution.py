@@ -6,11 +6,15 @@ import asyncio
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from blackwall_execution import (
     AdapterRegistry,
     CommandSpec,
+    DeclarativeAdapter,
+    ExecutionError,
     ExecutionManager,
     RunRequest,
     RunState,
@@ -169,6 +173,38 @@ class AdapterTests(unittest.TestCase):
         resolver_index = command.arguments.index("-r")
         self.assertEqual(command.arguments[resolver_index + 1], "udp:10.64.0.1:53")
 
+    def test_preview_uses_real_artifact_command_with_placeholder_run_path(self) -> None:
+        module = load_default_catalog().get("04")
+        request = RunRequest(
+            module=module,
+            profile=module.default_profile,
+            context=ExecutionContext(
+                selection=TargetSelection.direct((Target.parse("https://example.com"),))
+            ),
+        )
+
+        command = HttpxAdapter().preview_command(request, "httpx")
+
+        self.assertEqual(command.executable, "httpx")
+        self.assertIn(str(Path("<run>") / "artifacts" / "httpx.jsonl"), command.arguments)
+
+    def test_configured_executable_path_must_be_runnable(self) -> None:
+        with TemporaryDirectory() as directory:
+            executable = Path(directory) / "probe"
+            executable.write_text("test", encoding="utf-8")
+            original = request_for("print('unused')")
+            module = ModuleDefinition.from_mapping({
+                **original.module.to_mapping(),
+                "path": str(executable),
+                "adapter": "declarative",
+                "profiles": [{"name": "Default", "arguments": ["{targets}"]}],
+            })
+            request = RunRequest(module, module.default_profile, original.context)
+
+            with patch("blackwall_execution.adapters.os.access", return_value=False):
+                with self.assertRaisesRegex(ExecutionError, "not runnable"):
+                    DeclarativeAdapter().resolve_executable(request)
+
     def test_httpx_version_parser_skips_the_ascii_banner(self) -> None:
         version = HttpxAdapter().parse_version([
             "    __    __  __       _  __",
@@ -261,6 +297,73 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(recovered[0].state, RunState.FAILED)
         self.assertIn("stopped", recovered[0].error)
+
+    async def test_standalone_run_can_be_adopted_by_a_project(self) -> None:
+        run = await self.manager.start(request_for("print('adopt me')"))
+        await self.manager.wait(run.id)
+        project_path = Path(self.temporary_directory.name) / "adopted-project"
+        project_path.mkdir()
+        project = SimpleNamespace(id="P-0099", name="Adopted", path=project_path)
+
+        adopted = self.manager.adopt_unattached(project)
+
+        self.assertEqual(adopted[0].project_id, "P-0099")
+        self.assertEqual(adopted[0].run_path.parent, project_path / "runs")
+        self.assertFalse((self.store.standalone_root / run.id).exists())
+
+    async def test_standalone_runs_can_be_permanently_deleted(self) -> None:
+        run = await self.manager.start(request_for("print('discard me')"))
+        await self.manager.wait(run.id)
+
+        removed = self.manager.delete_unattached()
+
+        self.assertEqual(removed, (run.id,))
+        self.assertFalse(run.run_path.exists())
+
+    async def test_active_standalone_run_cannot_be_adopted_or_deleted(self) -> None:
+        run = await self.manager.start(request_for("import time; time.sleep(30)"))
+        for _ in range(100):
+            if self.manager.get(run.id).state is RunState.RUNNING:
+                break
+            await asyncio.sleep(0.01)
+        project_path = Path(self.temporary_directory.name) / "blocked-project"
+        project_path.mkdir()
+        project = SimpleNamespace(id="P-0100", name="Blocked", path=project_path)
+
+        try:
+            with self.assertRaisesRegex(ExecutionError, "active standalone runs"):
+                self.manager.adopt_unattached(project)
+            with self.assertRaisesRegex(ExecutionError, "active standalone runs"):
+                self.manager.delete_unattached()
+        finally:
+            await self.manager.cancel(run.id)
+            await asyncio.wait_for(self.manager.wait(run.id), timeout=5)
+
+    async def test_artifact_resolution_rejects_paths_outside_artifact_directory(self) -> None:
+        script = "from pathlib import Path; Path('artifacts/result.txt').write_text('safe')"
+        run = await self.manager.start(request_for(script))
+        finished = await self.manager.wait(run.id)
+        outside = finished.run_path / "outside.txt"
+        outside.write_text("unsafe", encoding="utf-8")
+
+        resolved = self.store.resolve_artifact(finished, "artifacts/result.txt")
+
+        self.assertEqual(resolved, (finished.run_path / "artifacts" / "result.txt").resolve())
+        with self.assertRaisesRegex(ExecutionError, "escapes"):
+            self.store.resolve_artifact(finished, "outside.txt")
+
+    async def test_run_timeout_is_recorded_as_failure(self) -> None:
+        request = request_for("import time; time.sleep(30)")
+        request = RunRequest(
+            module=request.module, profile=request.profile, context=request.context,
+            timeout_seconds=1,
+        )
+
+        run = await self.manager.start(request)
+        finished = await asyncio.wait_for(self.manager.wait(run.id), timeout=8)
+
+        self.assertEqual(finished.state, RunState.FAILED)
+        self.assertIn("timed out after 1 seconds", finished.error)
 
 
 if __name__ == "__main__":

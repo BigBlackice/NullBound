@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 from .models import (
@@ -31,7 +33,11 @@ class RunStore:
     """Create and discover self-contained run records."""
 
     def __init__(self, standalone_root: Path | None = None) -> None:
-        self.standalone_root = (standalone_root or default_runs_root()).expanduser().resolve(False)
+        # Unattached runs intentionally live only for this Blackwall process.
+        # An explicit root remains available for tests and embedding.
+        self._temporary_directory = TemporaryDirectory(prefix="blackwall-runs-") if standalone_root is None else None
+        root = Path(self._temporary_directory.name) if self._temporary_directory else standalone_root
+        self.standalone_root = Path(root).expanduser().resolve(False)
 
     def reserve(self, project_path: Path | None = None) -> tuple[str, Path]:
         root = (
@@ -76,6 +82,7 @@ class RunStore:
             executable=command.executable,
             arguments=command.arguments,
             created_at=utc_now(),
+            timeout_seconds=request.timeout_seconds,
             run_path=run_path,
         )
         return self.save(manifest)
@@ -118,6 +125,61 @@ class RunStore:
                 except ExecutionError:
                     continue
         return tuple(sorted(records.values(), key=lambda item: item.created_at, reverse=True))
+
+    def list_unattached(self) -> tuple[RunManifest, ...]:
+        """Return session-only runs which have not been assigned to a project."""
+        if not self.standalone_root.is_dir():
+            return ()
+        return tuple(run for run in self.list_runs() if run.project_id is None)
+
+    def adopt_unattached(self, project: object) -> tuple[RunManifest, ...]:
+        """Move all terminal session runs into a newly created project."""
+        runs = self.list_unattached()
+        active = tuple(run for run in runs if not run.state.terminal)
+        if active:
+            raise ExecutionError("wait for or cancel active standalone runs before creating a project")
+        project_path = Path(getattr(project, "path"))
+        destination_root = project_path / "runs"
+        destination_root.mkdir(parents=True, exist_ok=True)
+        collisions = tuple(run.id for run in runs if (destination_root / run.id).exists())
+        if collisions:
+            raise ExecutionError(f"project already contains run {collisions[0]}")
+        adopted: list[RunManifest] = []
+        for run in runs:
+            if run.run_path is None:
+                continue
+            destination = destination_root / run.id
+            shutil.move(str(run.run_path), str(destination))
+            adopted.append(self.save(run.evolve(
+                project_id=str(getattr(project, "id")),
+                project_name=str(getattr(project, "name")),
+                run_path=destination,
+            )))
+        return tuple(adopted)
+
+    def delete_unattached(self) -> tuple[str, ...]:
+        """Permanently remove all terminal session-only runs."""
+        runs = self.list_unattached()
+        if any(not run.state.terminal for run in runs):
+            raise ExecutionError("wait for or cancel active standalone runs before deleting them")
+        removed: list[str] = []
+        for run in runs:
+            if run.run_path and run.run_path.is_dir():
+                shutil.rmtree(run.run_path)
+            removed.append(run.id)
+        return tuple(removed)
+
+    @staticmethod
+    def resolve_artifact(manifest: RunManifest, relative_path: str) -> Path:
+        if manifest.run_path is None:
+            raise ExecutionError("run has no storage path")
+        root = (manifest.run_path / "artifacts").resolve()
+        candidate = (manifest.run_path / relative_path).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise ExecutionError("artifact path escapes the run directory")
+        if not candidate.is_file():
+            raise ExecutionError("artifact no longer exists")
+        return candidate
 
     def recover_incomplete(self, project_paths: tuple[Path, ...] = ()) -> tuple[RunManifest, ...]:
         recovered: list[RunManifest] = []

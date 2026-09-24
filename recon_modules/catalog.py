@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Iterable, Iterator, Mapping
+from uuid import uuid4
 
 
 DEFAULT_ICON = "extension"
 CATALOG_SCHEMA_VERSION = 1
 FIELD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+TARGET_TOKENS = {"{target}", "{targets}", "{target_file}"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,11 +70,20 @@ class ScanProfile:
         name = str(data.get("name", "")).strip()
         if not name:
             raise ValueError("scan profile name cannot be empty")
+        arguments = tuple(str(item) for item in data.get("arguments", ()))
+        if not arguments:
+            raise ValueError(f"scan profile {name!r} requires an argument template")
+        used_tokens = {token for token in TARGET_TOKENS if token in arguments}
+        if len(used_tokens) > 1:
+            raise ValueError(f"scan profile {name!r} mixes target placeholder styles")
+        for token in used_tokens:
+            if arguments.count(token) != 1:
+                raise ValueError(f"scan profile {name!r} must use {token} once")
         return cls(
             name=name,
             options=tuple((str(item["label"]), str(item["value"])) for item in data.get("options", ())),
             command=tuple((str(item["type"]), str(item["text"])) for item in data.get("command", ())),
-            arguments=tuple(str(item) for item in data.get("arguments", ())),
+            arguments=arguments,
             output_format=str(data.get("output_format", "text")).strip() or "text",
         )
 
@@ -116,6 +128,10 @@ class ModuleDefinition:
         if missing:
             raise ValueError(f"module {module_id}: missing {', '.join(missing)}")
 
+        profiles = tuple(ScanProfile.from_mapping(profile) for profile in data.get("profiles", ()))
+        profile_names = [profile.name.casefold() for profile in profiles]
+        if len(profile_names) != len(set(profile_names)):
+            raise ValueError(f"module {module_id}: scan profile names must be unique")
         return cls(
             id=module_id.zfill(2),
             eyebrow=required["eyebrow"],
@@ -128,7 +144,7 @@ class ModuleDefinition:
             # Read the old key as a migration fallback, but never submit it as a value.
             target_placeholder=str(data.get("target_placeholder", data.get("target_example", ""))),
             state=str(data.get("state", "MISSING")),
-            profiles=tuple(ScanProfile.from_mapping(profile) for profile in data.get("profiles", ())),
+            profiles=profiles,
             config_fields=tuple(
                 ModuleConfigField.from_mapping(field) for field in data.get("config_fields", ())
             ),
@@ -239,6 +255,12 @@ class ModuleCatalog:
         self._modules[self._modules.index(current)] = updated
         return updated
 
+    def remove_module(self, module_id: str) -> ModuleDefinition:
+        """Remove and return one module from the catalog."""
+        module = self.get(module_id)
+        self._modules.remove(module)
+        return module
+
     def save(self, path: Path | None = None) -> None:
         target = path or self.source_path
         if target is None:
@@ -247,7 +269,13 @@ class ModuleCatalog:
             "schema_version": CATALOG_SCHEMA_VERSION,
             "modules": [module.to_mapping() for module in self._modules],
         }
-        target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: Path) -> ModuleCatalog:

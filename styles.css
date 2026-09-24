@@ -783,6 +783,7 @@ button { font-family: inherit; }
 .settings-actions { display: flex; align-items: center; gap: 9px; margin-top: 14px; }
 .settings-action { border: 1px solid var(--structure); border-radius: 0 !important; color: var(--interactive) !important; font-size: 9px !important; letter-spacing: .08em; }
 .settings-action.primary { border-color: var(--interactive); }
+.settings-action.danger { border-color: var(--structure); color: var(--text) !important; }
 .module-settings-layout { min-height: 430px; display: grid; grid-template-columns: 220px minmax(0, 1fr); border: 1px solid var(--line); }
 .settings-module-list { min-width: 0; overflow: auto; padding: 8px; border-right: 1px solid var(--line); }
 .settings-module-item, .settings-module-add {
@@ -808,6 +809,13 @@ button { font-family: inherit; }
 .profile-heading { margin-top: 18px; }
 .profile-list { margin-top: 8px; border-top: 1px solid var(--line); }
 .profile-row, .profile-add { min-height: 34px; display: flex; align-items: center; gap: 10px; padding: 0 8px; border: 0; border-bottom: 1px solid var(--line); color: var(--text); background: transparent; font-size: 9px; }
+.profile-row.active { color: var(--interactive); box-shadow: inset 2px 0 var(--interactive); }
+.tool-health { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 10px; padding: 9px; border: 1px solid var(--line); }
+.run-project-filter { width: 180px; min-width: 150px; margin-left: auto; }
+.run-artifacts { margin: 0 14px 16px; border-top: 1px solid var(--line); padding-top: 12px; }
+.run-artifact-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; padding: 7px 0; border-bottom: 1px solid var(--line); }
+.run-artifact-copy { min-width: 0; overflow-wrap: anywhere; }
+.artifact-preview { width: min(76vw, 900px); min-height: 55vh; }
 .profile-index { color: var(--faint); }
 .profile-name { min-width: 0; flex: 1; }
 .profile-add { width: 100%; color: var(--interactive); cursor: pointer; }
@@ -999,7 +1007,8 @@ button { font-family: inherit; }
   .finding-row { grid-template-columns: 64px minmax(0, 1fr) 76px; }
   .finding-asset { display: none; }
   .finding-summary { justify-content: flex-start; overflow: hidden; white-space: nowrap; }
-  .record-filters { justify-content: flex-start; overflow: hidden; white-space: nowrap; }
+  .record-filters { justify-content: flex-start; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
+  .run-project-filter { margin-left: 0; }
   .evidence-filters { overflow-x: auto; }
   .assets-table .record-row { grid-template-columns: 58px minmax(0, 1fr) 72px; }
   .assets-table .record-address { display: none; }

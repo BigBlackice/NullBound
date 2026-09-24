@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import asyncio
+import os
 from pathlib import Path
 import re
 import shutil
+from tempfile import TemporaryDirectory
 
 from .models import CommandSpec, ExecutionError, RunRequest
 
@@ -64,6 +66,8 @@ class ToolAdapter(ABC):
             path = Path(configured).expanduser().resolve(strict=False)
             if not path.is_file():
                 raise ExecutionError(f"executable does not exist: {path}")
+            if not os.access(path, os.X_OK):
+                raise ExecutionError(f"executable is not runnable: {path}")
             return str(path)
         resolved = shutil.which(configured)
         if not resolved:
@@ -100,6 +104,10 @@ class ToolAdapter(ABC):
     def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
         raise NotImplementedError
 
+    def preview_command(self, request: RunRequest, executable: str) -> CommandSpec:
+        """Build a display command. Adapters may override to avoid side effects."""
+        return self.build_command(request, Path("<run>"), executable)
+
 
 class DeclarativeAdapter(ToolAdapter):
     """Execute catalog profiles without evaluating a shell command string."""
@@ -118,6 +126,17 @@ class DeclarativeAdapter(ToolAdapter):
         arguments = expand_argument_template(template, targets, target_file=target_file)
         arguments = (*arguments, *self._option_arguments(request))
         return CommandSpec(executable, arguments, request.profile.output_format)
+
+    def preview_command(self, request: RunRequest, executable: str) -> CommandSpec:
+        """Use the real builder, replacing its disposable run directory in the result."""
+        with TemporaryDirectory(prefix="blackwall-preview-") as temporary:
+            root = Path(temporary)
+            command = self.build_command(request, root, executable)
+            root_text = str(root)
+            arguments = tuple(
+                argument.replace(root_text, "<run>") for argument in command.arguments
+            )
+            return CommandSpec(command.executable, arguments, command.output_format)
 
     @staticmethod
     def _option_arguments(request: RunRequest) -> tuple[str, ...]:
@@ -172,7 +191,7 @@ class ProjectDiscoveryAdapter(DeclarativeAdapter):
             match = re.search(r"(?:current\s+)?[^\s]+\s+version:?\s+(v?[^\s(]+)", line, re.IGNORECASE)
             if match:
                 return match.group(1)[:240]
-        return super().parse_version(lines)
+        return None
 
 
 class ArtifactAdapter(DeclarativeAdapter):

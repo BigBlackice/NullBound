@@ -12,7 +12,7 @@ import re
 from typing import Callable
 
 from .adapters import AdapterRegistry
-from .models import RunEvent, RunManifest, RunRequest, RunState, utc_now
+from .models import ExecutionError, RunEvent, RunManifest, RunRequest, RunState, ToolHealth, utc_now
 from .store import RunStore
 
 
@@ -45,7 +45,7 @@ class ExecutionManager:
         if adapter.version_required and not version:
             raise ExecutionError(
                 f"{request.module.bin} did not identify as the expected tool; "
-                "configure the ProjectDiscovery httpx executable"
+                "check the configured executable path and version"
             )
         run_id, run_path = self.store.reserve(project_path)
         command = adapter.build_command(request, run_path, executable)
@@ -83,6 +83,37 @@ class ExecutionManager:
         persisted = {run.id: run for run in self.store.list_runs(project_paths)}
         persisted.update(self._runs)
         return tuple(sorted(persisted.values(), key=lambda item: item.created_at, reverse=True))
+
+    def unattached_runs(self) -> tuple[RunManifest, ...]:
+        return self.store.list_unattached()
+
+    def adopt_unattached(self, project: object) -> tuple[RunManifest, ...]:
+        adopted = self.store.adopt_unattached(project)
+        for run in adopted:
+            self._runs[run.id] = run
+        return adopted
+
+    def delete_unattached(self) -> tuple[str, ...]:
+        removed = self.store.delete_unattached()
+        for run_id in removed:
+            self._runs.pop(run_id, None)
+            self._tasks.pop(run_id, None)
+        return removed
+
+    async def check_tool(self, request: RunRequest) -> ToolHealth:
+        """Resolve a configured binary and report whether its adapter accepts it."""
+        try:
+            adapter = self.adapters.get(request.module.adapter)
+            executable = adapter.resolve_executable(request)
+            version = await adapter.version(executable)
+            if adapter.version_required and not version:
+                return ToolHealth(
+                    "INCOMPATIBLE", executable, None,
+                    "Executable was found but did not identify as the expected tool.",
+                )
+            return ToolHealth("AVAILABLE", executable, version, "Executable is ready.")
+        except (ExecutionError, OSError) as error:
+            return ToolHealth("MISSING", detail=str(error))
 
     def recover_incomplete(self, project_paths: tuple[Path, ...] = ()) -> tuple[RunManifest, ...]:
         """Fail stale persisted runs without touching processes owned by this manager."""
@@ -130,11 +161,31 @@ class ExecutionManager:
                 manifest = self._transition(manifest, RunState.RUNNING)
                 # Consume stderr first because many CLI tools write their startup
                 # banner there before emitting result records on stdout.
-                await asyncio.gather(
-                    self._pump(run_id, process.stderr, "stderr"),
-                    self._pump(run_id, process.stdout, "stdout"),
-                )
-                exit_code = await process.wait()
+                async def consume() -> int:
+                    await asyncio.gather(
+                        self._pump(run_id, process.stderr, "stderr"),
+                        self._pump(run_id, process.stdout, "stdout"),
+                    )
+                    return await process.wait()
+                try:
+                    if manifest.timeout_seconds:
+                        exit_code = await asyncio.wait_for(consume(), manifest.timeout_seconds)
+                    else:
+                        exit_code = await consume()
+                except TimeoutError:
+                    self._terminate_process(process)
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except TimeoutError:
+                        process.kill()
+                        await process.wait()
+                    self._transition(
+                        manifest, RunState.FAILED, exit_code=process.returncode,
+                        error=f"run timed out after {manifest.timeout_seconds} seconds",
+                        finished_at=utc_now(), duration_seconds=round(time.monotonic() - started_clock, 3),
+                        artifacts=self.store.collect_artifacts(manifest.run_path),
+                    )
+                    return
                 state = (
                     RunState.CANCELLED if run_id in self._cancel_requested
                     else RunState.COMPLETED if exit_code == 0 else RunState.FAILED

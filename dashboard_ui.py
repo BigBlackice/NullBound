@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from functools import partial
 from pathlib import Path
 import re
@@ -10,8 +11,7 @@ import shlex
 from nicegui import events, ui
 from app_config import AppConfig
 from blackwall_execution import (
-    ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest,
-    expand_argument_template,
+    ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest, ToolHealth,
 )
 from blackwall_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
 from blackwall_projects.picker import LocalDirectoryPicker
@@ -24,7 +24,9 @@ from blackwall_scope import (
     TargetSelection,
     evaluate_targets,
 )
-from recon_modules import FAVICON_DATA_URL, ModuleCatalog, ModuleDefinition, load_default_catalog
+from recon_modules import (
+    FAVICON_DATA_URL, ModuleCatalog, ModuleDefinition, ScanProfile, load_default_catalog,
+)
 from workspace_data import ASSETS, EVIDENCE, SCOPE_RULES
 
 
@@ -184,6 +186,13 @@ class DashboardUI:
         self.settings_open = False
         self.settings_section = "general"
         self.settings_module_id = modules[0].id
+        self.settings_profile_index = 0
+        self.settings_profile_drafts: dict[str, list[dict[str, object]]] = {}
+        self.module_health: dict[str, ToolHealth] = {}
+        self.run_project_filter = "ALL"
+        self.run_state_filter = "ALL"
+        self.run_timeout_values = {module.id: "" for module in modules}
+        self._pending_project: tuple[str, Path] | None = None
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
         self.execution_manager = execution_manager or ExecutionManager()
         self.active_run_id: str | None = None
@@ -223,6 +232,67 @@ class DashboardUI:
         manifests = self.execution_manager.list_runs(project_paths)
         return tuple(self._run_record(manifest) for manifest in manifests)
 
+    def filtered_run_records(self) -> tuple[dict[str, str], ...]:
+        """Apply the Runs view filters for both the table and its inspector."""
+        records = self.run_records()
+        if self.run_state_filter == "ACTIVE":
+            records = tuple(
+                record for record in records if record["state"] in {"STARTING", "RUNNING"}
+            )
+        elif self.run_state_filter != "ALL":
+            records = tuple(
+                record for record in records if record["state"] == self.run_state_filter
+            )
+        if self.run_project_filter == "NONE":
+            records = tuple(record for record in records if not record["project_id"])
+        elif self.run_project_filter != "ALL":
+            records = tuple(
+                record for record in records
+                if record["project_id"] == self.run_project_filter
+            )
+        query = self.search_query.strip().casefold()
+        if query:
+            records = tuple(
+                record for record in records
+                if query in " ".join(record.values()).casefold()
+            )
+        return records
+
+    def run_manifest(self, run_id: str) -> RunManifest:
+        return next(
+            run for run in self.execution_manager.list_runs(tuple(p.path for p in self.projects))
+            if run.id == run_id
+        )
+
+    def download_artifact(self, run_id: str, relative_path: str) -> None:
+        try:
+            path = self.execution_manager.store.resolve_artifact(
+                self.run_manifest(run_id), relative_path
+            )
+            ui.download(path)
+        except (ExecutionError, OSError, StopIteration) as error:
+            ui.notify(str(error), type="negative")
+
+    def open_artifact(self, run_id: str, relative_path: str) -> None:
+        try:
+            path = self.execution_manager.store.resolve_artifact(
+                self.run_manifest(run_id), relative_path
+            )
+            if path.stat().st_size > 2_000_000:
+                raise ExecutionError("artifact is too large to preview; use download")
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (ExecutionError, OSError, StopIteration) as error:
+            ui.notify(str(error), type="negative")
+            return
+        with ui.dialog().classes("project-dialog") as dialog, ui.card().classes("project-modal"):
+            with ui.element("header").classes("settings-header"):
+                ui.label(path.name).classes("settings-title")
+                ui.button("×", on_click=dialog.close).props("flat dense")
+            ui.textarea(value=content).props("readonly outlined").classes(
+                "config-control artifact-preview"
+            )
+        dialog.open()
+
     @staticmethod
     def _run_record(run: RunManifest) -> dict[str, str]:
         targets = ", ".join(item["value"] for item in run.targets) or "—"
@@ -241,6 +311,7 @@ class DashboardUI:
             "module": run.module_bin.upper(),
             "target": targets,
             "project": project,
+            "project_id": run.project_id or "",
             "duration": duration,
             "started": run.started_at or run.created_at,
             "exit_code": "—" if run.exit_code is None else str(run.exit_code),
@@ -313,6 +384,16 @@ class DashboardUI:
         self.update_rail_selection()
         self.settings_dialog.open()
 
+    def open_selected_module_settings(self) -> None:
+        """Open the profile editor for the module currently shown in the inspector."""
+        self.settings_module_id = self.selected_module_id
+        self.settings_profile_index = 0
+        self.settings_section = "modules"
+        self.open_settings()
+        self.render_settings_navigation()
+        self.render_settings_content()
+        asyncio.create_task(self.refresh_module_health())
+
     def close_settings(self) -> None:
         self.settings_open = False
         self.update_rail_selection()
@@ -327,6 +408,8 @@ class DashboardUI:
         self.settings_section = section
         self.render_settings_navigation()
         self.render_settings_content()
+        if section == "modules":
+            asyncio.create_task(self.refresh_module_health())
 
     # === START: PROJECT DIALOGS ===
     # Thin NiceGUI forms; all filesystem work remains in blackwall_projects.
@@ -359,14 +442,41 @@ class DashboardUI:
                     ui.button("CREATE", icon="create_new_folder", on_click=self.create_project).props(
                         "flat no-caps"
                     ).classes("settings-action primary")
+
+        with ui.dialog().classes("project-dialog") as self.unattached_runs_dialog:
+            with ui.card().classes("project-modal"):
+                with ui.element("header").classes("settings-header"):
+                    with ui.element("div"):
+                        ui.label("PROJECT / SESSION RUNS").classes("section-kicker")
+                        ui.label("Unattached runs detected").classes("settings-title")
+                    with ui.element("button").classes("settings-close").props(
+                        'type=button aria-label="Cancel project creation" data-escape-close=true'
+                    ).on("click", self.unattached_runs_dialog.close):
+                        ui.label("×")
+                self.unattached_runs_message = ui.label("").classes("settings-section-copy")
+                with ui.element("div").classes("settings-actions"):
+                    ui.button(
+                        "ADD TO PROJECT", icon="drive_file_move",
+                        on_click=partial(self.finish_create_project, "attach"),
+                    ).props("flat no-caps").classes("settings-action primary")
+                    ui.button(
+                        "DELETE PERMANENTLY", icon="delete_forever",
+                        on_click=partial(self.finish_create_project, "delete"),
+                    ).props("flat no-caps").classes("settings-action danger")
+                    ui.button("CANCEL", on_click=self.unattached_runs_dialog.close).props(
+                        "flat no-caps"
+                    ).classes("settings-action")
     # === END: PROJECT DIALOGS ===
 
     def select_settings_module(self, module_id: str) -> None:
         self.settings_module_id = module_id
+        self.settings_profile_index = 0
         self.render_settings_content()
 
     def new_settings_module(self) -> None:
         self.settings_module_id = "__new__"
+        self.settings_profile_index = 0
+        self.settings_profile_drafts.pop("__new__", None)
         self.render_settings_content()
 
     def select_finding(self, finding_id: str) -> None:
@@ -414,10 +524,23 @@ class DashboardUI:
     ) -> None:
         self.module_config_values.setdefault(module_id, {})[field_id] = str(event.value or "")
 
+    def set_run_timeout(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
+        self.run_timeout_values[module_id] = str(event.value or "").strip()
+
     def set_search_query(self, event: events.ValueChangeEventArguments) -> None:
         self.search_query = str(event.value or "")
         if self.active_view in FUNCTIONAL_VIEWS:
             self.render_workspace()
+
+    def set_run_project_filter(self, event: events.ValueChangeEventArguments) -> None:
+        self.run_project_filter = str(event.value or "ALL")
+        self.render_workspace()
+        self.render_inspector()
+
+    def set_run_state_filter(self, state: str) -> None:
+        self.run_state_filter = state
+        self.render_workspace()
+        self.render_inspector()
 
     def set_proxy_enabled(self, event: events.ValueChangeEventArguments) -> None:
         self.proxy_enabled = bool(event.value)
@@ -474,14 +597,19 @@ class DashboardUI:
                 (field.id, self.module_config_values.get(module.id, {}).get(field.id, ""))
                 for field in module.config_fields
             )
+            timeout_text = self.run_timeout_values.get(module.id, "").strip()
+            timeout_seconds = int(timeout_text) if timeout_text else None
+            if timeout_seconds is not None and timeout_seconds < 1:
+                raise ValueError("run timeout must be a positive number of seconds")
             request = RunRequest(
                 module=module,
                 profile=self._selected_profile(module),
                 context=context,
                 options=options,
+                timeout_seconds=timeout_seconds,
             )
             run = await self.execution_manager.start(request, project.path if project else None)
-        except (ExecutionError, OSError, ScopeValidationError, KeyError) as error:
+        except (ExecutionError, OSError, ScopeValidationError, KeyError, ValueError) as error:
             ui.notify(str(error), type="negative")
             return
 
@@ -537,12 +665,41 @@ class DashboardUI:
         self.create_project_dialog.open()
 
     def create_project(self) -> None:
+        name = str(self.create_project_name.value or "")
+        parent = Path(str(self.create_project_location.value or "")).expanduser()
+        unattached = self.execution_manager.unattached_runs()
+        if any(not run.state.terminal for run in unattached):
+            ui.notify("Wait for or cancel active standalone runs before creating a project", type="warning")
+            return
+        if unattached:
+            self._pending_project = (name, parent)
+            self.unattached_runs_message.set_text(
+                f"{len(unattached)} session run(s) are not attached to a project. "
+                "Add them to the new project or remove them permanently."
+            )
+            self.unattached_runs_dialog.open()
+            return
+        self._create_project(name, parent)
+
+    def finish_create_project(self, policy: str) -> None:
+        if self._pending_project is None:
+            self.unattached_runs_dialog.close()
+            return
+        name, parent = self._pending_project
+        self._create_project(name, parent, policy)
+
+    def _create_project(self, name: str, parent: Path, run_policy: str | None = None) -> None:
         try:
-            parent = Path(str(self.create_project_location.value or "")).expanduser()
-            project = self.project_workspace.create(str(self.create_project_name.value or ""), parent)
-        except (OSError, ProjectValidationError) as error:
+            project = self.project_workspace.create(name, parent)
+            if run_policy == "attach":
+                self.execution_manager.adopt_unattached(project)
+            elif run_policy == "delete":
+                self.execution_manager.delete_unattached()
+        except (ExecutionError, OSError, ProjectValidationError) as error:
             ui.notify(str(error), type="negative")
             return
+        self._pending_project = None
+        self.unattached_runs_dialog.close()
         self.create_project_dialog.close()
         self.execution_manager.recover_incomplete((project.path,))
         ui.notify(f"Created {project.id} / {project.name}", type="positive")
@@ -876,12 +1033,12 @@ class DashboardUI:
         )
 
     def render_runs_workspace(self) -> None:
-        records = self.run_records()
+        records = self.filtered_run_records()
         if records and self.selected_run_id not in {record["id"] for record in records}:
             self.selected_run_id = records[0]["id"]
         self.render_record_workspace(
             view_id="runs", kicker="EXECUTION / RUNS", title="Runs", index=f"{len(records):02d} RECORDS",
-            filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED"), records=records,
+            filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED", "CANCELLED"), records=records,
             columns=(("state", "STATE"), ("module", "MODULE"), ("target", "TARGET"),
                      ("project", "PROJECT"), ("duration", "DURATION"), ("started", "STARTED")),
             selected_id=self.selected_run_id or "", tone_key="state",
@@ -909,7 +1066,14 @@ class DashboardUI:
 
         with ui.element("div").classes(f"record-filters {view_id}-filters"):
             for index, label in enumerate(filters):
-                if interactive_filters:
+                if view_id == "runs":
+                    ui.button(label, on_click=partial(self.set_run_state_filter, label)).props(
+                        "flat dense no-caps"
+                    ).classes(
+                        "record-filter-button active"
+                        if label == self.run_state_filter else "record-filter-button"
+                    )
+                elif interactive_filters:
                     ui.button(label, on_click=partial(self.preview_evidence_filter, label)).props(
                         "flat dense no-caps"
                     ).classes(
@@ -917,6 +1081,17 @@ class DashboardUI:
                     )
                 else:
                     ui.label(label).classes("filter-active" if index == 0 else "")
+            if view_id == "runs":
+                project_options = {"ALL": "ALL PROJECTS", "NONE": "NO PROJECT"}
+                project_options.update({
+                    project.id: f"{project.name} / {project.id}" for project in self.projects
+                })
+                ui.select(
+                    project_options, value=self.run_project_filter,
+                    on_change=self.set_run_project_filter,
+                ).props("dense outlined options-dense").classes(
+                    "config-control settings-select-control run-project-filter"
+                )
 
         query = self.search_query.strip().casefold()
         visible_records = tuple(
@@ -964,8 +1139,10 @@ class DashboardUI:
                 icon(module.icon, "module-icon")
             with ui.element("div").classes("card-footer"):
                 ui.label(module.target_summary).classes("target-count")
-                tone = "muted" if module.state == "MISSING" else "interactive"
-                ui.label(module.state).classes(f"state {tone}")
+                health = self.module_health.get(module.id)
+                state = health.state if health else "UNCHECKED"
+                tone = "interactive" if state == "AVAILABLE" else "muted"
+                ui.label(state).classes(f"state {tone}")
 
     # === END: MODULE CARD ===
 
@@ -1026,23 +1203,15 @@ class DashboardUI:
             return
         if self.active_view == "runs":
             with self.inspector:
-                records = self.run_records()
+                records = self.filtered_run_records()
                 if not records:
                     with ui.element("div").classes("inspector-header"):
                         with ui.element("div").classes("inspector-header-copy"):
                             ui.label("RUNS").classes("panel-number")
-                            ui.label("No persisted runs yet").classes("panel-title")
+                            ui.label("No runs match the current filters").classes("panel-title")
                     return
                 record = self._record(records, self.selected_run_id or records[0]["id"])
-                self.render_record_inspector(
-                    record, "RUN", record["module"], record["state"],
-                    (("TARGET", record["target"]), ("PROJECT", record["project"]),
-                     ("PROFILE", record["profile"]), ("DURATION", record["duration"]),
-                     ("STARTED", record["started"]), ("EXIT CODE", record["exit_code"]),
-                     ("ARTIFACTS", record["artifacts"])),
-                    (("EXECUTION CONTEXT", record["context"]), ("COMMAND", record["command"]),
-                     ("SUMMARY", record["summary"])), record["state"],
-                )
+                self.render_run_inspector(record)
             return
         if self.active_view != "launchpad":
             return
@@ -1059,7 +1228,10 @@ class DashboardUI:
                 with ui.element("div").classes("inspector-header-copy"):
                     ui.label(f"CONFIG / {module.bin.upper()}").classes("panel-number")
                     ui.label(module.description).classes("panel-title")
-                    ui.label(f"{module.bin.upper()} / {module.state}").classes("panel-tool")
+                    health = self.module_health.get(module.id)
+                    ui.label(
+                        f"{module.bin.upper()} / {health.state if health else 'UNCHECKED'}"
+                    ).classes("panel-tool")
 
             if self.inspector_collapsed:
                 return
@@ -1110,7 +1282,7 @@ class DashboardUI:
                     ).classes("config-control")
                     ui.button(
                         "EDIT / CREATE PROFILES",
-                        on_click=lambda: ui.notify("Profile editing is not implemented yet"),
+                        on_click=self.open_selected_module_settings,
                     ).props("flat dense no-caps").classes("text-action")
 
                 with ui.element("div").classes("field"):
@@ -1134,35 +1306,40 @@ class DashboardUI:
                             ).props("dense outlined clearable").classes("config-control")
 
                 with ui.element("div").classes("field"):
+                    ui.label("RUN TIMEOUT / SECONDS").classes("field-label")
+                    ui.input(
+                        value=self.run_timeout_values.get(module.id, ""),
+                        placeholder="optional / no limit",
+                        on_change=partial(self.set_run_timeout, module.id),
+                    ).props("dense outlined clearable type=number min=1").classes("config-control")
+
+                with ui.element("div").classes("field"):
                     ui.label("COMMAND PREVIEW").classes("field-label")
                     with ui.element("div").classes("command-preview"):
-                        ui.label(module.path).classes("command-tool")
                         try:
                             selection = self._target_selection(module)
-                            arguments = expand_argument_template(
-                                profile.arguments,
-                                tuple(target.normalized for target in selection.targets),
-                                target_file="<run>/inputs/targets.txt",
+                            project = self.active_project
+                            request = RunRequest(
+                                module=module, profile=profile,
+                                context=ExecutionContext(
+                                    selection=selection,
+                                    project_id=project.id if project else None,
+                                    project_name=project.name if project else None,
+                                    scope_enforced=self.scope_enforced,
+                                ),
+                                options=tuple(
+                                    (field.id, self.module_config_values[module.id].get(field.id, ""))
+                                    for field in module.config_fields
+                                ),
                             )
-                            for argument in arguments:
+                            adapter = self.execution_manager.adapters.get(module.adapter)
+                            executable = adapter.resolve_executable(request)
+                            command = adapter.preview_command(request, executable)
+                            ui.label(command.executable).classes("command-tool")
+                            for argument in command.arguments:
                                 ui.label(f" {shlex.quote(argument)}").classes("command-argument")
-                            for config_field in module.config_fields:
-                                value = self.module_config_values[module.id].get(config_field.id, "").strip()
-                                if value:
-                                    ui.label(
-                                        f" {config_field.argument} {shlex.quote(value)}"
-                                    ).classes("command-argument")
-                            artifact_arguments = {
-                                "amass": " -nocolor -dir <run>/artifacts/amass",
-                                "dnsx": " -json -no-color -o <run>/artifacts/dnsx.jsonl",
-                                "nmap": " -oX <run>/artifacts/nmap.xml",
-                                "httpx": " -no-color -o <run>/artifacts/httpx.jsonl",
-                                "gau": " --json --o <run>/artifacts/gau.jsonl",
-                                "tlsx": " -json -no-color -o <run>/artifacts/tlsx.jsonl",
-                            }
-                            if module.adapter in artifact_arguments:
-                                ui.label(artifact_arguments[module.adapter]).classes("command-argument")
                         except (ExecutionError, ScopeValidationError, KeyError):
+                            ui.label(module.path).classes("command-tool")
                             for token_type, text in profile.command:
                                 if token_type != "tool":
                                     ui.label(text).classes(f"command-{token_type}")
@@ -1297,6 +1474,33 @@ class DashboardUI:
                 with ui.element("section").classes("finding-detail-section"):
                     ui.label(label).classes("field-label")
                     ui.label(value).classes("finding-detail-copy")
+
+    def render_run_inspector(self, record: dict[str, str]) -> None:
+        """Render run metadata plus safe artifact preview/download actions."""
+        run = self.run_manifest(record["id"])
+        self.render_record_inspector(
+            record, "RUN", record["module"], record["state"],
+            (("TARGET", record["target"]), ("PROJECT", record["project"]),
+             ("PROFILE", record["profile"]), ("DURATION", record["duration"]),
+             ("STARTED", record["started"]), ("EXIT CODE", record["exit_code"])),
+            (("EXECUTION CONTEXT", record["context"]), ("COMMAND", record["command"]),
+             ("SUMMARY", record["summary"])), record["state"],
+        )
+        if self.inspector_collapsed:
+            return
+        with ui.element("section").classes("run-artifacts"):
+            ui.label(f"ARTIFACTS / {len(run.artifacts):02d}").classes("field-label")
+            for artifact in run.artifacts:
+                with ui.element("div").classes("run-artifact-row"):
+                    with ui.element("div").classes("run-artifact-copy"):
+                        ui.label(artifact.path).classes("settings-project-name")
+                        ui.label(f"{artifact.size} bytes / {artifact.sha256[:12]}").classes("settings-meta")
+                    ui.button(
+                        "VIEW", on_click=partial(self.open_artifact, run.id, artifact.path)
+                    ).props("flat dense no-caps").classes("settings-action")
+                    ui.button(
+                        "GET", on_click=partial(self.download_artifact, run.id, artifact.path)
+                    ).props("flat dense no-caps").classes("settings-action primary")
 
     # === END: RIGHT INSPECTOR ===
 
@@ -1470,6 +1674,152 @@ class DashboardUI:
                 "HTTP or SOCKS routing; Blackwall must never imply that unsupported traffic is proxied."
             ).classes("settings-note warning")
 
+    # === START: MODULE SETTINGS ===
+    def _profile_drafts(self, key: str, module: ModuleDefinition | None) -> list[dict[str, object]]:
+        if key not in self.settings_profile_drafts:
+            profiles = module.profiles if module else ()
+            self.settings_profile_drafts[key] = [profile.to_mapping() for profile in profiles]
+        return self.settings_profile_drafts[key]
+
+    def select_settings_profile(self, index: int) -> None:
+        self.settings_profile_index = index
+        self.render_settings_content()
+
+    def add_settings_profile(self) -> None:
+        module = None if self.settings_module_id == "__new__" else self.module_catalog.get(self.settings_module_id)
+        drafts = self._profile_drafts(self.settings_module_id, module)
+        drafts.append({
+            "name": f"Profile {len(drafts) + 1}", "options": [], "command": [],
+            "arguments": ["{targets}"], "output_format": "text",
+        })
+        self.settings_profile_index = len(drafts) - 1
+        self.render_settings_content()
+
+    def delete_settings_profile(self, index: int) -> None:
+        module = None if self.settings_module_id == "__new__" else self.module_catalog.get(self.settings_module_id)
+        drafts = self._profile_drafts(self.settings_module_id, module)
+        if 0 <= index < len(drafts):
+            drafts.pop(index)
+        self.settings_profile_index = max(0, min(self.settings_profile_index, len(drafts) - 1))
+        self.render_settings_content()
+
+    def update_settings_profile(self, index: int, field: str, event: events.ValueChangeEventArguments) -> None:
+        drafts = self.settings_profile_drafts[self.settings_module_id]
+        drafts[index][field] = str(event.value or "")
+
+    async def refresh_module_health(self) -> None:
+        modules = self.module_catalog.modules
+        requests = tuple(
+            RunRequest(
+                module=module, profile=module.default_profile,
+                context=ExecutionContext(selection=TargetSelection.direct((Target.parse("example.com"),))),
+            )
+            for module in modules
+        )
+        results = await asyncio.gather(
+            *(self.execution_manager.check_tool(request) for request in requests)
+        )
+        self.module_health.update({module.id: health for module, health in zip(modules, results)})
+        if self.settings_open and self.settings_section == "modules":
+            self.render_settings_content()
+        if self.active_view == "launchpad":
+            self.render_workspace()
+
+    @staticmethod
+    def _parse_argument_template(value: str) -> tuple[str, ...]:
+        """Split an argv editor value without consuming Windows path backslashes."""
+        tokens = shlex.split(value, posix=False)
+        return tuple(
+            token[1:-1]
+            if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}
+            else token
+            for token in tokens
+        )
+
+    def save_settings_module(self) -> None:
+        try:
+            drafts = self.settings_profile_drafts.get(self.settings_module_id, [])
+            if not drafts:
+                raise ValueError("add at least one scan profile")
+            profiles: list[ScanProfile] = []
+            for draft in drafts:
+                arguments = draft.get("arguments", ())
+                if isinstance(arguments, str):
+                    arguments = self._parse_argument_template(arguments)
+                if not any(token in arguments for token in ("{target}", "{targets}", "{target_file}")):
+                    raise ValueError(f"profile {draft.get('name')!r} needs a target placeholder")
+                payload = dict(draft)
+                payload["arguments"] = arguments
+                profiles.append(ScanProfile.from_mapping(payload))
+            values = {
+                "eyebrow": str(self.module_eyebrow.value or ""),
+                "description": str(self.module_description.value or ""),
+                "bin": str(self.module_binary.value or ""),
+                "path": str(self.module_path.value or ""),
+                "icon": str(self.module_icon.value or "").strip() or "extension",
+                "target_placeholder": str(self.module_target_placeholder.value or ""),
+                "profiles": profiles,
+            }
+            if self.settings_module_id == "__new__":
+                module = self.module_catalog.create_module(**values)
+            else:
+                module = self.module_catalog.replace_module(self.settings_module_id, **values)
+            self.module_catalog.save()
+        except (OSError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.settings_module_id = module.id
+        self.settings_profile_drafts[module.id] = [profile.to_mapping() for profile in module.profiles]
+        self.settings_profile_drafts.pop("__new__", None)
+        self.target_modes.setdefault(module.id, "direct")
+        self.direct_targets.setdefault(module.id, "")
+        self.selected_profiles[module.id] = module.default_profile.name
+        self.module_config_values.setdefault(module.id, {})
+        self.run_timeout_values.setdefault(module.id, "")
+        ui.notify(f"Saved module {module.id} / {module.bin}", type="positive")
+        self.render_settings_content()
+        if self.active_view == "launchpad":
+            self.render_workspace()
+
+    def confirm_delete_settings_module(self) -> None:
+        if self.settings_module_id == "__new__":
+            return
+        module = self.module_catalog.get(self.settings_module_id)
+        with ui.dialog().classes("project-dialog") as dialog, ui.card().classes("project-modal"):
+            ui.label("DELETE MODULE").classes("section-kicker")
+            ui.label(module.description).classes("settings-title")
+            ui.label("This removes the module definition and all of its scan profiles.").classes(
+                "settings-section-copy"
+            )
+            with ui.element("div").classes("settings-actions"):
+                ui.button(
+                    "DELETE", on_click=lambda: (dialog.close(), self.delete_settings_module(module.id))
+                ).props("flat no-caps").classes("settings-action danger")
+                ui.button("CANCEL", on_click=dialog.close).props("flat no-caps").classes("settings-action")
+        dialog.open()
+
+    def delete_settings_module(self, module_id: str) -> None:
+        try:
+            if len(self.module_catalog) <= 1:
+                raise ValueError("Blackwall requires at least one module")
+            self.module_catalog.remove_module(module_id)
+            self.module_catalog.save()
+        except (OSError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.settings_profile_drafts.pop(module_id, None)
+        self.module_health.pop(module_id, None)
+        self.target_modes.pop(module_id, None)
+        self.direct_targets.pop(module_id, None)
+        self.selected_profiles.pop(module_id, None)
+        self.module_config_values.pop(module_id, None)
+        self.run_timeout_values.pop(module_id, None)
+        self.settings_module_id = self.module_catalog.modules[0].id
+        if self.selected_module_id == module_id:
+            self.selected_module_id = self.settings_module_id
+        self.render_settings_content()
+        self.render_workspace()
+
     def render_module_settings(self) -> None:
         self.render_settings_heading("Modules", "Manage executable adapters and their scan profiles.")
         with ui.element("div").classes("module-settings-layout"):
@@ -1488,8 +1838,10 @@ class DashboardUI:
                         with ui.element("div").classes("settings-module-copy"):
                             ui.label(module.description)
                             ui.label(f"{module.id} / {module.bin.upper()}").classes("settings-meta")
-                        ui.label(module.state).classes(
-                            "settings-state ready" if module.state == "READY" else "settings-state missing"
+                        health = self.module_health.get(module.id)
+                        state = health.state if health else "UNCHECKED"
+                        ui.label(state).classes(
+                            "settings-state ready" if state == "AVAILABLE" else "settings-state missing"
                         )
 
             with ui.element("section").classes("settings-module-editor"):
@@ -1500,44 +1852,95 @@ class DashboardUI:
                     module = self.module_catalog.get(self.settings_module_id)
                     module_id = module.id
 
+                drafts = self._profile_drafts(self.settings_module_id, module)
                 with ui.element("div").classes("settings-field-grid"):
-                    self.render_setting_field(
+                    self.module_eyebrow = self.render_setting_field(
                         "TYPE / EYEBROW", module.eyebrow if module else "",
                         placeholder="e.g. discovery",
                     )
                     self.render_setting_field("AUTO ID", module_id, readonly=True)
-                self.render_setting_field(
+                self.module_description = self.render_setting_field(
                     "DESCRIPTION", module.description if module else "",
                     placeholder="what the module does",
                 )
                 with ui.element("div").classes("settings-field-grid"):
-                    self.render_setting_field(
+                    self.module_binary = self.render_setting_field(
                         "BINARY", module.bin if module else "", placeholder="e.g. amass"
                     )
-                    self.render_setting_field(
+                    self.module_icon = self.render_setting_field(
                         "ICON (OPTIONAL)", module.icon if module else "",
                         placeholder="default icon if empty",
                     )
-                self.render_setting_field(
+                self.module_path = self.render_setting_field(
                     "EXECUTABLE PATH", module.path if module else "",
                     placeholder="binary name or full executable path",
                 )
+                self.module_target_placeholder = self.render_setting_field(
+                    "TARGET PLACEHOLDER", module.target_placeholder if module else "",
+                    placeholder="e.g. example.com or https://example.com",
+                )
+
+                if module:
+                    health = self.module_health.get(module.id)
+                    with ui.element("div").classes("tool-health"):
+                        ui.label(f"HEALTH / {health.state if health else 'UNCHECKED'}").classes("field-label")
+                        if health:
+                            ui.label(health.executable or health.detail).classes("settings-note")
+                            if health.version:
+                                ui.label(health.version).classes("settings-meta")
+                        ui.button("CHECK", icon="health_and_safety", on_click=lambda: asyncio.create_task(
+                            self.refresh_module_health()
+                        )).props("flat dense no-caps").classes("settings-action")
 
                 ui.label("SCAN PROFILES").classes("settings-group-title profile-heading")
                 with ui.element("div").classes("profile-list"):
-                    profile_names = module.profile_names if module else ()
-                    for index, profile_name in enumerate(profile_names):
-                        with ui.element("div").classes("profile-row"):
+                    for index, draft in enumerate(drafts):
+                        classes = "profile-row active" if index == self.settings_profile_index else "profile-row"
+                        with ui.element("button").classes(classes).props("type=button").on(
+                            "click", partial(self.select_settings_profile, index)
+                        ):
                             ui.label(f"{index + 1:02d}").classes("profile-index")
-                            ui.label(profile_name).classes("profile-name")
+                            ui.label(str(draft["name"])).classes("profile-name")
                             ui.label("DEFAULT" if index == 0 else "PROFILE").classes("settings-meta")
-                    with ui.element("button").classes("profile-add").props("type=button"):
+                    with ui.element("button").classes("profile-add").props("type=button").on(
+                        "click", self.add_settings_profile
+                    ):
                         ui.label("+ ADD PROFILE")
 
+                if drafts:
+                    index = min(self.settings_profile_index, len(drafts) - 1)
+                    draft = drafts[index]
+                    ui.label("PROFILE NAME").classes("field-label")
+                    ui.input(
+                        value=str(draft["name"]),
+                        on_change=partial(self.update_settings_profile, index, "name"),
+                    ).props("dense outlined").classes("config-control settings-input")
+                    ui.label("ARGUMENT TEMPLATE / ONE ARGUMENT STRING").classes("field-label")
+                    ui.textarea(
+                        value=shlex.join(tuple(draft.get("arguments", ())))
+                        if not isinstance(draft.get("arguments"), str) else str(draft["arguments"]),
+                        placeholder="-u {target} -json",
+                        on_change=partial(self.update_settings_profile, index, "arguments"),
+                    ).props("dense outlined autogrow").classes("config-control settings-input")
+                    ui.label("OUTPUT FORMAT").classes("field-label")
+                    ui.input(
+                        value=str(draft.get("output_format", "text")),
+                        on_change=partial(self.update_settings_profile, index, "output_format"),
+                    ).props("dense outlined").classes("config-control settings-input")
+                    ui.button(
+                        "REMOVE PROFILE", on_click=partial(self.delete_settings_profile, index)
+                    ).props("flat dense no-caps").classes("settings-action danger")
+
                 with ui.element("div").classes("settings-actions editor-actions"):
-                    ui.button("SAVE MODULE", icon="save", on_click=lambda: ui.notify(
-                        "Module persistence is not connected yet"
-                    )).props("flat no-caps").classes("settings-action primary")
+                    ui.button("SAVE MODULE", icon="save", on_click=self.save_settings_module).props(
+                        "flat no-caps"
+                    ).classes("settings-action primary")
+                    if module:
+                        ui.button(
+                            "DELETE MODULE", icon="delete", on_click=self.confirm_delete_settings_module
+                        ).props("flat no-caps").classes("settings-action danger")
+
+    # === END: MODULE SETTINGS ===
 
     def render_appearance_settings(self) -> None:
         self.render_settings_heading("Appearance", "Tune density and atmosphere without changing information semantics.")
@@ -1569,7 +1972,7 @@ class DashboardUI:
         readonly: bool = False,
         password: bool = False,
         placeholder: str = "",
-    ) -> None:
+    ):
         with ui.element("div").classes("settings-field"):
             ui.label(label).classes("field-label")
             field = ui.input(value=value, placeholder=placeholder).props("dense outlined").classes(
@@ -1579,6 +1982,7 @@ class DashboardUI:
                 field.props("readonly")
             if password:
                 field.props("type=password")
+            return field
 
     # === END: SETTINGS DIALOG ===
 

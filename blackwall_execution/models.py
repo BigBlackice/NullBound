@@ -43,6 +43,17 @@ class RunRequest:
     profile: ScanProfile
     context: ExecutionContext
     options: tuple[tuple[str, str], ...] = ()
+    timeout_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolHealth:
+    """Result of resolving and identifying one configured executable."""
+
+    state: str
+    executable: str | None = None
+    version: str | None = None
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +100,7 @@ class RunManifest:
     executable: str
     arguments: tuple[str, ...]
     created_at: str
+    timeout_seconds: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
     exit_code: int | None = None
@@ -117,6 +129,9 @@ class RunManifest:
             project_id=data.get("project_id"),
             project_name=data.get("project_name"), scope_enforced=bool(data["scope_enforced"]),
             executable=str(data["executable"]), arguments=tuple(str(x) for x in data["arguments"]),
+            timeout_seconds=(
+                int(data["timeout_seconds"]) if data.get("timeout_seconds") is not None else None
+            ),
             created_at=str(data["created_at"]), started_at=data.get("started_at"),
             finished_at=data.get("finished_at"), exit_code=data.get("exit_code"),
             duration_seconds=data.get("duration_seconds"),
@@ -137,6 +152,7 @@ class RunManifest:
             "project_id": self.project_id,
             "project_name": self.project_name, "scope_enforced": self.scope_enforced,
             "executable": self.executable, "arguments": list(self.arguments),
+            "timeout_seconds": self.timeout_seconds,
             "created_at": self.created_at, "started_at": self.started_at,
             "finished_at": self.finished_at, "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,

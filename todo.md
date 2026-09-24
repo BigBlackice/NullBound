@@ -127,19 +127,19 @@ The persistent shell should include:
   must not contain a separate project selector: runs launched inside a project are
   filed into it automatically, while launchpad runs outside a project remain
   unattached.
-- [ ] Add run-history filtering by project ID/name, including a `No project`
+- [x] Add run-history filtering by project ID/name, including a `No project`
   filter. This can follow the first polished UI implementation.
 
 ### v0.1c — One complete execution path
 
 - [x] Define an argv-based, data-driven tool-adapter schema which runtime-added
   modules and profiles can use without changing the process runner.
-- [ ] Build **Settings > Modules** to list, add, and edit modules. The editor must
+- [x] Build **Settings > Modules** to list, add, edit, and delete modules. The editor must
   show an automatically allocated, read-only numeric ID after the module type,
   plus `eyebrow`, optional `icon`, `description`, `bin`, and executable `path`.
-- [ ] Validate module executable paths, show availability/version state, and use
+- [x] Validate module executable paths, show availability/version state, and use
   the catalog's default icon whenever no icon is selected.
-- [ ] Support named scan profiles and provide per-module profile creation and
+- [x] Support named scan profiles and provide per-module profile creation and
   editing in **Settings > Modules**.
 - [x] Integrate ProjectDiscovery `httpx` as the first end-to-end adapter: availability
   check, version capture, direct/project targets, JSONL output, cancellation, and a
@@ -147,16 +147,19 @@ The persistent shell should include:
 - [x] Add initial runnable profiles and raw artifacts for every Launchpad module:
   Amass, dnsx, Nmap, httpx, gau, and tlsx. Normalization into project evidence
   remains a separate v0.2 concern.
-- [ ] Preview the exact executable and arguments before launch.
+- [x] Preview the exact executable and arguments before launch.
 - [x] Launch processes without interpolating user input into a shell string.
 - [x] Stream stdout and stderr to the run console and persistent log files.
 - [x] Add a deliberate starting/loading state to the run console for the period
   between launch and the first process output.
-- [ ] Support queueing, concurrency limits, timeouts, and process-group cancellation.
+- [x] Support queueing, concurrency limits, timeouts, and process-group cancellation.
 - [x] Preserve run state if the browser disconnects or refreshes.
 - [x] Record executable path, version, arguments, inputs, timestamps, duration,
   exit code, and artifact hashes in a run manifest.
-- [ ] Add run history and artifact download/open actions.
+- [x] Add project-filtered run history and safe artifact preview/download actions.
+- [x] Keep no-project runs session-only. When creating a project, require an explicit
+  choice to attach completed session runs or delete them permanently; active runs
+  must finish or be cancelled first.
 
 ### v0.1 acceptance criteria
 
@@ -167,7 +170,8 @@ The persistent shell should include:
   automatically and may use project assets as targets. Outside a project, the run
   remains unattached.
 - A denied target cannot be launched accidentally.
-- Raw artifacts and a complete manifest remain available after restarting the app.
+- Project-attached raw artifacts and complete manifests remain available after
+  restarting the app; intentionally transient no-project runs do not.
 - The main workflow is usable without an interactive terminal.
 
 ## v0.2 — Evidence and asset workspace
