@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from blackwall_evidence import EvidenceStore, ProjectRunIngestor
 from blackwall_execution import (
     AdapterRegistry,
     CommandSpec,
@@ -283,6 +284,99 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(finished.project_id, "P-0042")
         self.assertEqual(finished.run_path.parent, project / "runs")
+
+    async def test_project_run_is_post_processed_without_changing_terminal_state(self) -> None:
+        processed = []
+
+        def processor(manifest):
+            processed.append(manifest.id)
+            return {"assets_created": 2, "evidence_created": 2}
+
+        manager = ExecutionManager(
+            store=self.store, adapters=AdapterRegistry((PythonTestAdapter(),)),
+            max_concurrent=1, post_run_processor=processor,
+        )
+        original = request_for("print('index me')")
+        request = RunRequest(
+            module=original.module, profile=original.profile,
+            context=ExecutionContext(
+                selection=original.context.selection,
+                project_id="P-0043", project_name="Indexed",
+            ),
+        )
+        project = Path(self.temporary_directory.name) / "indexed-project"
+        project.mkdir()
+
+        run = await manager.start(request, project)
+        finished = await manager.wait(run.id)
+
+        self.assertEqual(finished.state, RunState.COMPLETED)
+        self.assertEqual(finished.evidence_state, "indexed")
+        self.assertEqual(dict(finished.evidence_summary)["assets_created"], 2)
+        self.assertEqual(processed, [run.id])
+
+    async def test_post_processing_failure_is_recorded_separately_from_scan_failure(self) -> None:
+        def processor(_manifest):
+            raise ValueError("parser fixture failed")
+
+        manager = ExecutionManager(
+            store=self.store, adapters=AdapterRegistry((PythonTestAdapter(),)),
+            max_concurrent=1, post_run_processor=processor,
+        )
+        original = request_for("print('scan succeeded')")
+        request = RunRequest(
+            module=original.module, profile=original.profile,
+            context=ExecutionContext(
+                selection=original.context.selection,
+                project_id="P-0044", project_name="Indexed",
+            ),
+        )
+        project = Path(self.temporary_directory.name) / "failed-index-project"
+        project.mkdir()
+
+        run = await manager.start(request, project)
+        finished = await manager.wait(run.id)
+
+        self.assertEqual(finished.state, RunState.COMPLETED)
+        self.assertEqual(finished.evidence_state, "failed")
+        self.assertIn("parser fixture failed", finished.evidence_error)
+
+    async def test_scan_artifact_flows_into_project_assets_and_evidence(self) -> None:
+        script = (
+            "from pathlib import Path; "
+            "Path('artifacts/dnsx.jsonl').write_text("
+            "'{\"host\":\"api.example.com\",\"a\":[\"192.0.2.50\"]}\\n')"
+        )
+        module = ModuleDefinition.from_mapping({
+            "id": "98", "eyebrow": "test", "description": "dnsx fixture",
+            "bin": "dnsx", "path": sys.executable, "adapter": "python-test",
+            "profiles": [{"name": "Test", "arguments": ["-c", script]}],
+        })
+        project = Path(self.temporary_directory.name) / "pipeline-project"
+        project.mkdir()
+        request = RunRequest(
+            module=module, profile=module.default_profile,
+            context=ExecutionContext(
+                selection=TargetSelection.direct((Target.parse("api.example.com"),)),
+                project_id="P-PIPE", project_name="Pipeline",
+            ),
+        )
+        manager = ExecutionManager(
+            store=self.store, adapters=AdapterRegistry((PythonTestAdapter(),)),
+            post_run_processor=ProjectRunIngestor(),
+        )
+
+        run = await manager.start(request, project)
+        finished = await manager.wait(run.id)
+        assets = EvidenceStore(project).list_assets()
+        evidence = EvidenceStore(project).list_evidence()
+
+        self.assertEqual(finished.state, RunState.COMPLETED)
+        self.assertEqual(finished.evidence_state, "indexed")
+        self.assertEqual({asset.normalized_key for asset in assets}, {
+            "api.example.com", "192.0.2.50",
+        })
+        self.assertEqual({item.run_id for item in evidence}, {run.id})
 
     async def test_stale_run_is_recovered_after_restart(self) -> None:
         run_id, run_path = self.store.reserve()

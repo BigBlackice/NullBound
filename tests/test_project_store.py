@@ -37,6 +37,7 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(project.id, "P-0001")
         self.assertEqual(project.name, "Nightfall / ACME")
         self.assertTrue(project.runs_path.is_dir())
+        self.assertTrue(project.database_path.is_file())
         payload = json.loads(project.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["kind"], PROJECT_KIND)
         self.assertEqual(payload["schema_version"], PROJECT_SCHEMA_VERSION)

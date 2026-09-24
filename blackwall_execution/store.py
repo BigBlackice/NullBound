@@ -83,6 +83,7 @@ class RunStore:
             arguments=command.arguments,
             created_at=utc_now(),
             timeout_seconds=request.timeout_seconds,
+            evidence_state="pending" if context.project_id else "not_applicable",
             run_path=run_path,
         )
         return self.save(manifest)

@@ -10,6 +10,7 @@ import shlex
 
 from nicegui import events, ui
 from app_config import AppConfig
+from blackwall_evidence import EvidenceStore
 from blackwall_execution import (
     ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest, ToolHealth,
 )
@@ -27,7 +28,6 @@ from blackwall_scope import (
 from recon_modules import (
     FAVICON_DATA_URL, ModuleCatalog, ModuleDefinition, ScanProfile, load_default_catalog,
 )
-from workspace_data import ASSETS, EVIDENCE, SCOPE_RULES
 
 
 # Shared static resources. Module data is intentionally loaded per page below so
@@ -62,59 +62,13 @@ ESCAPE_KEY_BEHAVIOR = """
 })();
 </script>
 """
-# Temporary finding records used to shape the UI before scanner persistence exists.
-FINDINGS = (
-    {
-        "id": "FW-1042", "severity": "critical",
-        "title": "Remote code execution via template injection",
-        "asset": "portal.acme.test", "source": "Nuclei", "confidence": "Confirmed", "seen": "12:42:18",
-        "location": "POST /api/v2/render",
-        "description": "User-controlled template input is evaluated by the server process.",
-        "evidence": "{{7*7}} returned 49 in the rendered response body.",
-        "recommendation": "Remove dynamic template evaluation and strictly allow-list supported fields.",
-    },
-    {
-        "id": "FW-1038", "severity": "high", "title": "Exposed administrative interface",
-        "asset": "admin.acme.test:8443", "source": "HTTPX", "confidence": "High", "seen": "12:37:04",
-        "location": "https://admin.acme.test:8443/console",
-        "description": "An administrative console is reachable from the public network.",
-        "evidence": "HTTP 200 with the product administration login page and version banner.",
-        "recommendation": "Restrict the interface to the management network and require strong authentication.",
-    },
-    {
-        "id": "FW-1029", "severity": "medium", "title": "TLS certificate name mismatch",
-        "asset": "legacy.acme.test", "source": "TLSX", "confidence": "Medium", "seen": "12:19:51",
-        "location": "legacy.acme.test:443",
-        "description": "The presented certificate does not contain the requested hostname.",
-        "evidence": "Certificate SAN contains old-portal.acme.test but not legacy.acme.test.",
-        "recommendation": "Replace the certificate with one covering the active service hostname.",
-    },
-    {
-        "id": "FW-1016", "severity": "low",
-        "title": "Server version disclosed in response header",
-        "asset": "api.acme.test", "source": "HTTPX", "confidence": "Low", "seen": "11:58:23",
-        "location": "GET /health",
-        "description": "The Server response header exposes an exact software version.",
-        "evidence": "Server: nginx/1.24.0",
-        "recommendation": "Suppress version tokens in externally visible response headers.",
-    },
-    {
-        "id": "FW-1007", "severity": "info", "title": "Additional hostname discovered",
-        "asset": "status.acme.test", "source": "Amass", "confidence": "N/A", "seen": "11:44:09",
-        "location": "status.acme.test",
-        "description": "A previously unknown hostname was identified through passive DNS sources.",
-        "evidence": "A record resolves to 203.0.113.42 and serves an HTTP status page.",
-        "recommendation": "Review ownership and add the host to the project scope if appropriate.",
-    },
-)
-
 # Navigation is data-driven: each entry defines its icon, label, view ID, and badge.
 NAV_ITEMS = (
     ("grid_view", "Launchpad", "launchpad", ""),
-    ("flag", "Findings", "findings", f"{len(FINDINGS):02d}"),
-    ("language", "Assets", "assets", "24"),
-    ("link", "Evidence", "evidence", f"{len(EVIDENCE):02d}"),
-    ("gpp_good", "Scope", "scope", "27"),
+    ("flag", "Findings", "findings", ""),
+    ("language", "Assets", "assets", ""),
+    ("link", "Evidence", "evidence", ""),
+    ("gpp_good", "Scope", "scope", ""),
     ("terminal", "Runs", "runs", ""),
 )
 
@@ -164,10 +118,10 @@ class DashboardUI:
         self.selected_module_id = "04"
         if all(module.id != self.selected_module_id for module in modules):
             self.selected_module_id = modules[0].id
-        self.selected_finding_id = FINDINGS[0]["id"]
-        self.selected_asset_id = ASSETS[0]["id"]
-        self.selected_evidence_id = EVIDENCE[0]["id"]
-        self.selected_scope_id = SCOPE_RULES[0]["id"]
+        self.selected_finding_id: str | None = None
+        self.selected_asset_id: str | None = None
+        self.selected_evidence_id: str | None = None
+        self.selected_scope_id: str | None = None
         self.selected_run_id: str | None = None
         self.target_modes = {module.id: "direct" for module in modules}
         self.direct_targets = {module.id: "" for module in modules}
@@ -194,6 +148,8 @@ class DashboardUI:
         self.run_timeout_values = {module.id: "" for module in modules}
         self._pending_project: tuple[str, Path] | None = None
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
+        self.evidence_stores: dict[Path, EvidenceStore] = {}
+        self.evidence_scope_versions: dict[Path, tuple[int, int] | None] = {}
         self.execution_manager = execution_manager or ExecutionManager()
         self.active_run_id: str | None = None
         self._run_unsubscribe = None
@@ -218,9 +174,120 @@ class DashboardUI:
             (project for project in self.projects if project.id == self.active_project_id), None
         )
 
-    @property
-    def selected_finding(self) -> dict[str, str]:
-        return next(finding for finding in FINDINGS if finding["id"] == self.selected_finding_id)
+    def active_evidence_store(self) -> EvidenceStore | None:
+        project = self.active_project
+        if project is None:
+            return None
+        key = project.path.resolve()
+        store = self.evidence_stores.get(key)
+        if store is None:
+            store = EvidenceStore(key)
+            self.evidence_stores[key] = store
+        scope_store = ScopeStore(project.path)
+        try:
+            stat = scope_store.path.stat()
+            scope_version: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            scope_version = None
+        if key not in self.evidence_scope_versions or self.evidence_scope_versions[key] != scope_version:
+            store.sync_scope(scope_store.load())
+            self.evidence_scope_versions[key] = scope_version
+        return store
+
+    @staticmethod
+    def _scope_label(value: str) -> str:
+        return {
+            "allowed": "ALLOWED", "denied": "DENIED", "review": "REVIEW",
+            "unmatched": "REVIEW",
+        }.get(value, value.upper())
+
+    def asset_records(self) -> tuple[dict[str, str], ...]:
+        store = self.active_evidence_store()
+        if store is None:
+            return ()
+        records: list[dict[str, str]] = []
+        for asset in store.list_assets():
+            evidence = store.list_evidence(asset_id=asset.id)
+            sources = ", ".join(dict.fromkeys(item.source.upper() for item in evidence)) or "—"
+            run_ids = ", ".join(dict.fromkeys(item.run_id for item in evidence if item.run_id))
+            metadata = dict(asset.metadata)
+            records.append({
+                "id": asset.id, "type": asset.kind.value.upper(), "name": asset.display_name,
+                "address": str(metadata.get("address", "—")),
+                "ports": str(metadata.get("ports", "—")),
+                "scope": self._scope_label(asset.scope.value), "source": sources,
+                "first_seen": asset.first_seen_at, "last_seen": asset.last_seen_at,
+                "technology": str(metadata.get("technology", "—")),
+                "provenance": run_ids or sources,
+                "notes": str(metadata.get("notes", "")),
+            })
+        return tuple(records)
+
+    def finding_records(self) -> tuple[dict[str, str], ...]:
+        store = self.active_evidence_store()
+        if store is None:
+            return ()
+        return tuple({
+            "id": finding.id, "severity": finding.severity.value, "title": finding.title,
+            "asset": finding.asset_name or "—", "source": finding.source,
+            "confidence": finding.confidence, "seen": finding.last_seen_at,
+            "location": finding.location, "description": finding.description,
+            "evidence": finding.evidence, "recommendation": finding.recommendation,
+            "state": finding.state.value,
+        } for finding in store.list_findings())
+
+    def evidence_node_records(self) -> tuple[dict[str, object], ...]:
+        store = self.active_evidence_store()
+        if store is None:
+            return ()
+        assets = store.list_assets()
+        by_id = {asset.id: asset for asset in assets}
+        records: list[dict[str, object]] = []
+        for asset in assets:
+            evidence = store.list_evidence(asset_id=asset.id)
+            relationships = store.list_relationships(asset.id)
+            identifiers: list[tuple[str, str]] = [(asset.kind.value.upper(), asset.normalized_key)]
+            for relationship in relationships:
+                related_id = (
+                    relationship.target_id
+                    if relationship.source_id == asset.id else relationship.source_id
+                )
+                related = by_id.get(related_id)
+                if related:
+                    identifiers.append((related.kind.value.upper(), related.normalized_key))
+            records.append({
+                "id": asset.id, "kind": asset.kind.value.upper(),
+                "identifier": asset.display_name,
+                "scope": "IN SCOPE" if asset.scope.value == "allowed" else "REVIEW REQUIRED",
+                "scope_anchor": asset.matched_rule_id or "NO MATCHED RULE",
+                "relations": f"{len(relationships):02d}",
+                "artifact_count": f"{len(evidence):02d}", "updated": asset.last_seen_at,
+                "context": "Normalized evidence node with retained raw observations and provenance.",
+                "identifiers": tuple(dict.fromkeys(identifiers)),
+                "artifacts": tuple(
+                    (item.kind.value.upper(), item.id, item.raw_value, item.source.upper(),
+                     item.integrity_status.upper())
+                    for item in evidence
+                ),
+            })
+        return tuple(records)
+
+    def scope_records(self) -> tuple[dict[str, str], ...]:
+        store = self.active_evidence_store()
+        if store is None:
+            return ()
+        records = []
+        for rule in store.list_scope_rules():
+            decision = "REVIEW REQUIRED" if rule["review_required"] else str(rule["scope_status"]).upper()
+            records.append({
+                "id": str(rule["id"]), "target": str(rule["original_target"]),
+                "type": str(rule["target_kind"]).upper(), "decision": decision,
+                "ownership": str(rule["ownership_confidence"]).upper(),
+                "source": str(rule["source"]).upper(), "updated": str(rule["synced_at"]),
+                "reason": str(rule["notes"] or "Portable scope rule mirrored from scope.json."),
+                "applies": str(rule["normalized_target"]), "notes": str(rule["notes"]),
+            })
+        return tuple(records)
 
     @staticmethod
     def _record(records: tuple[dict[str, str], ...], record_id: str) -> dict[str, str]:
@@ -305,6 +372,9 @@ class DashboardUI:
         if run.duration_seconds is not None:
             minutes, seconds = divmod(int(run.duration_seconds), 60)
             duration = f"{minutes:02d}:{seconds:02d}"
+        evidence_summary = ", ".join(
+            f"{key.replace('_', ' ')}: {value}" for key, value in run.evidence_summary
+        )
         return {
             "id": run.id,
             "state": run.state.value.upper(),
@@ -320,6 +390,8 @@ class DashboardUI:
             "command": command,
             "context": context,
             "summary": run.error or f"Run state: {run.state.value}.",
+            "evidence_state": run.evidence_state.replace("_", " ").upper(),
+            "evidence_summary": run.evidence_error or evidence_summary or "No indexed records.",
         }
 
     def build(self) -> None:
@@ -655,7 +727,7 @@ class DashboardUI:
     # Project-tab actions delegate persistence and validation to blackwall_projects.
     def select_project(self, project_id: str) -> None:
         self.project_workspace.select(project_id)
-        self.render_topbar()
+        self.refresh_project_surfaces()
         if self.active_view == "launchpad":
             self.render_inspector()
 
@@ -702,6 +774,16 @@ class DashboardUI:
         self.unattached_runs_dialog.close()
         self.create_project_dialog.close()
         self.execution_manager.recover_incomplete((project.path,))
+        evidence_store = EvidenceStore(project.path)
+        evidence_store.recover_incomplete()
+        evidence_store.sync_scope(ScopeStore(project.path).load())
+        key = project.path.resolve()
+        self.evidence_stores[key] = evidence_store
+        scope_path = ScopeStore(project.path).path
+        self.evidence_scope_versions[key] = (
+            (scope_path.stat().st_mtime_ns, scope_path.stat().st_size)
+            if scope_path.exists() else None
+        )
         ui.notify(f"Created {project.id} / {project.name}", type="positive")
         self.refresh_project_surfaces()
 
@@ -731,10 +813,23 @@ class DashboardUI:
             return
         ui.notify(f"Opened {project.id} / {project.name}", type="positive")
         self.execution_manager.recover_incomplete((project.path,))
+        evidence_store = EvidenceStore(project.path)
+        evidence_store.recover_incomplete()
+        evidence_store.sync_scope(ScopeStore(project.path).load())
+        key = project.path.resolve()
+        self.evidence_stores[key] = evidence_store
+        scope_path = ScopeStore(project.path).path
+        self.evidence_scope_versions[key] = (
+            (scope_path.stat().st_mtime_ns, scope_path.stat().st_size)
+            if scope_path.exists() else None
+        )
         self.refresh_project_surfaces()
 
     def refresh_project_surfaces(self) -> None:
         self.render_topbar()
+        if self.active_view in {"findings", "assets", "evidence", "scope", "runs"}:
+            self.render_workspace()
+            self.render_inspector()
         if self.settings_open and self.settings_section == "projects":
             self.render_settings_content()
 
@@ -958,20 +1053,23 @@ class DashboardUI:
     # === START: FINDINGS VIEW ===
     def render_findings_workspace(self) -> None:
         """Render a compact, packet-list-inspired finding table."""
+        findings = self.finding_records()
+        if findings and self.selected_finding_id not in {item["id"] for item in findings}:
+            self.selected_finding_id = findings[0]["id"]
         ui.label("ASSESSMENT / FINDINGS").classes("section-kicker")
         with ui.element("div").classes("title-row"):
             ui.label("Findings").classes("page-title")
-            ui.label(f"VIEW 02 / {len(FINDINGS):02d} RECORDS").classes("view-index")
+            ui.label(f"{len(findings):02d} RECORDS").classes("view-index")
 
         with ui.element("div").classes("finding-summary"):
             ui.label("ALL").classes("filter-active")
             for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
-                count = sum(finding["severity"] == severity.lower() for finding in FINDINGS)
+                count = sum(finding["severity"] == severity.lower() for finding in findings)
                 ui.label(f"{severity} {count:02d}")
 
         query = self.search_query.strip().casefold()
         visible_findings = tuple(
-            finding for finding in FINDINGS
+            finding for finding in findings
             if not query or query in " ".join(finding.values()).casefold()
         )
         with ui.element("section").classes("finding-table"):
@@ -1006,27 +1104,39 @@ class DashboardUI:
 
     # === START: PROJECT RECORD VIEWS ===
     def render_assets_workspace(self) -> None:
+        records = self.asset_records()
+        if records and self.selected_asset_id not in {item["id"] for item in records}:
+            self.selected_asset_id = records[0]["id"]
         self.render_record_workspace(
-            view_id="assets", kicker="INVENTORY / ASSETS", title="Assets", index="SHOWING 06 / 24",
-            filters=("ALL", "DOMAIN", "HOST", "IP", "URL"), records=ASSETS,
+            view_id="assets", kicker="INVENTORY / ASSETS", title="Assets",
+            index=f"{len(records):02d} RECORDS",
+            filters=("ALL", "DOMAIN", "HOST", "IP", "URL"), records=records,
             columns=(("type", "TYPE"), ("name", "ASSET"), ("address", "ADDRESS"),
                      ("ports", "PORTS"), ("scope", "SCOPE"), ("source", "SOURCE")),
             selected_id=self.selected_asset_id, tone_key="scope",
         )
 
     def render_evidence_workspace(self) -> None:
+        records = self.evidence_node_records()
+        if records and self.selected_evidence_id not in {item["id"] for item in records}:
+            self.selected_evidence_id = str(records[0]["id"])
         self.render_record_workspace(
-            view_id="evidence", kicker="PROVENANCE / EVIDENCE", title="Evidence", index="05 IN-SCOPE NODES",
-            filters=("ALL", "ASSETS", "VULNERABILITIES", "IDENTITIES", "DOMAINS", "URLS"), records=EVIDENCE,
+            view_id="evidence", kicker="PROVENANCE / EVIDENCE", title="Evidence",
+            index=f"{len(records):02d} NODES",
+            filters=("ALL", "ASSETS", "VULNERABILITIES", "IDENTITIES", "DOMAINS", "URLS"), records=records,
             columns=(("kind", "TYPE"), ("identifier", "IDENTIFIER"), ("scope_anchor", "SCOPE ANCHOR"),
                      ("relations", "RELATED"), ("artifact_count", "ARTIFACTS"), ("updated", "UPDATED")),
             selected_id=self.selected_evidence_id, tone_key="scope", interactive_filters=True,
         )
 
     def render_scope_workspace(self) -> None:
+        records = self.scope_records()
+        if records and self.selected_scope_id not in {item["id"] for item in records}:
+            self.selected_scope_id = records[0]["id"]
         self.render_record_workspace(
-            view_id="scope", kicker="AUTHORIZATION / SCOPE", title="Scope", index="SHOWING 06 / 27",
-            filters=("ALL", "ALLOWED", "DENIED", "REVIEW REQUIRED"), records=SCOPE_RULES,
+            view_id="scope", kicker="AUTHORIZATION / SCOPE", title="Scope",
+            index=f"{len(records):02d} RULES",
+            filters=("ALL", "ALLOWED", "DENIED", "REVIEW REQUIRED"), records=records,
             columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
                      ("ownership", "OWNERSHIP"), ("source", "SOURCE"), ("updated", "UPDATED")),
             selected_id=self.selected_scope_id, tone_key="decision",
@@ -1166,15 +1276,33 @@ class DashboardUI:
 
     # === START: RIGHT INSPECTOR ===
     # Shared right inspector dispatches to the active view's selected object.
+    def render_empty_inspector(self, label: str) -> None:
+        with ui.element("div").classes("inspector-header"):
+            with ui.element("div").classes("inspector-header-copy"):
+                ui.label(label.upper()).classes("panel-number")
+                ui.label(
+                    "Open a project to view indexed records"
+                    if self.active_project is None else "No indexed records yet"
+                ).classes("panel-title")
+
     def render_inspector(self) -> None:
         self.inspector.clear()
         if self.active_view == "findings":
             with self.inspector:
-                self.render_finding_inspector()
+                records = self.finding_records()
+                if not records:
+                    self.render_empty_inspector("Findings")
+                    return
+                record = self._record(records, self.selected_finding_id or records[0]["id"])
+                self.render_finding_inspector(record)
             return
         if self.active_view == "assets":
             with self.inspector:
-                record = self._record(ASSETS, self.selected_asset_id)
+                records = self.asset_records()
+                if not records:
+                    self.render_empty_inspector("Assets")
+                    return
+                record = self._record(records, self.selected_asset_id or records[0]["id"])
                 self.render_record_inspector(
                     record, "ASSET", record["name"], f"{record['type']} / {record['scope']}",
                     (("ADDRESS", record["address"]), ("PORTS", record["ports"]),
@@ -1186,12 +1314,20 @@ class DashboardUI:
             return
         if self.active_view == "evidence":
             with self.inspector:
-                record = self._record(EVIDENCE, self.selected_evidence_id)
+                records = self.evidence_node_records()
+                if not records:
+                    self.render_empty_inspector("Evidence")
+                    return
+                record = self._record(records, self.selected_evidence_id or str(records[0]["id"]))
                 self.render_evidence_inspector(record)
             return
         if self.active_view == "scope":
             with self.inspector:
-                record = self._record(SCOPE_RULES, self.selected_scope_id)
+                records = self.scope_records()
+                if not records:
+                    self.render_empty_inspector("Scope")
+                    return
+                record = self._record(records, self.selected_scope_id or records[0]["id"])
                 self.render_record_inspector(
                     record, "SCOPE RULE", record["target"], record["decision"],
                     (("DECISION", record["decision"]), ("OWNERSHIP", record["ownership"]),
@@ -1356,9 +1492,8 @@ class DashboardUI:
                     on_click=self.launch_selected_module,
                 ).props("unelevated no-caps").classes("launch-button")
 
-    def render_finding_inspector(self) -> None:
+    def render_finding_inspector(self, finding: dict[str, str]) -> None:
         """Render details for the selected finding in the shared right inspector."""
-        finding = self.selected_finding
         with ui.element("div").classes("inspector-header finding-inspector-header"):
             with ui.element("button").classes("inspector-toggle").props(
                 f'type=button aria-label="{"Expand finding details" if self.inspector_collapsed else "Collapse finding details"}"'
@@ -1380,6 +1515,7 @@ class DashboardUI:
                 ("LOCATION", finding["location"]),
                 ("SOURCE", finding["source"].upper()),
                 ("CONFIDENCE", finding["confidence"].upper()),
+                ("LIFECYCLE", finding["state"].replace("_", " ").upper()),
                 ("FIRST SEEN", finding["seen"]),
             ):
                 with ui.element("div").classes("finding-detail-row"):
@@ -1482,9 +1618,11 @@ class DashboardUI:
             record, "RUN", record["module"], record["state"],
             (("TARGET", record["target"]), ("PROJECT", record["project"]),
              ("PROFILE", record["profile"]), ("DURATION", record["duration"]),
-             ("STARTED", record["started"]), ("EXIT CODE", record["exit_code"])),
+             ("STARTED", record["started"]), ("EXIT CODE", record["exit_code"]),
+             ("EVIDENCE", record["evidence_state"])),
             (("EXECUTION CONTEXT", record["context"]), ("COMMAND", record["command"]),
-             ("SUMMARY", record["summary"])), record["state"],
+             ("SUMMARY", record["summary"]),
+             ("EVIDENCE INGESTION", record["evidence_summary"])), record["state"],
         )
         if self.inspector_collapsed:
             return

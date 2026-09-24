@@ -6,6 +6,7 @@ import sys
 from nicegui import app, ui
 
 from app_config import AppConfig
+from blackwall_evidence import ProjectRunIngestor
 from blackwall_execution import ExecutionManager
 from dashboard_ui import build_ui
 from recon_modules import FAVICON_SVG
@@ -17,7 +18,7 @@ def run(argv: list[str] | None = None) -> None:
     if config.remote_access_warning:
         print(f"WARNING: {config.remote_access_warning}", file=sys.stderr)
 
-    execution_manager = ExecutionManager()
+    execution_manager = ExecutionManager(post_run_processor=ProjectRunIngestor())
     execution_manager.recover_incomplete()
     print("Jacking in...", flush=True)
     app.on_startup(lambda: print("BlackWall ready!", flush=True))

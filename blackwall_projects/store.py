@@ -10,6 +10,8 @@ import shutil
 from typing import Final
 from uuid import uuid4
 
+from blackwall_evidence import DatabaseVersionError, ProjectDatabase
+
 from .models import (
     PROJECT_ID_PATTERN,
     Project,
@@ -89,6 +91,7 @@ class ProjectStore:
             staging.mkdir()
             (staging / PROJECT_RUNS_DIRECTORY).mkdir()
             self._write_manifest(staging / PROJECT_MANIFEST_NAME, manifest)
+            ProjectDatabase(staging).initialize()
             staging.replace(destination)
         except Exception:
             if staging.exists():
@@ -129,6 +132,10 @@ class ProjectStore:
             raise ProjectValidationError(f"cannot create runs directory: {runs_path}") from error
         if not runs_path.is_dir():
             raise ProjectValidationError(f"runs path is not a directory: {runs_path}")
+        try:
+            ProjectDatabase(project_path).initialize()
+        except (OSError, DatabaseVersionError) as error:
+            raise ProjectValidationError(f"cannot open project database: {project_path}") from error
         return Project(manifest=manifest, path=project_path)
 
     def _next_project_id(self) -> str:

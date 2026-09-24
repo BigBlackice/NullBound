@@ -116,6 +116,11 @@ class Project:
         """Optional versioned target/scope data stored beside project metadata."""
         return self.path / "scope.json"
 
+    @property
+    def database_path(self) -> Path:
+        """Searchable local index; portable raw evidence remains beside it on disk."""
+        return self.path / "project.db"
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectIssue:

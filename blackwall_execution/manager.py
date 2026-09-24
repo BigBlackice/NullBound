@@ -9,7 +9,7 @@ from pathlib import Path
 import signal
 import time
 import re
-from typing import Callable
+from typing import Callable, Mapping
 
 from .adapters import AdapterRegistry
 from .models import ExecutionError, RunEvent, RunManifest, RunRequest, RunState, ToolHealth, utc_now
@@ -17,6 +17,7 @@ from .store import RunStore
 
 
 RunListener = Callable[[RunEvent], None]
+PostRunProcessor = Callable[[RunManifest], Mapping[str, int] | None]
 ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
@@ -28,6 +29,7 @@ class ExecutionManager:
         store: RunStore | None = None,
         adapters: AdapterRegistry | None = None,
         max_concurrent: int = 3,
+        post_run_processor: PostRunProcessor | None = None,
     ) -> None:
         self.store = store or RunStore()
         self.adapters = adapters or AdapterRegistry()
@@ -37,6 +39,7 @@ class ExecutionManager:
         self._runs: dict[str, RunManifest] = {}
         self._listeners: dict[str, list[RunListener]] = defaultdict(list)
         self._cancel_requested: set[str] = set()
+        self.post_run_processor = post_run_processor
 
     async def start(self, request: RunRequest, project_path: Path | None = None) -> RunManifest:
         adapter = self.adapters.get(request.module.adapter)
@@ -90,8 +93,10 @@ class ExecutionManager:
     def adopt_unattached(self, project: object) -> tuple[RunManifest, ...]:
         adopted = self.store.adopt_unattached(project)
         for run in adopted:
-            self._runs[run.id] = run
-        return adopted
+            pending = self.store.save(run.evolve(evidence_state="pending"))
+            self._runs[run.id] = pending
+            self._post_process_sync(pending)
+        return tuple(self._runs[run.id] for run in adopted)
 
     def delete_unattached(self) -> tuple[str, ...]:
         removed = self.store.delete_unattached()
@@ -179,27 +184,37 @@ class ExecutionManager:
                     except TimeoutError:
                         process.kill()
                         await process.wait()
-                    self._transition(
+                    terminal = self._transition(
                         manifest, RunState.FAILED, exit_code=process.returncode,
                         error=f"run timed out after {manifest.timeout_seconds} seconds",
                         finished_at=utc_now(), duration_seconds=round(time.monotonic() - started_clock, 3),
                         artifacts=self.store.collect_artifacts(manifest.run_path),
                     )
+                    await self._post_process(terminal)
                     return
                 state = (
                     RunState.CANCELLED if run_id in self._cancel_requested
                     else RunState.COMPLETED if exit_code == 0 else RunState.FAILED
                 )
                 error = None if state in {RunState.COMPLETED, RunState.CANCELLED} else f"process exited with code {exit_code}"
-                self._transition(
+                terminal = self._transition(
                     manifest, state, exit_code=exit_code, error=error,
                     finished_at=utc_now(), duration_seconds=round(time.monotonic() - started_clock, 3),
                     artifacts=self.store.collect_artifacts(manifest.run_path),
                 )
+                await self._post_process(terminal)
         except asyncio.CancelledError:
-            self._transition(manifest, RunState.CANCELLED, finished_at=utc_now())
+            terminal = self._transition(
+                manifest, RunState.CANCELLED, finished_at=utc_now(),
+                artifacts=self.store.collect_artifacts(manifest.run_path),
+            )
+            await self._post_process(terminal)
         except Exception as error:
-            self._transition(manifest, RunState.FAILED, finished_at=utc_now(), error=str(error))
+            terminal = self._transition(
+                manifest, RunState.FAILED, finished_at=utc_now(), error=str(error),
+                artifacts=self.store.collect_artifacts(manifest.run_path),
+            )
+            await self._post_process(terminal)
         finally:
             self._processes.pop(run_id, None)
             self._cancel_requested.discard(run_id)
@@ -241,6 +256,53 @@ class ExecutionManager:
                 listener(event)
             except Exception:
                 self._listeners[event.run.id].remove(listener)
+
+    async def _post_process(self, manifest: RunManifest) -> None:
+        if manifest.project_id is None or self.post_run_processor is None:
+            return
+        try:
+            indexing = self._transition(
+                manifest, manifest.state, evidence_state="indexing",
+                evidence_parser=manifest.module_bin.casefold(), evidence_error=None,
+            )
+            summary = await asyncio.to_thread(self.post_run_processor, indexing)
+            self._transition(
+                indexing, indexing.state,
+                evidence_state="indexed" if summary is not None else "no_artifact",
+                evidence_summary=tuple(sorted((summary or {}).items())),
+            )
+        except Exception as error:
+            current = self._runs.get(manifest.id, manifest)
+            try:
+                self._transition(
+                    current, current.state, evidence_state="failed", evidence_error=str(error),
+                )
+            except Exception:
+                pass
+
+    def _post_process_sync(self, manifest: RunManifest) -> None:
+        """Index an adopted terminal run from synchronous project creation code."""
+        if manifest.project_id is None or self.post_run_processor is None:
+            return
+        try:
+            indexing = self._transition(
+                manifest, manifest.state, evidence_state="indexing",
+                evidence_parser=manifest.module_bin.casefold(), evidence_error=None,
+            )
+            summary = self.post_run_processor(indexing)
+            self._transition(
+                indexing, indexing.state,
+                evidence_state="indexed" if summary is not None else "no_artifact",
+                evidence_summary=tuple(sorted((summary or {}).items())),
+            )
+        except Exception as error:
+            current = self._runs.get(manifest.id, manifest)
+            try:
+                self._transition(
+                    current, current.state, evidence_state="failed", evidence_error=str(error),
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _terminate_process(process: asyncio.subprocess.Process) -> None:

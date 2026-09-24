@@ -178,16 +178,26 @@ The persistent shell should include:
 
 - [x] Prototype an in-scope Evidence browser where assets, vulnerabilities, and
   identities act as relationship nodes and the inspector lists their artifacts.
-- [ ] Use SQLite as the searchable project index while keeping raw artifacts on
+- [x] Use SQLite as the searchable project index while keeping raw artifacts on
   disk.
 - [ ] Add schema versions, migrations, workspace locking, and crash recovery.
-- [ ] Define normalized record envelopes with stable IDs and source provenance.
-- [ ] Implement `parse -> normalize -> deduplicate -> scope review` as explicit,
+- [x] Define normalized record envelopes with stable IDs and source provenance.
+- [x] Implement `parse -> normalize -> deduplicate -> scope review` as explicit,
   independently testable stages.
-- [ ] Import the native Amass OAM `asset.db` run artifact without flattening its
+- [x] Define extensible correlation-rule contracts and persist typed, evidenced
+  relationships; start with explicit parser links and conservative URL-to-host
+  correlation without guessing registrable-domain boundaries.
+- [x] Automatically parse project-attached terminal runs into the evidence index.
+  Native parsers cover dnsx/httpx/gau/tlsx JSONL, Nmap XML, and Amass OAM SQLite;
+  no-project runs remain session-only and never create a project database.
+- [x] Import the native Amass OAM `asset.db` run artifact without flattening its
   asset relationships, source provenance, or confidence metadata.
-- [ ] Preserve every raw value alongside its normalized comparison key.
-- [ ] Treat URL canonicalization conservatively and record the normalization
+- Amass v5 JSON output is intentionally unsupported upstream. Keep `asset.db` as
+  the lossless source artifact; supported OAM entities and graph edges are indexed
+  read-only, while the complete native database remains available for future OAM
+  type coverage and rebuilds.
+- [x] Preserve every raw value alongside its normalized comparison key.
+- [x] Treat URL canonicalization conservatively and record the normalization
   version and transformations.
 - [ ] Retain out-of-scope discoveries, hide them from normal workflows, and expose
   them only in a deliberate review view.
@@ -197,6 +207,30 @@ The persistent shell should include:
 - [ ] Add search, filters, tags, notes, JSON/CSV export, and project backup.
 - [ ] Prove interoperability by using normalized output from one adapter as input
   to a second adapter.
+
+The initial database framework includes schema migrations, SQLite write locking,
+transaction rollback, and explicit recovery of interrupted ingestion batches. A
+separate multi-process workspace lock and backup/rebuild workflow are still needed
+before the combined locking/recovery item above can be marked complete.
+
+### Preserved UI classification vocabulary
+
+The prototype records were removed when the project database became the source for
+Assets, Findings, Evidence, and Scope. Preserve these semantic classifications and
+their established colors when real records populate those views:
+
+- Finding severity: `critical` uses structural red, `high` orange, `medium` amber,
+  `low` interactive blue, and `info` green.
+- Finding lifecycle: `candidate`, `validated`, `false_positive`, and
+  `accepted_risk`; lifecycle must remain distinct from severity and confidence.
+- Scope/record tones: `allowed`, `completed`, `verified`, `confirmed`, and
+  `in-scope` use interactive blue; `running`, `review`, `review-required`, and
+  `queued` use amber; `denied` and `failed` use structural red; `cancelled` uses
+  faint neutral text.
+- Ownership confidence remains `confirmed`, `likely`, or `unknown`, independently
+  of authorization. Scope decisions remain `allowed` or `denied`, with review as a
+  separate flag; unmatched discoveries enter deliberate review rather than being
+  silently treated as authorized.
 
 Suggested run layout:
 

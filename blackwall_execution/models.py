@@ -107,6 +107,10 @@ class RunManifest:
     duration_seconds: float | None = None
     error: str | None = None
     artifacts: tuple[ArtifactRecord, ...] = ()
+    evidence_state: str = "pending"
+    evidence_parser: str | None = None
+    evidence_error: str | None = None
+    evidence_summary: tuple[tuple[str, int], ...] = ()
     kind: str = RUN_KIND
     schema_version: int = RUN_SCHEMA_VERSION
     run_path: Path | None = field(default=None, compare=False, repr=False)
@@ -137,6 +141,16 @@ class RunManifest:
             duration_seconds=data.get("duration_seconds"),
             error=data.get("error"),
             artifacts=tuple(ArtifactRecord.from_mapping(x) for x in data.get("artifacts", ())),
+            evidence_state=str(data.get(
+                "evidence_state",
+                "pending" if data.get("project_id") else "not_applicable",
+            )),
+            evidence_parser=data.get("evidence_parser"),
+            evidence_error=data.get("evidence_error"),
+            evidence_summary=tuple(
+                (str(key), int(value))
+                for key, value in dict(data.get("evidence_summary", {})).items()
+            ),
             run_path=run_path,
         )
 
@@ -157,6 +171,10 @@ class RunManifest:
             "finished_at": self.finished_at, "exit_code": self.exit_code,
             "duration_seconds": self.duration_seconds,
             "error": self.error, "artifacts": [item.to_mapping() for item in self.artifacts],
+            "evidence_state": self.evidence_state,
+            "evidence_parser": self.evidence_parser,
+            "evidence_error": self.evidence_error,
+            "evidence_summary": dict(self.evidence_summary),
         }
 
 

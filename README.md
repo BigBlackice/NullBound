@@ -16,12 +16,21 @@ live in `blackwall_scope`.
 The adapter contract, subprocess lifecycle, cancellation, and portable run
 manifests live in `blackwall_execution`. Module scan profiles store argument arrays;
 Blackwall never interpolates target input into a shell command.
+The project-local SQLite schema, typed evidence records, parser contracts,
+normalization, deduplication, scope review, and correlation rules live in
+`blackwall_evidence`. Raw artifacts remain ordinary files; `project.db` is their
+searchable, rebuildable index. Terminal project runs are indexed automatically:
+Amass uses its native OAM SQLite `asset.db`, Nmap uses XML, and dnsx, httpx, gau,
+and tlsx use their native JSONL outputs. Failed or cancelled scans can still
+contribute complete records from partial artifacts, while parser failures are
+recorded separately and never rewrite the scan's terminal status.
 
 New projects default to the current user's Blackwall directory on every platform:
 
 ```text
 ~/.blackwall/projects/P-0001/
   project.json
+  project.db
   scope.json  # created when target sets or scope rules are first saved
   runs/
     RUN-YYYYMMDD-HHMMSS-XXXXXX/
@@ -35,6 +44,7 @@ The parent directory can be changed while creating a project. Existing project
 directories can be opened from anywhere on the local filesystem as long as they
 contain a valid `project.json`; they do not need to remain below `.blackwall`.
 Older projects without `scope.json` remain valid and load with empty scope data.
+Their `project.db` index is created and migrated when the project is next opened.
 
 Scope is opt-in at execution time. Direct targets work with or without a project,
 and do not need to be added to project scope first. When enforcement is enabled,
