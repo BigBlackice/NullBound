@@ -24,11 +24,12 @@ from blackwall_scope import (
     TargetSelection,
     evaluate_targets,
 )
-from recon_modules import FAVICON_DATA_URL, ModuleDefinition, load_default_catalog
+from recon_modules import FAVICON_DATA_URL, ModuleCatalog, ModuleDefinition, load_default_catalog
 from workspace_data import ASSETS, EVIDENCE, SCOPE_RULES
 
 
-# Shared resources and module data loaded once when the application starts.
+# Shared static resources. Module data is intentionally loaded per page below so
+# definitions.json changes become visible on the next browser refresh.
 STYLESHEET = Path(__file__).with_name("styles.css")
 ESCAPE_KEY_BEHAVIOR = """
 <script>
@@ -59,8 +60,6 @@ ESCAPE_KEY_BEHAVIOR = """
 })();
 </script>
 """
-MODULE_CATALOG = load_default_catalog()
-
 # Temporary finding records used to shape the UI before scanner persistence exists.
 FINDINGS = (
     {
@@ -150,12 +149,19 @@ class DashboardUI:
         project_store: ProjectStore | None = None,
         app_config: AppConfig | None = None,
         execution_manager: ExecutionManager | None = None,
+        module_catalog: ModuleCatalog | None = None,
     ) -> None:
         self.app_config = app_config or AppConfig()
         self.active_view = "launchpad"
-        self.module_catalog = MODULE_CATALOG
+        # NiceGUI creates this controller for each page load. Re-reading the
+        # catalog here makes a normal browser refresh the explicit reload point.
+        self.module_catalog = module_catalog or load_default_catalog()
         modules = self.module_catalog.modules
+        if not modules:
+            raise ValueError("module catalog must contain at least one module")
         self.selected_module_id = "04"
+        if all(module.id != self.selected_module_id for module in modules):
+            self.selected_module_id = modules[0].id
         self.selected_finding_id = FINDINGS[0]["id"]
         self.selected_asset_id = ASSETS[0]["id"]
         self.selected_evidence_id = EVIDENCE[0]["id"]
