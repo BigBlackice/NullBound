@@ -70,6 +70,31 @@ python .\main.py
 
 Open <http://127.0.0.1:8080> in a browser.
 
+### Install the Windows scanner tools locally
+
+The PowerShell bootstrapper checks the executable paths configured in
+`recon_modules/definitions.json`, the ignored `.blackwall-tools` directory, and
+the current `PATH`. Missing Amass, dnsx, httpx, gau, and tlsx binaries are fetched
+from their official GitHub releases. Nmap uses its official signed Windows
+installer because current portable ZIP builds are restricted to Nmap OEM users.
+
+```powershell
+# Report only; do not download or change PATH
+.\scripts\setup-tools.ps1 -CheckOnly
+
+# Install missing tools locally and add the local directories to the user PATH
+.\scripts\setup-tools.ps1
+```
+
+Nmap installation displays a UAC prompt. If Npcap is absent, its installer opens
+interactively because the free Npcap edition cannot legally/technically be
+installed silently; keep Npcap selected. If Npcap is already installed, the Nmap
+step can run silently. Use `-SkipNmap` to install only the portable tools, or
+`-NoPersistPath` to avoid changing the user `PATH`. The tool directory, download
+cache, and extracted licenses are excluded from Git. Gau has no additional runtime
+dependency. OpenSSL is optional for tlsx and is only needed for its OpenSSL scan
+mode or the extra fallback coverage from that mode.
+
 Blackwall binds to localhost by default. To make it reachable on a trusted LAN,
 opt in explicitly:
 
