@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -12,7 +11,6 @@ import unittest
 from blackwall_evidence import (
     AssetKind,
     AssetReference,
-    AmassOamSqliteParser,
     DATABASE_SCHEMA_VERSION,
     DnsxJsonlParser,
     EvidencePipeline,
@@ -22,10 +20,12 @@ from blackwall_evidence import (
     HttpxJsonlParser,
     JsonLinesEnvelopeParser,
     NmapXmlParser,
+    ParserRegistry,
     ParsedFinding,
     ParsedRecord,
     ProjectRunIngestor,
     ScopeDisposition,
+    SubfinderJsonlParser,
     TlsxJsonlParser,
     normalize_record,
 )
@@ -88,8 +88,8 @@ class EvidenceFrameworkTests(unittest.TestCase):
     def test_pipeline_deduplicates_assets_and_preserves_observation_provenance(self) -> None:
         records = (
             ParsedRecord(
-                AssetKind.DOMAIN, "Portal.Example.com.", "amass", run_id="RUN-001",
-                artifact_path="runs/RUN-001/artifacts/amass/name.txt",
+                AssetKind.DOMAIN, "Portal.Example.com.", "subfinder", run_id="RUN-001",
+                artifact_path="runs/RUN-001/artifacts/subfinder.jsonl",
             ),
             ParsedRecord(
                 AssetKind.DOMAIN, "portal.example.com", "dnsx", run_id="RUN-002",
@@ -124,8 +124,8 @@ class EvidenceFrameworkTests(unittest.TestCase):
 
     def test_denied_assets_are_retained_but_hidden_from_normal_queries(self) -> None:
         self.pipeline.ingest((ParsedRecord(
-            AssetKind.DOMAIN, "blocked.example.com", "amass",
-        ),), scope=self.scope, source="amass")
+            AssetKind.DOMAIN, "blocked.example.com", "subfinder",
+        ),), scope=self.scope, source="subfinder")
 
         self.assertEqual(self.store.list_assets(), ())
         review = self.store.list_scope_review_assets()
@@ -167,6 +167,10 @@ class EvidenceFrameworkTests(unittest.TestCase):
 
     def test_native_jsonl_parsers_cover_projectdiscovery_and_gau_artifacts(self) -> None:
         fixtures = {
+            "subfinder.jsonl": ({
+                "host": "api.example.com", "input": "example.com",
+                "sources": ["crtsh", "hackertarget"],
+            }, SubfinderJsonlParser(), AssetKind.DOMAIN, None),
             "dnsx.jsonl": ({
                 "host": "api.example.com", "a": ["192.0.2.10"],
                 "cname": ["edge.example.net"],
@@ -211,56 +215,26 @@ class EvidenceFrameworkTests(unittest.TestCase):
         service = next(record for record in records if record.kind is AssetKind.SERVICE)
         self.assertIn("uses_technology", {item.relation for item in service.related})
 
-    def test_amass_oam_parser_preserves_graph_edges_tags_and_confidence(self) -> None:
-        path = self.project_path / "asset.db"
-        connection = sqlite3.connect(path)
-        connection.executescript("""
-            CREATE TABLE entity_type_lu (id INTEGER PRIMARY KEY, name TEXT);
-            CREATE TABLE edge_type_lu (id INTEGER PRIMARY KEY, name TEXT);
-            CREATE TABLE tag_type_lu (id INTEGER PRIMARY KEY, name TEXT);
-            CREATE TABLE entity (
-                entity_id INTEGER PRIMARY KEY, created_at TEXT, updated_at TEXT,
-                etype_id INTEGER, natural_key TEXT, table_name TEXT, row_id INTEGER
-            );
-            CREATE TABLE fqdn (id INTEGER PRIMARY KEY, fqdn TEXT, attrs TEXT);
-            CREATE TABLE ipaddress (id INTEGER PRIMARY KEY, ip_address TEXT, attrs TEXT);
-            CREATE TABLE edge (
-                edge_id INTEGER PRIMARY KEY, etype_id INTEGER, label TEXT, content TEXT,
-                from_entity_id INTEGER, to_entity_id INTEGER
-            );
-            CREATE TABLE entity_tag (
-                tag_id INTEGER PRIMARY KEY, entity_id INTEGER, ttype_id INTEGER,
-                property_name TEXT, property_value TEXT, content TEXT
-            );
-            CREATE TABLE edge_tag (
-                tag_id INTEGER PRIMARY KEY, edge_id INTEGER, ttype_id INTEGER,
-                property_name TEXT, property_value TEXT, content TEXT
-            );
-            INSERT INTO entity_type_lu VALUES (1, 'fqdn'), (2, 'ipaddress');
-            INSERT INTO edge_type_lu VALUES (1, 'basicdnsrelation');
-            INSERT INTO tag_type_lu VALUES (1, 'sourceproperty');
-            INSERT INTO fqdn VALUES (1, 'api.example.com', '{"source":"amass"}');
-            INSERT INTO ipaddress VALUES (1, '192.0.2.30', '{}');
-            INSERT INTO entity VALUES (10, '2026-01-01', '2026-01-02', 1, 'api.example.com', 'fqdn', 1);
-            INSERT INTO entity VALUES (20, '2026-01-01', '2026-01-02', 2, '192.0.2.30', 'ipaddress', 1);
-            INSERT INTO entity_tag VALUES (1, 10, 1, 'source', 'DNS', '{}');
-            INSERT INTO edge VALUES (30, 1, 'resolves_to', '{"confidence":"high"}', 10, 20);
-            INSERT INTO edge_tag VALUES (1, 30, 1, 'source', 'DNS', '{}');
-        """)
-        connection.commit()
-        connection.close()
+    def test_subfinder_parser_preserves_provider_provenance(self) -> None:
+        path = self.project_path / "subfinder.jsonl"
+        path.write_text(json.dumps({
+            "host": "api.example.com", "input": "example.com",
+            "sources": ["crtsh", "hackertarget"],
+        }) + "\n", encoding="utf-8")
 
-        records = AmassOamSqliteParser().parse(path, run_id="RUN-AMASS")
-        domain = next(record for record in records if record.kind is AssetKind.DOMAIN)
+        records = SubfinderJsonlParser().parse(path, run_id="RUN-SUBFINDER")
 
-        self.assertEqual(domain.metadata["oam_tags"][0]["value"], "DNS")
-        self.assertEqual(domain.related[0].value, "192.0.2.30")
-        self.assertEqual(domain.related[0].confidence, "high")
-        self.assertEqual(domain.related[0].metadata["oam_tags"][0]["value"], "DNS")
-        self.pipeline.ingest(records, scope=self.scope, parser="amass", source="RUN-AMASS")
-        relationship = self.store.list_relationships()[0]
-        self.assertEqual(relationship.confidence, "high")
-        self.assertEqual(relationship.metadata["oam_edge_type"], "basicdnsrelation")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].kind, AssetKind.DOMAIN)
+        self.assertEqual(records[0].value, "api.example.com")
+        self.assertEqual(records[0].metadata["input"], "example.com")
+        self.assertEqual(
+            records[0].metadata["sources"], ("crtsh", "hackertarget")
+        )
+
+    def test_amass_parser_is_not_registered_in_the_active_pipeline(self) -> None:
+        with self.assertRaisesRegex(KeyError, "unknown evidence parser"):
+            ParserRegistry.native().get("amass")
 
     def test_project_run_ingestor_uses_native_parser_and_project_relative_provenance(self) -> None:
         run_path = self.project_path / "runs" / "RUN-INGEST"
@@ -285,6 +259,27 @@ class EvidenceFrameworkTests(unittest.TestCase):
             {item.artifact_path for item in evidence},
             {"runs/RUN-INGEST/artifacts/dnsx.jsonl"},
         )
+
+    def test_subfinder_run_indexes_the_submitted_domain_as_a_seed_without_results(self) -> None:
+        run_path = self.project_path / "runs" / "RUN-SEED"
+        (run_path / "artifacts").mkdir(parents=True)
+        manifest = SimpleNamespace(
+            id="RUN-SEED", project_id="P-0001", module_bin="subfinder",
+            run_path=run_path, artifacts=(), target_source="direct",
+            targets=({
+                "kind": "domain", "value": "Example.COM",
+                "normalized": "example.com",
+            },),
+        )
+
+        summary = ProjectRunIngestor()(manifest)
+        assets = EvidenceStore(self.project_path).list_assets()
+        evidence = EvidenceStore(self.project_path).list_evidence()
+
+        self.assertEqual(summary["assets_created"], 1)
+        self.assertEqual(assets[0].normalized_key, "example.com")
+        self.assertEqual(evidence[0].metadata["role"], "seed")
+        self.assertIsNone(evidence[0].artifact_path)
 
     def test_artifact_provenance_path_cannot_escape_project(self) -> None:
         with self.assertRaisesRegex(ValueError, "project-relative"):

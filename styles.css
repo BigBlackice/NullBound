@@ -20,9 +20,10 @@
 /* Global reset, viewport containment, typography, and CRT scanline overlay. */
 * { box-sizing: border-box; }
 html, body, #q-app {
+  height: 100%;
   min-height: 100%;
   max-width: 100%;
-  overflow-x: hidden;
+  overflow: hidden;
   background: var(--void);
 }
 body {
@@ -41,22 +42,32 @@ body::after {
   opacity: .42;
 }
 button { font-family: inherit; }
-.nicegui-content { max-width: 100%; padding: 0 !important; overflow-x: hidden; }
+.nicegui-content {
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  max-width: 100%;
+  padding: 0 !important;
+  overflow: hidden;
+}
 
 /* Main application grid: navigation rail, top bar, workspace, inspector, and console. */
 .app-shell {
   display: grid;
   grid-template-columns: 208px minmax(540px, 1fr) 310px;
-  grid-template-rows: 86px minmax(500px, 1fr) 158px;
-  min-height: 100vh;
+  grid-template-rows: 86px minmax(0, 1fr) 158px;
+  height: 100dvh;
+  min-height: 0;
   width: 100%;
+  overflow: hidden;
 }
 .app-shell.nyi-mode .workspace { grid-column: 2 / 4; }
 .app-shell.nyi-mode .inspector { display: none; }
+.app-shell.nyi-mode .console { grid-column: 2 / 4; }
 .app-shell.inspector-collapsed { grid-template-columns: 208px minmax(540px, 1fr) 36px; }
 .app-shell.evidence-mode { grid-template-columns: 208px minmax(500px, 1fr) 440px; }
 .app-shell.evidence-mode.inspector-collapsed { grid-template-columns: 208px minmax(540px, 1fr) 36px; }
-.app-shell.console-minimized { grid-template-rows: 86px minmax(500px, 1fr) 35px; }
+.app-shell.console-minimized { grid-template-rows: 86px minmax(0, 1fr) 35px; }
 .app-shell.console-fullscreen .console {
   position: fixed;
   inset: 0;
@@ -71,6 +82,8 @@ button { font-family: inherit; }
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   padding: 18px 11px 14px;
   border-right: 1px solid var(--line);
   background: var(--surface);
@@ -269,6 +282,7 @@ button { font-family: inherit; }
   grid-column: 2;
   grid-row: 2;
   min-width: 0;
+  min-height: 0;
   overflow-x: auto;
   overflow-y: scroll;
   padding: 15px 18px 22px;
@@ -400,8 +414,71 @@ button { font-family: inherit; }
   letter-spacing: .08em;
 }
 .record-filter-button.active { border-color: var(--interactive); }
+.scope-add-button { margin-right: auto; border-color: var(--structure); color: var(--structure) !important; }
 .evidence-filters { justify-content: flex-start; overflow-x: auto; scrollbar-width: none; }
 .evidence-filters::-webkit-scrollbar { display: none; }
+.asset-controls {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  margin-bottom: 9px;
+}
+.asset-search {
+  width: min(360px, 45%);
+  min-width: 190px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  color: var(--interactive);
+}
+.asset-search .q-icon { font-size: 16px; }
+.asset-search-input { min-width: 0; flex: 1; }
+.asset-search-input .q-field__control,
+.asset-search-input .q-field__native,
+.asset-search-input .q-field__input {
+  min-height: 30px !important;
+  height: 30px;
+  padding: 0 !important;
+  color: var(--interactive) !important;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: .07em;
+}
+.asset-scope-filter {
+  color: var(--interactive) !important;
+  font-size: 8px;
+  letter-spacing: .08em;
+}
+.asset-scope-filter .q-checkbox__inner { color: var(--interactive) !important; }
+.asset-scope-filter .q-checkbox__bg { border-radius: 0 !important; }
+.asset-scope-filter .q-checkbox__svg { color: var(--void) !important; }
+.asset-selection-count { margin-left: auto; color: var(--faint); font-size: 8px; letter-spacing: .1em; }
+.asset-action-button {
+  min-height: 30px !important;
+  border: 1px solid var(--interactive);
+  border-radius: 0 !important;
+  color: var(--interactive) !important;
+  font-family: var(--mono) !important;
+  font-size: 8px !important;
+  letter-spacing: .08em;
+}
+.asset-action-menu,
+.asset-context-menu {
+  border: 1px solid var(--structure) !important;
+  border-radius: 0 !important;
+  color: var(--interactive) !important;
+  background: var(--surface) !important;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+.asset-results { min-width: 0; }
+.asset-select-cell { display: grid; place-items: center; padding: 0 !important; }
+.asset-select-cell .q-checkbox__inner { color: var(--interactive) !important; }
+.asset-select-cell .q-checkbox__bg { border-radius: 0 !important; }
 .record-table { width: 100%; min-width: 0; border-top: 1px solid var(--line); }
 .record-row {
   --record-tone: var(--interactive);
@@ -437,7 +514,7 @@ button { font-family: inherit; }
 .record-address, .record-object, .record-project, .record-ownership, .record-scope_anchor { color: var(--interactive); }
 .record-source, .record-integrity, .record-duration, .record-started,
 .record-updated, .record-captured { color: var(--faint); }
-.assets-table .record-row { grid-template-columns: 72px minmax(170px, 2fr) minmax(120px, 1fr) 68px 78px 72px; }
+.assets-table .record-row { grid-template-columns: 32px 72px minmax(170px, 2fr) minmax(120px, 1fr) 68px 78px 72px; }
 .evidence-table .record-row { grid-template-columns: 92px minmax(160px, 2fr) minmax(120px, 1fr) 62px 68px 74px; }
 .scope-table .record-row { grid-template-columns: 108px minmax(170px, 2fr) 65px 92px 92px 78px; }
 .runs-table .record-row { grid-template-columns: 84px 86px minmax(170px, 2fr) 72px 76px 72px; }
@@ -449,12 +526,19 @@ button { font-family: inherit; }
 /* Selected-module configuration inspector. */
 .inspector {
   grid-column: 3;
-  grid-row: 2;
+  grid-row: 2 / 4;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: var(--interactive) var(--line);
+  scrollbar-width: thin;
   border-left: 1px solid var(--line);
   background: var(--surface);
 }
+.inspector::-webkit-scrollbar { width: 6px; }
+.inspector::-webkit-scrollbar-track { background: var(--line); }
+.inspector::-webkit-scrollbar-thumb { border-radius: 0; background: var(--interactive); }
 .inspector-header { position: relative; min-height: 91px; padding: 15px 16px 13px; border-bottom: 1px solid var(--line); }
 .inspector-header-copy { padding-left: 28px; }
 .inspector-toggle {
@@ -653,6 +737,11 @@ button { font-family: inherit; }
 .project-modal > .settings-note,
 .project-modal > .settings-field,
 .project-modal > .settings-actions { margin-right: 22px; margin-left: 22px; }
+.scope-dialog-copy { margin: 16px 22px 12px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.scope-modal > .settings-field,
+.scope-dialog-grid { width: calc(100% - 44px); }
+.scope-dialog-grid { margin-right: 22px; margin-left: 22px; }
+.scope-review-field { margin-top: -4px; }
 /* Host-filesystem browser used for portable project directory selection. */
 .directory-picker-dialog .q-dialog__backdrop { background: rgba(0, 0, 0, .78); }
 .directory-picker-dialog .q-dialog__inner { padding: 24px; }
@@ -844,7 +933,7 @@ button { font-family: inherit; }
 
 /* Bottom run-output console, including minimized and fullscreen states. */
 .console {
-  grid-column: 2 / 4;
+  grid-column: 2;
   grid-row: 3;
   min-width: 0;
   min-height: 0;
@@ -941,9 +1030,9 @@ button { font-family: inherit; }
   .app-shell.evidence-mode.inspector-collapsed {
     display: grid;
     grid-template-columns: 64px minmax(0, 1fr);
-    grid-template-rows: 86px minmax(420px, 1fr) 158px;
+    grid-template-rows: 86px minmax(0, 1fr) 158px;
   }
-  .app-shell.console-minimized { grid-template-rows: 86px minmax(420px, 1fr) 35px; }
+  .app-shell.console-minimized { grid-template-rows: 86px minmax(0, 1fr) 35px; }
   .brand-copy, .nav-item > :not(.q-icon), .nav-count, .rail-label { display: none !important; }
   .brand { justify-content: center; padding-left: 0; padding-right: 0; }
   .rail, .nav-item { overflow: hidden; }
@@ -962,6 +1051,7 @@ button { font-family: inherit; }
   }
   .app-shell.nyi-mode .workspace { display: block; grid-column: 2; padding-right: 18px; }
   .app-shell.nyi-mode .inspector { display: none; }
+  .app-shell.nyi-mode .console { grid-column: 2; }
   .project-stack { width: 100%; min-width: 0; }
   .project-tabs {
     width: 100%;
@@ -987,7 +1077,7 @@ button { font-family: inherit; }
 @media (max-width: 760px) {
   .finding-row { grid-template-columns: 72px minmax(0, 2fr) minmax(100px, 1fr) 82px; }
   .finding-source, .finding-seen { display: none; }
-  .assets-table .record-row { grid-template-columns: 64px minmax(0, 2fr) minmax(100px, 1fr) 76px; }
+  .assets-table .record-row { grid-template-columns: 30px 64px minmax(0, 2fr) minmax(100px, 1fr) 76px; }
   .assets-table .record-ports, .assets-table .record-source { display: none; }
   .evidence-table .record-row { grid-template-columns: 76px minmax(0, 2fr) minmax(100px, 1fr) 68px; }
   .evidence-table .record-relations, .evidence-table .record-updated { display: none; }
@@ -1004,13 +1094,17 @@ button { font-family: inherit; }
   .app-shell.evidence-mode,
   .app-shell.evidence-mode.inspector-collapsed { grid-template-columns: 58px minmax(0, 1fr); }
   .module-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .asset-controls { flex-wrap: wrap; }
+  .asset-search { width: 100%; }
+  .asset-selection-count { margin-left: 0; }
+  .asset-action-button { margin-left: auto; }
   .finding-row { grid-template-columns: 64px minmax(0, 1fr) 76px; }
   .finding-asset { display: none; }
   .finding-summary { justify-content: flex-start; overflow: hidden; white-space: nowrap; }
   .record-filters { justify-content: flex-start; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
   .run-project-filter { margin-left: 0; }
   .evidence-filters { overflow-x: auto; }
-  .assets-table .record-row { grid-template-columns: 58px minmax(0, 1fr) 72px; }
+  .assets-table .record-row { grid-template-columns: 30px 58px minmax(0, 1fr) 72px; }
   .assets-table .record-address { display: none; }
   .evidence-table .record-row { grid-template-columns: 68px minmax(0, 1fr) 64px; }
   .evidence-table .record-scope_anchor { display: none; }
@@ -1035,7 +1129,8 @@ button { font-family: inherit; }
 @media (max-width: 400px) {
   .finding-row { grid-template-columns: 58px minmax(0, 1fr); }
   .finding-confidence { display: none; }
-  .assets-table .record-row, .evidence-table .record-row { grid-template-columns: 56px minmax(0, 1fr); }
+  .assets-table .record-row { grid-template-columns: 30px 56px minmax(0, 1fr); }
+  .evidence-table .record-row { grid-template-columns: 56px minmax(0, 1fr); }
   .assets-table .record-scope, .evidence-table .record-artifact_count { display: none; }
   .runs-table .record-row { grid-template-columns: 70px minmax(0, 1fr); }
   .runs-table .record-target { display: none; }

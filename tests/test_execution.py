@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import socket
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from blackwall_evidence import EvidenceStore, ProjectRunIngestor
 from blackwall_execution import (
     AdapterRegistry,
     CommandSpec,
+    CompanionProcessSpec,
     DeclarativeAdapter,
     ExecutionError,
     ExecutionManager,
@@ -87,7 +89,7 @@ class AdapterTests(unittest.TestCase):
             "04": "https://example.com", "05": "example.com", "06": "example.com",
         }
         artifact_flags = {
-            "01": "-dir", "02": "-o", "03": "-oX",
+            "01": "-o", "02": "-o", "03": "-oX",
             "04": "-o", "05": "--o", "06": "-o",
         }
         registry = AdapterRegistry()
@@ -114,7 +116,7 @@ class AdapterTests(unittest.TestCase):
             dns_targets = root / "dnsx" / "inputs" / "targets.txt"
             self.assertEqual(dns_targets.read_text(encoding="utf-8"), "api.example.com\n")
 
-    def test_amass_uses_current_v5_flags_and_preserves_the_oam_database(self) -> None:
+    def test_subfinder_writes_source_attributed_jsonl_without_private_state(self) -> None:
         module = load_default_catalog().get("01")
         request = RunRequest(
             module=module,
@@ -123,15 +125,25 @@ class AdapterTests(unittest.TestCase):
                 selection=TargetSelection.direct((Target.parse("example.com"),))
             ),
         )
-        run_path = Path("portable-run")
+        with TemporaryDirectory() as directory:
+            run_path = Path(directory)
+            command = AdapterRegistry().get("subfinder").build_command(
+                request, run_path, "subfinder"
+            )
 
-        command = AdapterRegistry().get("amass").build_command(request, run_path, "amass")
-
-        self.assertNotIn("-json", command.arguments)
-        self.assertNotIn("-passive", command.arguments)
-        self.assertNotIn("-brute", command.arguments)
-        self.assertEqual(command.arguments[-2:], ("-dir", str(run_path / "artifacts" / "amass")))
-        self.assertEqual(command.output_format, "oam-sqlite")
+            self.assertEqual(command.arguments[:2], (
+                "-dL", str(run_path / "inputs" / "targets.txt")
+            ))
+            self.assertIn("-json", command.arguments)
+            self.assertIn("-collect-sources", command.arguments)
+            self.assertIn("-silent", command.arguments)
+            self.assertEqual(
+                command.arguments[-2:],
+                ("-o", str(run_path / "artifacts" / "subfinder.jsonl")),
+            )
+            self.assertEqual(command.output_format, "jsonl")
+            self.assertIsNone(command.companion)
+            self.assertEqual(command.environment, ())
 
     def test_catalog_targets_are_placeholders_not_submitted_values(self) -> None:
         for module in load_default_catalog():
@@ -213,6 +225,18 @@ class AdapterTests(unittest.TestCase):
         ])
         self.assertEqual(version, "v1.12.0")
 
+    def test_amass_is_not_registered_as_an_active_adapter(self) -> None:
+        with self.assertRaisesRegex(ExecutionError, "unknown module adapter"):
+            AdapterRegistry().get("amass")
+
+    def test_windows_setup_bootstraps_subfinder_and_not_amass(self) -> None:
+        setup_script = (
+            Path(__file__).parents[1] / "scripts" / "setup-tools.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("projectdiscovery/subfinder", setup_script)
+        self.assertNotIn("owasp-amass/amass", setup_script)
+
 
 class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -253,6 +277,32 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(finished.artifacts[0].sha256), 64)
         self.assertTrue(any(event.text == "hello stdout" for event in events))
         self.assertEqual(self.store.load(finished.run_path).state, RunState.COMPLETED)
+
+    async def test_long_run_emits_throttled_adapter_progress(self) -> None:
+        class ProgressAdapter(PythonTestAdapter):
+            key = "progress-test"
+
+            def progress_summary(self, run_path):
+                return "42 records collected"
+
+        original = request_for("import time; time.sleep(0.2)")
+        module = ModuleDefinition.from_mapping({
+            **original.module.to_mapping(),
+            "adapter": "progress-test",
+        })
+        manager = ExecutionManager(
+            store=self.store,
+            adapters=AdapterRegistry((ProgressAdapter(),)),
+            progress_interval_seconds=0.05,
+        )
+
+        run = await manager.start(RunRequest(module, module.default_profile, original.context))
+        finished = await manager.wait(run.id)
+        console = (finished.run_path / "console.log").read_text(encoding="utf-8")
+
+        self.assertEqual(finished.state, RunState.COMPLETED)
+        self.assertIn("still running", console)
+        self.assertIn("42 records collected", console)
 
     async def test_active_process_can_be_cancelled(self) -> None:
         run = await self.manager.start(request_for("import time; print('started', flush=True); time.sleep(30)"))
@@ -458,6 +508,102 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(finished.state, RunState.FAILED)
         self.assertIn("timed out after 1 seconds", finished.error)
+
+    async def test_companion_failure_is_streamed_and_reported_without_waiting_full_timeout(self) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            unused_port = probe.getsockname()[1]
+
+        class FailedCompanionAdapter(PythonTestAdapter):
+            key = "failed-companion"
+
+            def build_command(self, request, run_path, executable):
+                return CommandSpec(
+                    executable,
+                    ("-c", "print('main should not run')"),
+                    companion=CompanionProcessSpec(
+                        executable,
+                        (
+                            "-c",
+                            "import os, sys; print(os.environ['BLACKWALL_COMPANION_TEST'], file=sys.stderr, flush=True); sys.exit(7)",
+                        ),
+                        "127.0.0.1",
+                        unused_port,
+                        ready_http_path=None,
+                        label="Test engine",
+                        startup_timeout_seconds=5,
+                    ),
+                    environment=(("BLACKWALL_COMPANION_TEST", "isolated engine startup failed"),),
+                )
+
+        original = request_for("print('unused')")
+        module = ModuleDefinition.from_mapping({
+            **original.module.to_mapping(),
+            "adapter": "failed-companion",
+        })
+        request = RunRequest(module, module.default_profile, original.context)
+        manager = ExecutionManager(
+            store=self.store,
+            adapters=AdapterRegistry((FailedCompanionAdapter(),)),
+        )
+
+        run = await manager.start(request)
+        finished = await asyncio.wait_for(manager.wait(run.id), timeout=5)
+
+        self.assertEqual(finished.state, RunState.FAILED)
+        self.assertIn("Test engine exited before becoming ready", finished.error)
+        self.assertIn("engine startup failed", finished.error)
+        self.assertIn(
+            "isolated engine startup failed",
+            (finished.run_path / "console.log").read_text(encoding="utf-8"),
+        )
+
+    async def test_existing_companion_endpoint_is_not_reused(self) -> None:
+        async def healthy_endpoint(reader, writer):
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(healthy_endpoint, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+
+        class ExistingCompanionAdapter(PythonTestAdapter):
+            key = "existing-companion"
+
+            def build_command(self, request, run_path, executable):
+                return CommandSpec(
+                    executable,
+                    ("-c", "print('main should not run')"),
+                    companion=CompanionProcessSpec(
+                        executable,
+                        ("-c", "import time; time.sleep(10)"),
+                        "127.0.0.1",
+                        port,
+                        ready_http_path="/api/v1/health",
+                        label="Test engine",
+                    ),
+                )
+
+        original = request_for("print('unused')")
+        module = ModuleDefinition.from_mapping({
+            **original.module.to_mapping(),
+            "adapter": "existing-companion",
+        })
+        manager = ExecutionManager(
+            store=self.store,
+            adapters=AdapterRegistry((ExistingCompanionAdapter(),)),
+        )
+        try:
+            run = await manager.start(RunRequest(module, module.default_profile, original.context))
+            finished = await manager.wait(run.id)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        self.assertEqual(finished.state, RunState.FAILED)
+        self.assertIn("already running outside this Blackwall run", finished.error)
+        self.assertFalse((finished.run_path / "stdout.log").exists())
 
 
 if __name__ == "__main__":

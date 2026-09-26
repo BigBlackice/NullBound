@@ -1,0 +1,17 @@
+"""INERT BACKUP: Amass-specific ProjectRunIngestor artifact selection."""
+
+# This was the Amass branch inside ProjectRunIngestor._artifact_for:
+#
+# if module_key == "amass":
+#     if candidate.suffix.casefold() in {".db", ".sqlite", ".sqlite3"}:
+#         candidates.append(candidate)
+# elif candidate.name.casefold() == self._ARTIFACT_NAMES.get(module_key, ""):
+#     candidates.append(candidate)
+#
+# if module_key == "amass":
+#     candidates.sort(
+#         key=lambda path: (
+#             path.name.casefold() != "asset.db",
+#             path.as_posix(),
+#         )
+#     )

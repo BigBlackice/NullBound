@@ -6,31 +6,35 @@
       "eyebrow": "discovery",
       "icon": "travel_explore",
       "description": "Subdomain Intel",
-      "bin": "amass",
-      "path": "amass",
-      "adapter": "amass",
+      "bin": "subfinder",
+      "path": "subfinder",
+      "adapter": "subfinder",
       "target_summary": "ADD TARGET",
       "target_placeholder": "domain",
       "state": "READY",
       "profiles": [
         {
-          "name": "Passive discovery",
+          "name": "Standard passive",
           "options": [
             {"label": "Mode", "value": "PASSIVE"},
-            {"label": "Timeout", "value": "30m"}
+            {"label": "Sources", "value": "DEFAULT"}
           ],
-          "arguments": ["enum", "-d", "{target}", "-timeout", "30"],
-          "output_format": "oam-sqlite"
+          "arguments": ["-dL", "{target_file}"],
+          "output_format": "jsonl"
         },
         {
-          "name": "Active discovery",
-          "arguments": ["enum", "-d", "{target}", "-active", "-timeout", "30"],
-          "output_format": "oam-sqlite"
+          "name": "Broad passive",
+          "options": [
+            {"label": "Sources", "value": "ALL"},
+            {"label": "Runtime", "value": "SLOWER"}
+          ],
+          "arguments": ["-dL", "{target_file}", "-all"],
+          "output_format": "jsonl"
         },
         {
-          "name": "Scope-rigid discovery",
-          "arguments": ["enum", "-d", "{target}", "-rigid", "-timeout", "30"],
-          "output_format": "oam-sqlite"
+          "name": "Recursive passive",
+          "arguments": ["-dL", "{target_file}", "-recursive"],
+          "output_format": "jsonl"
         }
       ]
     },

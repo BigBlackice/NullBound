@@ -9,6 +9,12 @@ from .models import (
     ProjectValidationError,
 )
 from .store import ProjectStore, default_projects_root
+from .session import (
+    WORKSPACE_SESSION_KIND,
+    WORKSPACE_SESSION_NAME,
+    WORKSPACE_SESSION_SCHEMA_VERSION,
+    WorkspaceSessionStore,
+)
 from .workspace import ProjectWorkspace
 
 
@@ -21,5 +27,9 @@ __all__ = [
     "ProjectStore",
     "ProjectValidationError",
     "ProjectWorkspace",
+    "WORKSPACE_SESSION_KIND",
+    "WORKSPACE_SESSION_NAME",
+    "WORKSPACE_SESSION_SCHEMA_VERSION",
+    "WorkspaceSessionStore",
     "default_projects_root",
 ]

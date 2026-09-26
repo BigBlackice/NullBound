@@ -25,7 +25,6 @@ from .models import (
 )
 from .normalization import normalize_record, normalize_value
 from .parsers import (
-    AmassOamSqliteParser,
     DnsxJsonlParser,
     EvidenceParser,
     GauJsonlParser,
@@ -33,6 +32,7 @@ from .parsers import (
     JsonLinesEnvelopeParser,
     NmapXmlParser,
     ParserRegistry,
+    SubfinderJsonlParser,
     TlsxJsonlParser,
 )
 from .pipeline import CorrelationCandidate, CorrelationRule, EvidencePipeline, UrlHostCorrelation
@@ -40,12 +40,12 @@ from .store import EvidenceStore, stable_id
 from .integration import ProjectRunIngestor
 
 __all__ = [
-    "AmassOamSqliteParser", "AssetKind", "AssetRecord", "AssetReference", "CorrelationCandidate",
+    "AssetKind", "AssetRecord", "AssetReference", "CorrelationCandidate",
     "CorrelationRule", "DATABASE_NAME", "DATABASE_SCHEMA_VERSION", "DatabaseVersionError",
     "DnsxJsonlParser", "EvidenceKind", "EvidenceParser", "EvidencePipeline", "EvidenceRecord", "EvidenceStore",
     "FindingRecord", "FindingSeverity", "FindingState", "IngestionResult",
     "GauJsonlParser", "HttpxJsonlParser", "JsonLinesEnvelopeParser", "NORMALIZATION_VERSION",
     "NmapXmlParser", "NormalizedRecord", "ParsedFinding", "ParsedRecord", "ParserRegistry",
-    "ProjectDatabase", "ProjectRunIngestor", "RelationshipRecord", "ScopeDisposition",
+    "ProjectDatabase", "ProjectRunIngestor", "RelationshipRecord", "ScopeDisposition", "SubfinderJsonlParser",
     "TlsxJsonlParser", "UrlHostCorrelation", "normalize_record", "normalize_value", "stable_id",
 ]

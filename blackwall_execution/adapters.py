@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 from tempfile import TemporaryDirectory
 
 from .models import CommandSpec, ExecutionError, RunRequest
@@ -77,9 +78,13 @@ class ToolAdapter(ABC):
     async def version(self, executable: str) -> str | None:
         process: asyncio.subprocess.Process | None = None
         try:
+            kwargs: dict[str, object] = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             process = await asyncio.create_subprocess_exec(
                 executable, *self.version_arguments(),
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                **kwargs,
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
         except TimeoutError:
@@ -99,6 +104,10 @@ class ToolAdapter(ABC):
 
     def parse_version(self, lines: list[str]) -> str | None:
         return lines[0][:240] if lines else None
+
+    def progress_summary(self, run_path: Path) -> str | None:
+        """Return a concise live summary for long-running tools, when available."""
+        return None
 
     @abstractmethod
     def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
@@ -136,7 +145,14 @@ class DeclarativeAdapter(ToolAdapter):
             arguments = tuple(
                 argument.replace(root_text, "<run>") for argument in command.arguments
             )
-            return CommandSpec(command.executable, arguments, command.output_format)
+            environment = tuple(
+                (key, value.replace(root_text, "<run>"))
+                for key, value in command.environment
+            )
+            return CommandSpec(
+                command.executable, arguments, command.output_format,
+                environment=environment,
+            )
 
     @staticmethod
     def _option_arguments(request: RunRequest) -> tuple[str, ...]:
@@ -208,18 +224,22 @@ class ArtifactAdapter(DeclarativeAdapter):
         return CommandSpec(command.executable, (*command.arguments, *arguments), self.artifact_format)
 
 
-class AmassAdapter(DeclarativeAdapter):
-    """Keep Amass' native OAM database as the lossless run artifact."""
+class SubfinderAdapter(ProjectDiscoveryAdapter):
+    """Emit compact source-attributed JSONL without maintaining a private database."""
 
-    key = "amass"
+    key = "subfinder"
 
     def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
         command = super().build_command(request, run_path, executable)
-        output_directory = run_path / "artifacts" / "amass"
+        artifact = run_path / "artifacts" / "subfinder.jsonl"
         return CommandSpec(
             command.executable,
-            (*command.arguments, "-nocolor", "-dir", str(output_directory)),
-            "oam-sqlite",
+            (
+                *command.arguments,
+                "-json", "-collect-sources", "-silent", "-no-color",
+                "-disable-update-check", "-o", str(artifact),
+            ),
+            "jsonl",
         )
 
 
@@ -266,7 +286,7 @@ class AdapterRegistry:
 
     def __init__(self, adapters: tuple[ToolAdapter, ...] | None = None) -> None:
         installed = adapters or (
-            DeclarativeAdapter(), AmassAdapter(), DnsxAdapter(), NmapAdapter(),
+            DeclarativeAdapter(), SubfinderAdapter(), DnsxAdapter(), NmapAdapter(),
             HttpxAdapter(), GauAdapter(), TlsxAdapter(),
         )
         self._adapters = {adapter.key: adapter for adapter in installed}

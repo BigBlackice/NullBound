@@ -26,7 +26,7 @@ $DownloadsPath = Join-Path $ToolsRoot 'downloads'
 $NmapPath = Join-Path $ToolsRoot 'nmap'
 
 $GitHubTools = [ordered]@{
-    amass = @{ Repository = 'owasp-amass/amass'; VersionArguments = @('-version'); VersionPattern = '(?i)amass' }
+    subfinder = @{ Repository = 'projectdiscovery/subfinder'; VersionArguments = @('-version'); VersionPattern = '(?i)subfinder' }
     dnsx  = @{ Repository = 'projectdiscovery/dnsx'; VersionArguments = @('-version'); VersionPattern = '(?i)dnsx' }
     httpx = @{ Repository = 'projectdiscovery/httpx'; VersionArguments = @('-version'); VersionPattern = '(?i)httpx' }
     gau   = @{ Repository = 'lc/gau'; VersionArguments = @('--version'); VersionPattern = '(?i)(gau|v\d+\.)' }
@@ -34,7 +34,7 @@ $GitHubTools = [ordered]@{
 }
 
 $VersionChecks = @{
-    amass = @{ Arguments = @('-version'); Pattern = '(?i)amass' }
+    subfinder = @{ Arguments = @('-version'); Pattern = '(?i)subfinder' }
     dnsx  = @{ Arguments = @('-version'); Pattern = '(?i)dnsx' }
     nmap  = @{ Arguments = @('--version'); Pattern = '(?i)nmap version' }
     httpx = @{ Arguments = @('-version'); Pattern = '(?i)httpx' }

@@ -8,7 +8,15 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from .models import ScopeDocument, ScopeRule, ScopeValidationError, Target, TargetSet
+from .models import (
+    OwnershipConfidence,
+    ScopeDocument,
+    ScopeRule,
+    ScopeStatus,
+    ScopeValidationError,
+    Target,
+    TargetSet,
+)
 
 
 SCOPE_DOCUMENT_NAME = "scope.json"
@@ -84,6 +92,41 @@ class ScopeStore:
         self.save(replace(document, rules=(*document.rules, rule)))
         return rule
 
+    def add_rules(
+        self,
+        targets: tuple[Target, ...],
+        *,
+        scope_status: ScopeStatus = ScopeStatus.ALLOWED,
+        ownership_confidence: OwnershipConfidence = OwnershipConfidence.UNKNOWN,
+        review_required: bool = False,
+        source: str = "manual",
+        notes: str = "",
+    ) -> tuple[ScopeRule, ...]:
+        """Atomically add unique target rules, preserving any existing decision."""
+        document = self.load()
+        identities = {(rule.target.kind, rule.target.normalized) for rule in document.rules}
+        rules = list(document.rules)
+        created: list[ScopeRule] = []
+        for target in targets:
+            identity = (target.kind, target.normalized)
+            if identity in identities:
+                continue
+            rule = ScopeRule(
+                id=self._next_id((item.id for item in rules), "SC"),
+                target=target,
+                scope_status=scope_status,
+                ownership_confidence=ownership_confidence,
+                review_required=review_required,
+                source=source,
+                notes=notes,
+            )
+            rules.append(rule)
+            created.append(rule)
+            identities.add(identity)
+        if created:
+            self.save(replace(document, rules=tuple(rules)))
+        return tuple(created)
+
     def put_rule(self, rule: ScopeRule) -> ScopeRule:
         document = self.load()
         items = tuple(item for item in document.rules if item.id != rule.id)
@@ -101,4 +144,3 @@ class ScopeStore:
     def _next_id(identifiers: object, prefix: str) -> str:
         numbers = [int(value.split("-", 1)[1]) for value in identifiers]
         return f"{prefix}-{max(numbers, default=0) + 1:04d}"
-

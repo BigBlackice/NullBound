@@ -1,0 +1,14 @@
+# INERT BACKUP: former scripts/setup-tools.ps1 Amass entries.
+
+# $GitHubTools entry:
+amass = @{
+    Repository = 'owasp-amass/amass'
+    VersionArguments = @('-version')
+    VersionPattern = '(?i)amass'
+}
+
+# $VersionChecks entry:
+amass = @{
+    Arguments = @('-version')
+    Pattern = '(?i)amass'
+}

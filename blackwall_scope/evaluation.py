@@ -35,7 +35,24 @@ def rule_matches(rule: ScopeRule, target: Target) -> bool:
     """Return whether a rule covers a target across compatible target types."""
     rule_target = rule.target
     if rule_target.kind is TargetKind.URL:
-        return target.kind is TargetKind.URL and rule_target.normalized == target.normalized
+        if target.kind is not TargetKind.URL:
+            return False
+        rule_url = urlsplit(rule_target.normalized)
+        target_url = urlsplit(target.normalized)
+        if rule_url.scheme != target_url.scheme or rule_url.port != target_url.port:
+            return False
+        rule_host = rule_url.hostname or ""
+        target_host = target_url.hostname or ""
+        if rule_host.startswith("*."):
+            host_matches = target_host.endswith(f".{rule_host[2:]}")
+        else:
+            host_matches = target_host == rule_host
+        if not host_matches:
+            return False
+        if rule_url.path.endswith("*"):
+            query_matches = not rule_url.query or rule_url.query == target_url.query
+            return query_matches and target_url.path.startswith(rule_url.path[:-1])
+        return rule_url.path == target_url.path and rule_url.query == target_url.query
 
     if rule_target.kind is TargetKind.DOMAIN:
         host = _target_host(target)
@@ -105,4 +122,3 @@ def evaluate_targets(
     enforce: bool,
 ) -> tuple[ScopeEvaluation, ...]:
     return tuple(evaluate_target(target, rules, enforce=enforce) for target in targets)
-

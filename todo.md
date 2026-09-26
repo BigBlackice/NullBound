@@ -84,6 +84,9 @@ The persistent shell should include:
 - [x] Allow open project-workspace tabs to be closed without unloading the shell.
 - [x] Make the configuration inspector collapsible and prioritize it over module
   selection at narrow viewport widths.
+- [x] Constrain the application shell to the viewport so an overflowing contextual
+  right rail scrolls independently to the bottom without stretching the navigation
+  rail, workspace, or run console.
 - [x] Preserve the labeled navigation rail until the icon-only narrow breakpoint.
 - [x] Move modules and scan profiles into a validated, data-driven catalog with
   automatic numeric ID allocation and a default-icon fallback.
@@ -109,6 +112,8 @@ The persistent shell should include:
   to `~/.blackwall/projects`, but allow the operator to choose any parent path.
 - [x] Add a local directory browser, starting in `~/.blackwall`, for opening any
   folder containing a valid `project.json` as a workspace tab.
+- [x] Persist the open project-tab set in local application state and restore it on
+  restart; tabs explicitly closed with their close control remain closed.
 - [x] Model direct-target execution when no project is open. Tool process launch is
   implemented separately in v0.1c.
 - [x] Allow a project execution context to use direct targets without first adding
@@ -145,13 +150,16 @@ The persistent shell should include:
   check, version capture, direct/project targets, JSONL output, cancellation, and a
   completed run manifest. Keep it distinct from the Python HTTPX package.
 - [x] Add initial runnable profiles and raw artifacts for every Launchpad module:
-  Amass, dnsx, Nmap, httpx, gau, and tlsx. Normalization into project evidence
+  Subfinder, dnsx, Nmap, httpx, gau, and tlsx. Normalization into project evidence
   remains a separate v0.2 concern.
 - [x] Preview the exact executable and arguments before launch.
 - [x] Launch processes without interpolating user input into a shell string.
 - [x] Stream stdout and stderr to the run console and persistent log files.
 - [x] Add a deliberate starting/loading state to the run console for the period
   between launch and the first process output.
+- [x] Prototype managed Amass v5 execution and OAM indexing, then place the
+  integration on indefinite hold. Preserve the disconnected implementation under
+  `recon_modules/amass_hold` without registering it in Blackwall.
 - [x] Support queueing, concurrency limits, timeouts, and process-group cancellation.
 - [x] Preserve run state if the browser disconnects or refreshes.
 - [x] Record executable path, version, arguments, inputs, timestamps, duration,
@@ -188,14 +196,23 @@ The persistent shell should include:
   relationships; start with explicit parser links and conservative URL-to-host
   correlation without guessing registrable-domain boundaries.
 - [x] Automatically parse project-attached terminal runs into the evidence index.
-  Native parsers cover dnsx/httpx/gau/tlsx JSONL, Nmap XML, and Amass OAM SQLite;
+  Native parsers cover Subfinder/dnsx/httpx/gau/tlsx JSONL and Nmap XML;
   no-project runs remain session-only and never create a project database.
-- [x] Import the native Amass OAM `asset.db` run artifact without flattening its
-  asset relationships, source provenance, or confidence metadata.
-- Amass v5 JSON output is intentionally unsupported upstream. Keep `asset.db` as
-  the lossless source artifact; supported OAM entities and graph edges are indexed
-  read-only, while the complete native database remains available for future OAM
-  type coverage and rebuilds.
+- [x] Drive Assets from normalized project records with a live search field, an
+  independent in-scope-only filter, multi-row selection/actions, and per-row
+  context actions for adding supported assets to scope.
+- [x] Keep Scope limited to explicit portable scope rules and allow operators to
+  add domains, wildcard domains, IPs, CIDRs, exact URLs, and conservative wildcard
+  URL patterns manually.
+- [x] Refresh an open Assets view when any concurrent project run finishes evidence
+  indexing, without requiring navigation or a browser reload.
+- [x] Replace active Amass support with Subfinder JSONL discovery, retain provider
+  provenance, and index submitted root domains as seed assets even when no
+  subdomains are returned.
+- Amass is on indefinite hold. Its engine adapter, OAM SQLite parser, and catalog
+  profiles are disconnected backups under `recon_modules/amass_hold`; they must
+  not be imported or installed by Blackwall. The standalone Windows Mullvad DNS
+  helper remains under `scripts/` for manual testing of DNS discovery tools only.
 - [x] Preserve every raw value alongside its normalized comparison key.
 - [x] Treat URL canonicalization conservatively and record the normalization
   version and transformations.
@@ -205,8 +222,6 @@ The persistent shell should include:
 - [ ] Add finding lifecycle states: `candidate`, `validated`, `false_positive`, and
   `accepted_risk`.
 - [ ] Add search, filters, tags, notes, JSON/CSV export, and project backup.
-- [ ] Prove interoperability by using normalized output from one adapter as input
-  to a second adapter.
 
 The initial database framework includes schema migrations, SQLite write locking,
 transaction rollback, and explicit recovery of interrupted ingestion batches. A
@@ -254,6 +269,8 @@ physically immutable.
 
 ## v0.3 — Workflows and integrations
 
+- [ ] Prove cross-tool interoperability by using normalized output from one adapter
+  as typed input to a second adapter.
 - [ ] Add saved multi-tool workflows with explicit inputs and outputs.
 - [ ] Store relationships between assets, findings, artifacts, and runs as part of
   the Evidence model.
@@ -287,12 +304,12 @@ stateful systems, and internal libraries for reusable behavior.
 
 #### Launchpad adapters
 
-- [ ] Add `subfinder` for passive subdomain discovery and normalize discovered
+- [x] Add `subfinder` for passive subdomain discovery and normalize discovered
   names into candidate assets with source provenance.
 - [ ] Add ProjectDiscovery `httpx` for reachability checks, HTTP metadata, and
-  validation of output from `subfinder`, Amass, and other discovery adapters.
-- [ ] Add Amass for passive-first asset discovery; expose active enumeration only
-  through an explicit profile.
+  validation of output from `subfinder` and other discovery adapters.
+- [x] Place Amass on indefinite hold and keep its disconnected implementation in
+  `recon_modules/amass_hold` for possible future reassessment.
 - [ ] Add Katana for scoped crawling and normalize URLs, forms, parameters, and
   JavaScript references without silently expanding beyond scope.
 - [ ] Add `ffuf` for content, virtual-host, and parameter fuzzing with rate,
@@ -335,11 +352,17 @@ stateful systems, and internal libraries for reusable behavior.
   for operators who use `jq` outside Blackwall.
 
 Adapter workflows should compose typed outputs where practical, for example
-`subfinder or Amass -> httpx -> Katana or Nuclei`, while retaining the raw output
+`subfinder -> httpx -> Katana or Nuclei`, while retaining the raw output
 and provenance from every individual stage.
 
 The application must not claim that all traffic is proxied. Environment proxy
 variables do not affect every scanner, DNS client, or raw-socket tool.
+
+The retired Amass prototype exposed a v5.1.1 bootstrap dependency on hard-coded
+public DNS resolvers that VPN DNS-leak protection can block. The standalone
+`scripts/amass-mullvad-dns.ps1` helper can temporarily enable that broader resolver
+pool for manual testing of Amass or other DNS discovery tools, then restore the
+known Mullvad defaults. Blackwall never invokes it or changes operator VPN/DNS settings.
 
 ## v1.0 — Extensibility
 

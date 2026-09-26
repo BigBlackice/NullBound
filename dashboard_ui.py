@@ -18,10 +18,12 @@ from blackwall_projects import Project, ProjectStore, ProjectValidationError, Pr
 from blackwall_projects.picker import LocalDirectoryPicker
 from blackwall_scope import (
     ExecutionContext,
+    OwnershipConfidence,
     ScopeStatus,
     ScopeStore,
     ScopeValidationError,
     Target,
+    TargetKind,
     TargetSelection,
     evaluate_targets,
 )
@@ -123,6 +125,10 @@ class DashboardUI:
         self.selected_evidence_id: str | None = None
         self.selected_scope_id: str | None = None
         self.selected_run_id: str | None = None
+        self.selected_asset_ids: set[str] = set()
+        self._asset_selection_project_id: str | None = None
+        self.asset_search_query = ""
+        self.asset_in_scope_only = False
         self.target_modes = {module.id: "direct" for module in modules}
         self.direct_targets = {module.id: "" for module in modules}
         self.selected_profiles = {module.id: module.default_profile.name for module in modules}
@@ -147,12 +153,27 @@ class DashboardUI:
         self.run_state_filter = "ALL"
         self.run_timeout_values = {module.id: "" for module in modules}
         self._pending_project: tuple[str, Path] | None = None
+        self.execution_manager = execution_manager or ExecutionManager()
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
         self.evidence_stores: dict[Path, EvidenceStore] = {}
         self.evidence_scope_versions: dict[Path, tuple[int, int] | None] = {}
-        self.execution_manager = execution_manager or ExecutionManager()
+        for project in self.project_workspace.open_projects:
+            self.execution_manager.recover_incomplete((project.path,))
+            evidence_store = EvidenceStore(project.path)
+            evidence_store.recover_incomplete()
+            scope_store = ScopeStore(project.path)
+            evidence_store.sync_scope(scope_store.load())
+            key = project.path.resolve()
+            self.evidence_stores[key] = evidence_store
+            self.evidence_scope_versions[key] = (
+                (scope_store.path.stat().st_mtime_ns, scope_store.path.stat().st_size)
+                if scope_store.path.exists() else None
+            )
         self.active_run_id: str | None = None
         self._run_unsubscribe = None
+        self._evidence_unsubscribe = None
+        self._last_evidence_refresh: tuple[str, str] | None = None
+        self._client = None
 
     # Resolve the selected ID through the module catalog instead of duplicating data.
     @property
@@ -213,15 +234,36 @@ class DashboardUI:
             metadata = dict(asset.metadata)
             records.append({
                 "id": asset.id, "type": asset.kind.value.upper(), "name": asset.display_name,
+                "target_kind": asset.kind.value, "normalized": asset.normalized_key,
                 "address": str(metadata.get("address", "—")),
                 "ports": str(metadata.get("ports", "—")),
                 "scope": self._scope_label(asset.scope.value), "source": sources,
+                "scope_rule": asset.matched_rule_id or "",
                 "first_seen": asset.first_seen_at, "last_seen": asset.last_seen_at,
                 "technology": str(metadata.get("technology", "—")),
                 "provenance": run_ids or sources,
                 "notes": str(metadata.get("notes", "")),
             })
         return tuple(records)
+
+    def filtered_asset_records(self) -> tuple[dict[str, str], ...]:
+        records = self.asset_records()
+        queries = tuple(
+            query.strip().casefold()
+            for query in (self.search_query, self.asset_search_query)
+            if query.strip()
+        )
+        if self.asset_in_scope_only:
+            records = tuple(record for record in records if record["scope"] == "ALLOWED")
+        if queries:
+            records = tuple(
+                record for record in records
+                if all(
+                    query in " ".join(str(value) for value in record.values()).casefold()
+                    for query in queries
+                )
+            )
+        return records
 
     def finding_records(self) -> tuple[dict[str, str], ...]:
         store = self.active_evidence_store()
@@ -395,6 +437,13 @@ class DashboardUI:
         }
 
     def build(self) -> None:
+        # Run events are emitted by background subprocess tasks. Retain the
+        # page client so those callbacks can safely re-enter its UI context.
+        self._client = ui.context.client
+        self._evidence_unsubscribe = self.execution_manager.subscribe_all(
+            self.handle_evidence_event
+        )
+        self._client.on_delete(self.dispose)
         ui.add_css(STYLESHEET.read_text(encoding="utf-8"))
         ui.add_head_html(ESCAPE_KEY_BEHAVIOR)
         ui.colors(primary="#22cfff")
@@ -414,6 +463,7 @@ class DashboardUI:
         self.render_console()
         self.render_settings_dialog()
         self.render_project_dialogs()
+        self.render_scope_dialog()
         self.create_location_picker = LocalDirectoryPicker(
             "Choose project parent", self.set_create_project_parent
         )
@@ -539,6 +589,204 @@ class DashboardUI:
                         "flat no-caps"
                     ).classes("settings-action")
     # === END: PROJECT DIALOGS ===
+
+    # === START: SCOPE DIALOG ===
+    def render_scope_dialog(self) -> None:
+        with ui.dialog().classes("project-dialog") as self.scope_add_dialog:
+            with ui.card().classes("project-modal scope-modal"):
+                with ui.element("header").classes("settings-header"):
+                    with ui.element("div"):
+                        ui.label("AUTHORIZATION / SCOPE").classes("section-kicker")
+                        ui.label("Add scope items").classes("settings-title")
+                    with ui.element("button").classes("settings-close").props(
+                        'type=button aria-label="Close add scope items" data-escape-close=true'
+                    ).on("click", self.scope_add_dialog.close):
+                        ui.label("Ã—")
+                ui.label(
+                    "One target per line. Supports domains, IPs, CIDRs, exact URLs, "
+                    "*.example.com, and https://*.example.com/* patterns."
+                ).classes("settings-section-copy scope-dialog-copy")
+                with ui.element("div").classes("settings-field"):
+                    ui.label("TARGETS").classes("field-label")
+                    self.scope_add_targets = ui.textarea(
+                        placeholder="*.example.com\nhttps://*.example.com/*"
+                    ).props("dense outlined autogrow").classes("config-control")
+                with ui.element("div").classes("settings-field-grid scope-dialog-grid"):
+                    with ui.element("div").classes("settings-field"):
+                        ui.label("DECISION").classes("field-label")
+                        self.scope_add_decision = ui.select(
+                            {"allowed": "ALLOWED", "denied": "DENIED"}, value="allowed",
+                            on_change=self.set_scope_add_decision,
+                        ).props("dense outlined options-dense").classes("config-control")
+                    with ui.element("div").classes("settings-field"):
+                        ui.label("OWNERSHIP").classes("field-label")
+                        self.scope_add_ownership = ui.select(
+                            {
+                                "unknown": "UNKNOWN",
+                                "likely": "LIKELY",
+                                "confirmed": "CONFIRMED",
+                            },
+                            value="unknown",
+                        ).props("dense outlined options-dense").classes("config-control")
+                with ui.element("div").classes("settings-field"):
+                    ui.label("NOTES").classes("field-label")
+                    self.scope_add_notes = ui.input(
+                        placeholder="Authorization reference or operator note"
+                    ).props("dense outlined").classes("config-control")
+                with ui.element("div").classes("settings-field scope-review-field"):
+                    self.scope_add_review = ui.checkbox(
+                        "REQUIRE REVIEW", value=False
+                    ).props("dense").classes("setting-check")
+                with ui.element("div").classes("settings-actions"):
+                    ui.button(
+                        "ADD TO SCOPE", icon="add_task", on_click=self.add_manual_scope_rules
+                    ).props("flat no-caps").classes("settings-action primary")
+                    ui.button("CANCEL", on_click=self.scope_add_dialog.close).props(
+                        "flat no-caps"
+                    ).classes("settings-action")
+    # === END: SCOPE DIALOG ===
+
+    def open_scope_add_dialog(self) -> None:
+        if self.active_project is None:
+            ui.notify("Open a project before adding scope items", type="warning")
+            return
+        self.scope_add_targets.value = ""
+        self.scope_add_decision.value = "allowed"
+        self.scope_add_ownership.value = "unknown"
+        self.scope_add_notes.value = ""
+        self.scope_add_review.value = False
+        self.scope_add_review.enable()
+        self.scope_add_dialog.open()
+
+    def set_scope_add_decision(self, event: events.ValueChangeEventArguments) -> None:
+        if not hasattr(self, "scope_add_review"):
+            return
+        if str(event.value) == "denied":
+            self.scope_add_review.value = False
+            self.scope_add_review.disable()
+        else:
+            self.scope_add_review.enable()
+
+    def add_manual_scope_rules(self) -> None:
+        project = self.active_project
+        if project is None:
+            ui.notify("Open a project before adding scope items", type="warning")
+            return
+        values = tuple(
+            value.strip()
+            for value in re.split(r"[\r\n]+", str(self.scope_add_targets.value or ""))
+            if value.strip()
+        )
+        try:
+            if not values:
+                raise ScopeValidationError("enter at least one scope target")
+            created = ScopeStore(project.path).add_rules(
+                tuple(Target.parse(value) for value in values),
+                scope_status=ScopeStatus(str(self.scope_add_decision.value)),
+                ownership_confidence=OwnershipConfidence(str(self.scope_add_ownership.value)),
+                review_required=bool(self.scope_add_review.value),
+                source="manual",
+                notes=str(self.scope_add_notes.value or "").strip(),
+            )
+        except (OSError, ScopeValidationError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        if not created:
+            ui.notify("Those targets already have scope rules", type="warning")
+            return
+        self.selected_scope_id = created[-1].id
+        self._sync_active_scope()
+        self.scope_add_dialog.close()
+        self._refresh_scope_surfaces()
+        ui.notify(f"Added {len(created)} scope rule(s)", type="positive")
+
+    @staticmethod
+    def _target_for_asset(record: dict[str, str]) -> Target:
+        kind = record.get("target_kind", "")
+        supported = {
+            "domain": TargetKind.DOMAIN,
+            "ipv4": TargetKind.IPV4,
+            "ipv6": TargetKind.IPV6,
+            "cidr": TargetKind.CIDR,
+            "url": TargetKind.URL,
+        }
+        if kind == "host":
+            return Target.parse(record["normalized"])
+        if kind not in supported:
+            raise ScopeValidationError(
+                f"{record.get('type', kind).lower()} assets cannot be used as scope targets"
+            )
+        return Target(supported[kind], record["normalized"])
+
+    def add_assets_to_scope(self, asset_ids: tuple[str, ...]) -> None:
+        project = self.active_project
+        if project is None:
+            ui.notify("Open a project before adding assets to scope", type="warning")
+            return
+        records = {record["id"]: record for record in self.asset_records()}
+        targets: list[Target] = []
+        unsupported = 0
+        for asset_id in dict.fromkeys(asset_ids):
+            record = records.get(asset_id)
+            if record is None:
+                continue
+            try:
+                targets.append(self._target_for_asset(record))
+            except ScopeValidationError:
+                unsupported += 1
+        if not targets:
+            ui.notify("Select a domain, host, IP, CIDR, or URL asset", type="warning")
+            return
+        try:
+            created = ScopeStore(project.path).add_rules(
+                tuple(targets), scope_status=ScopeStatus.ALLOWED,
+                ownership_confidence=OwnershipConfidence.UNKNOWN,
+                source="assets", notes="Added from the Assets workspace",
+            )
+        except (OSError, ScopeValidationError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self._sync_active_scope()
+        self._refresh_scope_surfaces()
+        if not created and not unsupported:
+            ui.notify("The selected assets already have scope rules", type="warning")
+            return
+        skipped = len(targets) - len(created)
+        details = []
+        if skipped:
+            details.append(f"{skipped} already scoped")
+        if unsupported:
+            details.append(f"{unsupported} unsupported")
+        suffix = f" ({', '.join(details)})" if details else ""
+        ui.notify(
+            f"Added {len(created)} asset(s) to scope{suffix}",
+            type="positive" if created else "warning",
+        )
+
+    def add_selected_assets_to_scope(self) -> None:
+        self.add_assets_to_scope(tuple(self.selected_asset_ids))
+
+    def _sync_active_scope(self) -> None:
+        project = self.active_project
+        if project is None:
+            return
+        scope_store = ScopeStore(project.path)
+        key = project.path.resolve()
+        evidence_store = self.evidence_stores.get(key)
+        if evidence_store is None:
+            evidence_store = EvidenceStore(key)
+            self.evidence_stores[key] = evidence_store
+        evidence_store.sync_scope(scope_store.load())
+        stat = scope_store.path.stat()
+        self.evidence_scope_versions[key] = (stat.st_mtime_ns, stat.st_size)
+
+    def _refresh_scope_surfaces(self) -> None:
+        if self.active_view == "assets" and hasattr(self, "assets_result_host"):
+            self.refresh_asset_results()
+            self.render_inspector()
+        elif self.active_view == "scope":
+            self.render_workspace()
+            self.render_inspector()
 
     def select_settings_module(self, module_id: str) -> None:
         self.settings_module_id = module_id
@@ -696,9 +944,47 @@ class DashboardUI:
         ui.notify(f"Started {run.id}", type="positive")
 
     def handle_run_event(self, event: RunEvent) -> None:
-        """Update the connected console without coupling the runner to NiceGUI."""
+        """Route a background run event through the owning page context."""
         if event.run.id != self.active_run_id:
             return
+        if self._client is not None:
+            self._client.safe_invoke(lambda: self._apply_run_event(event))
+            return
+        self._apply_run_event(event)
+
+    def handle_evidence_event(self, event: RunEvent) -> None:
+        """Refresh project data once any run finishes evidence indexing."""
+        if event.text is not None or event.run.evidence_state not in {
+            "indexed", "failed", "no_artifact",
+        }:
+            return
+        if event.run.project_id != self.active_project_id:
+            return
+        marker = (event.run.id, event.run.evidence_state)
+        if marker == self._last_evidence_refresh:
+            return
+        if self._client is not None:
+            self._client.safe_invoke(lambda: self._apply_evidence_refresh(marker))
+            return
+        self._apply_evidence_refresh(marker)
+
+    def _apply_evidence_refresh(self, marker: tuple[str, str]) -> None:
+        self._last_evidence_refresh = marker
+        if self.active_view == "assets" and hasattr(self, "assets_result_host"):
+            self.refresh_asset_results()
+            self.render_inspector()
+
+    def dispose(self) -> None:
+        """Detach page-owned listeners when NiceGUI discards this client."""
+        if self._run_unsubscribe:
+            self._run_unsubscribe()
+            self._run_unsubscribe = None
+        if self._evidence_unsubscribe:
+            self._evidence_unsubscribe()
+            self._evidence_unsubscribe = None
+
+    def _apply_run_event(self, event: RunEvent) -> None:
+        """Apply a run event after the page's NiceGUI context is active."""
         if event.text is not None and hasattr(self, "run_output"):
             self.push_run_output(event.text)
         if hasattr(self, "console_state_label"):
@@ -826,6 +1112,10 @@ class DashboardUI:
         self.refresh_project_surfaces()
 
     def refresh_project_surfaces(self) -> None:
+        if self._asset_selection_project_id != self.active_project_id:
+            self.selected_asset_ids.clear()
+            self.selected_asset_id = None
+            self._asset_selection_project_id = self.active_project_id
         self.render_topbar()
         if self.active_view in {"findings", "assets", "evidence", "scope", "runs"}:
             self.render_workspace()
@@ -1104,17 +1394,177 @@ class DashboardUI:
 
     # === START: PROJECT RECORD VIEWS ===
     def render_assets_workspace(self) -> None:
-        records = self.asset_records()
+        records = self.filtered_asset_records()
         if records and self.selected_asset_id not in {item["id"] for item in records}:
             self.selected_asset_id = records[0]["id"]
-        self.render_record_workspace(
-            view_id="assets", kicker="INVENTORY / ASSETS", title="Assets",
-            index=f"{len(records):02d} RECORDS",
-            filters=("ALL", "DOMAIN", "HOST", "IP", "URL"), records=records,
-            columns=(("type", "TYPE"), ("name", "ASSET"), ("address", "ADDRESS"),
-                     ("ports", "PORTS"), ("scope", "SCOPE"), ("source", "SOURCE")),
-            selected_id=self.selected_asset_id, tone_key="scope",
-        )
+        ui.label("INVENTORY / ASSETS").classes("section-kicker")
+        with ui.element("div").classes("title-row"):
+            ui.label("Assets").classes("page-title")
+            self.assets_index_label = ui.label(f"{len(records):02d} RECORDS").classes("view-index")
+
+        with ui.element("div").classes("asset-controls"):
+            with ui.element("div").classes("asset-search"):
+                icon("search")
+                ui.input(
+                    value=self.asset_search_query,
+                    placeholder="SEARCH ASSETS",
+                    on_change=self.set_asset_search_query,
+                ).props(
+                    "borderless dense debounce=100 aria-label=Search-assets-table"
+                ).classes("asset-search-input")
+            ui.checkbox(
+                "IN SCOPE ONLY",
+                value=self.asset_in_scope_only,
+                on_change=self.set_asset_scope_filter,
+            ).props("dense").classes("asset-scope-filter")
+            self.asset_selection_label = ui.label("").classes("asset-selection-count")
+            with ui.button("ACTIONS", icon="more_horiz").props(
+                "flat dense no-caps"
+            ).classes("asset-action-button") as self.asset_action_button:
+                with ui.menu().classes("asset-action-menu"):
+                    ui.menu_item("ADD SELECTED TO SCOPE", self.add_selected_assets_to_scope)
+                    ui.menu_item("CLEAR SELECTION", self.clear_asset_selection)
+        self.assets_result_host = ui.element("div").classes("asset-results")
+        self.refresh_asset_results(records)
+
+    def set_asset_search_query(self, event: events.ValueChangeEventArguments) -> None:
+        self.asset_search_query = str(event.value or "")
+        self.refresh_asset_results()
+        self.render_inspector()
+
+    def set_asset_scope_filter(self, event: events.ValueChangeEventArguments) -> None:
+        self.asset_in_scope_only = bool(event.value)
+        self.refresh_asset_results()
+        self.render_inspector()
+
+    def select_asset_record(self, asset_id: str) -> None:
+        self.selected_asset_id = asset_id
+        if self.inspector_collapsed:
+            self.inspector_collapsed = False
+            self.update_inspector_layout()
+        self.refresh_asset_results()
+        self.render_inspector()
+
+    def toggle_asset_selection(
+        self, asset_id: str, event: events.ValueChangeEventArguments
+    ) -> None:
+        if event.value:
+            self.selected_asset_ids.add(asset_id)
+        else:
+            self.selected_asset_ids.discard(asset_id)
+        self.refresh_asset_results()
+
+    def toggle_visible_asset_selection(self, event: events.ValueChangeEventArguments) -> None:
+        visible_ids = {record["id"] for record in self.filtered_asset_records()}
+        if event.value:
+            self.selected_asset_ids.update(visible_ids)
+        else:
+            self.selected_asset_ids.difference_update(visible_ids)
+        self.refresh_asset_results()
+
+    def toggle_asset_selection_from_menu(self, asset_id: str) -> None:
+        if asset_id in self.selected_asset_ids:
+            self.selected_asset_ids.remove(asset_id)
+        else:
+            self.selected_asset_ids.add(asset_id)
+        self.refresh_asset_results()
+
+    def clear_asset_selection(self) -> None:
+        self.selected_asset_ids.clear()
+        self.refresh_asset_results()
+
+    def _update_asset_action_state(self) -> None:
+        count = len(self.selected_asset_ids)
+        if hasattr(self, "asset_selection_label"):
+            self.asset_selection_label.set_text(
+                f"{count:02d} SELECTED" if count else "NO SELECTION"
+            )
+        if hasattr(self, "asset_action_button"):
+            if count:
+                self.asset_action_button.enable()
+            else:
+                self.asset_action_button.disable()
+
+    def refresh_asset_results(
+        self, records: tuple[dict[str, str], ...] | None = None
+    ) -> None:
+        if not hasattr(self, "assets_result_host"):
+            return
+        all_records = self.asset_records()
+        all_ids = {record["id"] for record in all_records}
+        self.selected_asset_ids.intersection_update(all_ids)
+        visible_records = records if records is not None else self.filtered_asset_records()
+        visible_ids = {record["id"] for record in visible_records}
+        if self.selected_asset_id not in visible_ids:
+            self.selected_asset_id = visible_records[0]["id"] if visible_records else None
+        if hasattr(self, "assets_index_label"):
+            self.assets_index_label.set_text(f"{len(visible_records):02d} RECORDS")
+        self._update_asset_action_state()
+
+        self.assets_result_host.clear()
+        with self.assets_result_host:
+            with ui.element("section").classes("record-table assets-table"):
+                with ui.element("div").classes("record-row record-header"):
+                    ui.checkbox(
+                        value=bool(visible_ids and visible_ids <= self.selected_asset_ids),
+                        on_change=self.toggle_visible_asset_selection,
+                    ).props("dense aria-label=Select-all-visible-assets").classes(
+                        "record-cell asset-select-cell"
+                    )
+                    for key, label in (
+                        ("type", "TYPE"), ("name", "ASSET"), ("address", "ADDRESS"),
+                        ("ports", "PORTS"), ("scope", "SCOPE"), ("source", "SOURCE"),
+                    ):
+                        ui.label(label).classes(f"record-cell record-{key}")
+
+                for record in visible_records:
+                    tone = record["scope"].lower().replace(" ", "-")
+                    classes = f"record-row tone-{tone}"
+                    if record["id"] == self.selected_asset_id:
+                        classes += " selected"
+                    with ui.element("div").classes(classes).props(
+                        f'role=button tabindex=0 aria-label="Open asset {record["id"]}"'
+                    ).on(
+                        "click", partial(self.select_asset_record, record["id"])
+                    ).on(
+                        "keydown.enter", partial(self.select_asset_record, record["id"])
+                    ):
+                        ui.checkbox(
+                            value=record["id"] in self.selected_asset_ids,
+                            on_change=partial(self.toggle_asset_selection, record["id"]),
+                        ).props(f'dense aria-label="Select asset {record["id"]}"').classes(
+                            "record-cell asset-select-cell"
+                        ).on("click", js_handler="event => event.stopPropagation()")
+                        ui.label(record["type"]).classes("record-cell record-type")
+                        with ui.element("div").classes("record-cell record-name record-primary"):
+                            ui.label(record["name"]).classes("record-primary-value")
+                            ui.label(record["id"]).classes("record-id")
+                        ui.label(record["address"]).classes("record-cell record-address")
+                        ui.label(record["ports"]).classes("record-cell record-ports")
+                        ui.label(record["scope"]).classes("record-cell record-scope")
+                        ui.label(record["source"]).classes("record-cell record-source")
+                        with ui.context_menu().classes("asset-context-menu"):
+                            scope_target_supported = record["target_kind"] in {
+                                "domain", "host", "ipv4", "ipv6", "cidr", "url",
+                            }
+                            add_label = (
+                                "ALREADY IN SCOPE" if record["scope_rule"]
+                                else "ADD TO SCOPE" if scope_target_supported
+                                else "NOT A SCOPE TARGET"
+                            )
+                            add_item = ui.menu_item(
+                                add_label,
+                                partial(self.add_assets_to_scope, (record["id"],)),
+                            )
+                            if record["scope_rule"] or not scope_target_supported:
+                                add_item.disable()
+                            ui.menu_item(
+                                "DESELECT" if record["id"] in self.selected_asset_ids else "SELECT",
+                                partial(self.toggle_asset_selection_from_menu, record["id"]),
+                            )
+        if not visible_records:
+            with self.assets_result_host:
+                ui.label("NO ASSETS MATCH THE CURRENT FILTERS").classes("module-empty")
 
     def render_evidence_workspace(self) -> None:
         records = self.evidence_node_records()
@@ -1175,6 +1625,12 @@ class DashboardUI:
             ui.label(index).classes("view-index")
 
         with ui.element("div").classes(f"record-filters {view_id}-filters"):
+            if view_id == "scope":
+                add_scope_button = ui.button(
+                    "ADD SCOPE ITEM", icon="add", on_click=self.open_scope_add_dialog
+                ).props("flat dense no-caps").classes("record-filter-button scope-add-button")
+                if self.active_project is None:
+                    add_scope_button.disable()
             for index, label in enumerate(filters):
                 if view_id == "runs":
                     ui.button(label, on_click=partial(self.set_run_state_filter, label)).props(
@@ -1298,7 +1754,7 @@ class DashboardUI:
             return
         if self.active_view == "assets":
             with self.inspector:
-                records = self.asset_records()
+                records = self.filtered_asset_records()
                 if not records:
                     self.render_empty_inspector("Assets")
                     return
@@ -2003,7 +2459,7 @@ class DashboardUI:
                 )
                 with ui.element("div").classes("settings-field-grid"):
                     self.module_binary = self.render_setting_field(
-                        "BINARY", module.bin if module else "", placeholder="e.g. amass"
+                        "BINARY", module.bin if module else "", placeholder="e.g. subfinder"
                     )
                     self.module_icon = self.render_setting_field(
                         "ICON (OPTIONAL)", module.icon if module else "",

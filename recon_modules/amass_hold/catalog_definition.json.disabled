@@ -1,0 +1,33 @@
+{
+  "id": "01",
+  "eyebrow": "discovery",
+  "icon": "travel_explore",
+  "description": "Subdomain Intel",
+  "bin": "amass",
+  "path": "amass",
+  "adapter": "amass",
+  "target_summary": "ADD TARGET",
+  "target_placeholder": "domain",
+  "state": "READY",
+  "profiles": [
+    {
+      "name": "Passive discovery",
+      "options": [
+        {"label": "Mode", "value": "PASSIVE"},
+        {"label": "Timeout", "value": "30m"}
+      ],
+      "arguments": ["enum", "-d", "{target}", "-timeout", "30"],
+      "output_format": "oam-sqlite"
+    },
+    {
+      "name": "Active discovery",
+      "arguments": ["enum", "-d", "{target}", "-active", "-timeout", "30"],
+      "output_format": "oam-sqlite"
+    },
+    {
+      "name": "Scope-rigid discovery",
+      "arguments": ["enum", "-d", "{target}", "-rigid", "-timeout", "30"],
+      "output_format": "oam-sqlite"
+    }
+  ]
+}

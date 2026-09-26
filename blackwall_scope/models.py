@@ -90,10 +90,22 @@ def normalize_target(kind: TargetKind, value: object) -> str:
         if parsed.username or parsed.password:
             raise ScopeValidationError("url targets cannot contain credentials")
         host = parsed.hostname.lower()
+        if "*" in host:
+            base = host[2:] if host.startswith("*.") else ""
+            if not base or "*" in base or any(
+                not _DOMAIN_LABEL.fullmatch(label) for label in base.split(".")
+            ):
+                raise ScopeValidationError(
+                    "URL host wildcards must use a complete leftmost label, e.g. *.example.com"
+                )
+        path = parsed.path or "/"
+        if "*" in path and (path.count("*") != 1 or not path.endswith("*")):
+            raise ScopeValidationError("URL path wildcards are only supported at the end")
+        if "*" in parsed.query:
+            raise ScopeValidationError("URL query wildcards are not supported")
         if ":" in host:
             host = f"[{host}]"
         netloc = f"{host}:{parsed.port}" if parsed.port else host
-        path = parsed.path or "/"
         return urlunsplit((parsed.scheme.lower(), netloc, path, parsed.query, ""))
 
     raise ScopeValidationError(f"unsupported target kind: {kind}")

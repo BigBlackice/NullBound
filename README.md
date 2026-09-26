@@ -20,8 +20,8 @@ The project-local SQLite schema, typed evidence records, parser contracts,
 normalization, deduplication, scope review, and correlation rules live in
 `blackwall_evidence`. Raw artifacts remain ordinary files; `project.db` is their
 searchable, rebuildable index. Terminal project runs are indexed automatically:
-Amass uses its native OAM SQLite `asset.db`, Nmap uses XML, and dnsx, httpx, gau,
-and tlsx use their native JSONL outputs. Failed or cancelled scans can still
+Subfinder, dnsx, httpx, gau, and tlsx use native JSONL outputs, while Nmap uses
+XML. Failed or cancelled scans can still
 contribute complete records from partial artifacts, while parser failures are
 recorded separately and never rewrite the scan's terminal status.
 
@@ -45,6 +45,9 @@ directories can be opened from anywhere on the local filesystem as long as they
 contain a valid `project.json`; they do not need to remain below `.blackwall`.
 Older projects without `scope.json` remain valid and load with empty scope data.
 Their `project.db` index is created and migrated when the project is next opened.
+Open project tabs are stored in local `~/.blackwall/workspace.json` state and are
+restored after an application restart. Closing a tab removes it from that state;
+the session file is local UI state and is not part of the portable project format.
 
 Scope is opt-in at execution time. Direct targets work with or without a project,
 and do not need to be added to project scope first. When enforcement is enabled,
@@ -74,7 +77,7 @@ Open <http://127.0.0.1:8080> in a browser.
 
 The PowerShell bootstrapper checks the executable paths configured in
 `recon_modules/definitions.json`, the ignored `.blackwall-tools` directory, and
-the current `PATH`. Missing Amass, dnsx, httpx, gau, and tlsx binaries are fetched
+the current `PATH`. Missing Subfinder, dnsx, httpx, gau, and tlsx binaries are fetched
 from their official GitHub releases. Nmap uses its official signed Windows
 installer because current portable ZIP builds are restricted to Nmap OEM users.
 
@@ -94,6 +97,10 @@ step can run silently. Use `-SkipNmap` to install only the portable tools, or
 cache, and extracted licenses are excluded from Git. Gau has no additional runtime
 dependency. OpenSSL is optional for tlsx and is only needed for its OpenSSL scan
 mode or the extra fallback coverage from that mode.
+
+`scripts/amass-mullvad-dns.ps1` remains available as a manual Windows testing
+helper for temporarily allowing a broad public resolver pool through Mullvad. It
+is not called by Blackwall or by the tool bootstrapper.
 
 Blackwall binds to localhost by default. To make it reachable on a trusted LAN,
 opt in explicitly:

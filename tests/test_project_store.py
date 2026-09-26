@@ -120,6 +120,54 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(project.path.parent, alternate_parent.resolve())
         self.assertEqual(workspace.open_projects, [project])
 
+    def test_workspace_restores_open_projects_and_active_tab_after_restart(self) -> None:
+        first = self.store.create_project("First")
+        external_store = ProjectStore(self.temporary_root / "external")
+        external_store.create_project("Placeholder")
+        second = external_store.create_project("Second")
+        workspace = ProjectWorkspace(self.store)
+        workspace.open(first.path)
+        workspace.open(second.path)
+        workspace.select(first.id)
+
+        restored = ProjectWorkspace(self.store)
+
+        self.assertEqual(
+            [project.path for project in restored.open_projects],
+            [first.path, second.path],
+        )
+        self.assertEqual(restored.active_project_id, first.id)
+        session = json.loads(
+            (self.store.root.parent / "workspace.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(session["open_projects"], [str(first.path), str(second.path)])
+
+    def test_explicitly_closed_project_is_not_restored_after_restart(self) -> None:
+        first = self.store.create_project("First")
+        second = self.store.create_project("Second")
+        workspace = ProjectWorkspace(self.store)
+        workspace.open(first.path)
+        workspace.open(second.path)
+
+        workspace.close(first.id)
+        restored = ProjectWorkspace(self.store)
+        self.assertEqual(restored.open_projects, [second])
+
+        restored.close(second.id)
+        empty_restart = ProjectWorkspace(self.store)
+        self.assertEqual(empty_restart.open_projects, [])
+        self.assertIsNone(empty_restart.active_project_id)
+
+    def test_invalid_workspace_session_does_not_block_startup(self) -> None:
+        session_path = self.store.root.parent / "workspace.json"
+        session_path.parent.mkdir(parents=True)
+        session_path.write_text("not json", encoding="utf-8")
+
+        workspace = ProjectWorkspace(self.store)
+
+        self.assertEqual(workspace.open_projects, [])
+        self.assertIsNone(workspace.active_project_id)
+
 
 if __name__ == "__main__":
     unittest.main()

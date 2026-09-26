@@ -57,10 +57,29 @@ class ToolHealth:
 
 
 @dataclass(frozen=True, slots=True)
+class CompanionProcessSpec:
+    """A short-lived local service required while the main command runs."""
+
+    executable: str
+    arguments: tuple[str, ...]
+    ready_host: str
+    ready_port: int
+    ready_http_path: str | None = None
+    label: str = "companion process"
+    startup_timeout_seconds: float = 15.0
+
+    @property
+    def key(self) -> tuple[str, str, int]:
+        return (self.executable, self.ready_host, self.ready_port)
+
+
+@dataclass(frozen=True, slots=True)
 class CommandSpec:
     executable: str
     arguments: tuple[str, ...]
     output_format: str = "text"
+    companion: CompanionProcessSpec | None = None
+    environment: tuple[tuple[str, str], ...] = ()
 
     @property
     def argv(self) -> tuple[str, ...]:

@@ -91,6 +91,26 @@ class ScopeEvaluationTests(unittest.TestCase):
         self.assertTrue(result.review_required)
         self.assertTrue(result.launch_allowed)
 
+    def test_wildcard_url_rule_matches_subdomains_and_path_prefix(self) -> None:
+        rule = ScopeRule(
+            id="SC-0010",
+            target=Target.parse("https://*.example.com/api/*"),
+            scope_status=ScopeStatus.ALLOWED,
+        )
+
+        self.assertTrue(evaluate_target(
+            Target.parse("https://portal.example.com/api/users"), (rule,), enforce=False
+        ).matched)
+        self.assertTrue(evaluate_target(
+            Target.parse("https://portal.example.com/api/users?page=2"), (rule,), enforce=False
+        ).matched)
+        self.assertFalse(evaluate_target(
+            Target.parse("https://example.com/api/users"), (rule,), enforce=False
+        ).matched)
+        self.assertFalse(evaluate_target(
+            Target.parse("https://portal.example.com/admin/"), (rule,), enforce=False
+        ).matched)
+
 
 class ScopeStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -141,6 +161,30 @@ class ScopeStoreTests(unittest.TestCase):
         self.assertTrue(self.store.load().rules[0].review_required)
         self.store.remove_rule(rule.id)
         self.assertEqual(self.store.load().rules, ())
+
+    def test_bulk_add_rules_is_atomic_and_skips_existing_targets(self) -> None:
+        self.store.add_rule(
+            target=Target.parse("existing.example.com"),
+            scope_status=ScopeStatus.DENIED,
+        )
+
+        created = self.store.add_rules(
+            (
+                Target.parse("existing.example.com"),
+                Target.parse("*.example.com"),
+                Target.parse("*.EXAMPLE.COM"),
+            ),
+            scope_status=ScopeStatus.ALLOWED,
+            ownership_confidence=OwnershipConfidence.LIKELY,
+            source="assets",
+        )
+
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].id, "SC-0002")
+        self.assertEqual(created[0].target.normalized, "*.example.com")
+        rules = self.store.load().rules
+        self.assertEqual(len(rules), 2)
+        self.assertEqual(rules[0].scope_status, ScopeStatus.DENIED)
 
     def test_saved_document_is_versioned_and_portable(self) -> None:
         self.store.add_target_set("Direct", (Target.parse("example.com"),))

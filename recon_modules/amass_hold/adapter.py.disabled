@@ -1,0 +1,75 @@
+"""INERT BACKUP: managed Amass v5 execution adapter."""
+
+from pathlib import Path
+import sqlite3
+
+from blackwall_execution.adapters import DeclarativeAdapter
+from blackwall_execution.models import CommandSpec, CompanionProcessSpec, RunRequest
+
+
+class AmassAdapter(DeclarativeAdapter):
+    """Keep Amass' native OAM database and manage its v5 engine explicitly."""
+
+    key = "amass"
+
+    def progress_summary(self, run_path: Path) -> str | None:
+        database = run_path / "artifacts" / "amass" / "asset.db"
+        if not database.is_file():
+            return None
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                database.resolve().as_uri() + "?mode=ro", uri=True, timeout=1
+            )
+            tables = {
+                str(row[0]) for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            definitions = (
+                ("fqdn", "domain", "domains"),
+                ("ipaddress", "IP", "IPs"),
+                ("url", "URL", "URLs"),
+                ("edge", "relationship", "relationships"),
+            )
+            counts = [
+                (singular, plural, int(connection.execute(
+                    f'SELECT COUNT(*) FROM "{table}"'
+                ).fetchone()[0]))
+                for table, singular, plural in definitions if table in tables
+            ]
+        except sqlite3.Error:
+            return None
+        finally:
+            if connection is not None:
+                connection.close()
+        if not counts:
+            return "OAM database initialized"
+        return ", ".join(
+            f"{count:,} {singular if count == 1 else plural}"
+            for singular, plural, count in counts
+        ) + " recorded"
+
+    def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
+        command = super().build_command(request, run_path, executable)
+        output_directory = run_path / "artifacts" / "amass"
+        output_directory.mkdir(parents=True, exist_ok=True)
+        config_root = output_directory.parent
+        return CommandSpec(
+            command.executable,
+            (*command.arguments, "-silent", "-nocolor", "-dir", str(output_directory)),
+            "oam-sqlite",
+            CompanionProcessSpec(
+                executable=command.executable,
+                arguments=("engine", "-nocolor"),
+                ready_host="127.0.0.1",
+                ready_port=4000,
+                ready_http_path="/api/v1/health",
+                label="Amass engine",
+                startup_timeout_seconds=60.0,
+            ),
+            environment=(
+                ("APPDATA", str(config_root)),
+                ("XDG_CONFIG_HOME", str(config_root)),
+            ),
+        )

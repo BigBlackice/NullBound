@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from blackwall_scope import ScopeStore
 
-from .models import IngestionResult
+from .models import AssetKind, IngestionResult, ParsedRecord
 from .parsers import ParserRegistry
 from .pipeline import EvidencePipeline
 from .store import EvidenceStore
@@ -21,6 +21,7 @@ class ProjectRunIngestor:
     """Select a native parser and index one terminal project run."""
 
     _ARTIFACT_NAMES = {
+        "subfinder": "subfinder.jsonl",
         "dnsx": "dnsx.jsonl",
         "nmap": "nmap.xml",
         "httpx": "httpx.jsonl",
@@ -42,11 +43,21 @@ class ProjectRunIngestor:
             # raw artifact remains available and the scan itself is still valid.
             return None
         project_path, artifact = self._artifact_for(manifest, module_key)
-        if artifact is None:
+        if artifact is None and module_key != "subfinder":
             return None
-        records = parser.parse(artifact, run_id=manifest.id)
-        relative_artifact = artifact.relative_to(project_path).as_posix()
-        records = tuple(replace(record, artifact_path=relative_artifact) for record in records)
+        records = parser.parse(artifact, run_id=manifest.id) if artifact is not None else ()
+        if artifact is not None:
+            relative_artifact = artifact.relative_to(project_path).as_posix()
+            records = tuple(replace(record, artifact_path=relative_artifact) for record in records)
+        if module_key == "subfinder":
+            records = (*records, *(
+                ParsedRecord(
+                    AssetKind.DOMAIN, str(target["normalized"]), parser.key,
+                    run_id=manifest.id,
+                    metadata={"role": "seed", "target_source": manifest.target_source},
+                )
+                for target in manifest.targets if target.get("kind") == "domain"
+            ))
         pipeline = EvidencePipeline(EvidenceStore(project_path))
         result = pipeline.ingest(
             records, scope=ScopeStore(project_path).load(), parser=parser.key,
@@ -69,13 +80,8 @@ class ProjectRunIngestor:
                 raise ValueError("run artifact path escapes the artifact directory")
             if not candidate.is_file():
                 continue
-            if module_key == "amass":
-                if candidate.suffix.casefold() in {".db", ".sqlite", ".sqlite3"}:
-                    candidates.append(candidate)
-            elif candidate.name.casefold() == self._ARTIFACT_NAMES.get(module_key, ""):
+            if candidate.name.casefold() == self._ARTIFACT_NAMES.get(module_key, ""):
                 candidates.append(candidate)
-        if module_key == "amass":
-            candidates.sort(key=lambda path: (path.name.casefold() != "asset.db", path.as_posix()))
         return project_path, candidates[0] if candidates else None
 
     @staticmethod
