@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -64,10 +65,71 @@ class EvidenceStore:
     def recover_incomplete(self) -> int:
         return self.database.recover_incomplete_batches(utc_now())
 
+    def transaction(self):
+        """Expose one project write transaction for an atomic ingestion batch."""
+        return self.database.transaction()
+
+    def _write_context(self, connection: sqlite3.Connection | None):
+        return nullcontext(connection) if connection is not None else self.database.transaction()
+
+    def change_token(self) -> tuple[tuple[int, int] | None, ...]:
+        """Return a cheap token which changes when SQLite's database or WAL changes."""
+        self.database.initialize()
+        tokens: list[tuple[int, int] | None] = []
+        for path in (self.database.path, self.database.path.with_name(f"{self.database.path.name}-wal")):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                tokens.append(None)
+            else:
+                tokens.append((stat.st_mtime_ns, stat.st_size))
+        return tuple(tokens)
+
     def sync_scope(self, document: ScopeDocument) -> int:
         """Mirror portable scope.json rules and re-evaluate indexed assets."""
         synced_at = utc_now()
         with self.database.transaction() as connection:
+            expected_sets = tuple(sorted(
+                (item.id, item.name, item.description) for item in document.target_sets
+            ))
+            expected_members = tuple(sorted(
+                (
+                    target_set.id, ordinal, target.kind.value,
+                    target.value, target.normalized,
+                )
+                for target_set in document.target_sets
+                for ordinal, target in enumerate(target_set.targets)
+            ))
+            expected_rules = tuple(sorted(
+                (
+                    rule.id, rule.target.kind.value, rule.target.value,
+                    rule.target.normalized, rule.scope_status.value,
+                    rule.ownership_confidence.value, int(rule.review_required),
+                    rule.source, rule.notes,
+                )
+                for rule in document.rules
+            ))
+            current_sets = tuple(tuple(row) for row in connection.execute(
+                "SELECT id, name, description FROM target_sets ORDER BY id"
+            ).fetchall())
+            current_members = tuple(tuple(row) for row in connection.execute(
+                """SELECT target_set_id, ordinal, target_kind, original_target,
+                          normalized_target
+                   FROM target_set_members ORDER BY target_set_id, ordinal"""
+            ).fetchall())
+            current_rules = tuple(tuple(row) for row in connection.execute(
+                """SELECT id, target_kind, original_target, normalized_target,
+                          scope_status, ownership_confidence, review_required,
+                          source, notes
+                   FROM scope_rules ORDER BY id"""
+            ).fetchall())
+            if (
+                current_sets == expected_sets
+                and current_members == expected_members
+                and current_rules == expected_rules
+            ):
+                return len(document.rules)
+
             connection.execute("DELETE FROM target_set_members")
             connection.execute("DELETE FROM target_sets")
             connection.execute("DELETE FROM scope_rules")
@@ -165,6 +227,7 @@ class EvidenceStore:
         *,
         evidence_kind: EvidenceKind = EvidenceKind.OBSERVATION,
         batch_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[AssetRecord, EvidenceRecord, bool, bool]:
         observed_at = record.observed_at or utc_now()
         asset_id = stable_id("AS", record.kind.value, record.normalized_key)
@@ -176,11 +239,11 @@ class EvidenceStore:
         scope, ownership, review, matched = self._scope_for(
             record.kind, record.raw_value, scope_document
         )
-        with self.database.transaction() as connection:
-            asset_exists = connection.execute(
+        with self._write_context(connection) as writer:
+            asset_exists = writer.execute(
                 "SELECT 1 FROM assets WHERE id = ?", (asset_id,)
             ).fetchone() is not None
-            connection.execute(
+            writer.execute(
                 """INSERT INTO assets (
                     id, kind, original_value, normalized_key, normalization_version,
                     transformations_json, display_name, scope_disposition,
@@ -200,10 +263,10 @@ class EvidenceStore:
                     _json(dict(record.metadata)), observed_at, observed_at,
                 ),
             )
-            evidence_exists = connection.execute(
+            evidence_exists = writer.execute(
                 "SELECT 1 FROM evidence_records WHERE id = ?", (evidence_id,)
             ).fetchone() is not None
-            connection.execute(
+            writer.execute(
                 """INSERT INTO evidence_records (
                     id, kind, asset_id, finding_id, source, raw_value, normalized_key,
                     normalization_version, transformations_json, run_id, batch_id, artifact_path,
@@ -217,13 +280,24 @@ class EvidenceStore:
                     observed_at, _json(dict(record.metadata)),
                 ),
             )
-        return self.get_asset(asset_id), self.get_evidence(evidence_id), not asset_exists, not evidence_exists
+            asset_row = writer.execute(
+                "SELECT * FROM assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+            evidence_row = writer.execute(
+                "SELECT * FROM evidence_records WHERE id = ?", (evidence_id,)
+            ).fetchone()
+        return (
+            self._asset(asset_row), self._evidence(evidence_row),
+            not asset_exists, not evidence_exists,
+        )
 
     def put_finding(
         self,
         finding: ParsedFinding,
         asset_id: str | None,
         batch_id: str | None = None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[FindingRecord, bool]:
         observed_at = finding.observed_at or utc_now()
         fingerprint = finding.fingerprint or stable_id(
@@ -231,11 +305,11 @@ class EvidenceStore:
             finding.location.casefold(),
         )
         finding_id = stable_id("FW", fingerprint)
-        with self.database.transaction() as connection:
-            exists = connection.execute(
+        with self._write_context(connection) as writer:
+            exists = writer.execute(
                 "SELECT 1 FROM findings WHERE fingerprint = ?", (fingerprint,)
             ).fetchone() is not None
-            connection.execute(
+            writer.execute(
                 """INSERT INTO findings (
                     id, fingerprint, title, severity, lifecycle_state, confidence,
                     asset_id, location, description, evidence, recommendation, source,
@@ -255,7 +329,13 @@ class EvidenceStore:
                     _json(dict(finding.metadata)),
                 ),
             )
-        return self.get_finding(finding_id), not exists
+            row = writer.execute(
+                """SELECT f.*, COALESCE(a.display_name, '') AS asset_name
+                   FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
+                   WHERE f.id = ?""",
+                (finding_id,),
+            ).fetchone()
+        return self._finding(row), not exists
 
     def put_relationship(
         self,
@@ -268,16 +348,17 @@ class EvidenceStore:
         evidence_id: str | None = None,
         confidence: str = "observed",
         metadata: dict[str, object] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> tuple[RelationshipRecord, bool]:
         relationship_id = stable_id(
             "RL", source_type, source_id, target_type, target_id, relation
         )
         created_at = utc_now()
-        with self.database.transaction() as connection:
-            exists = connection.execute(
+        with self._write_context(connection) as writer:
+            exists = writer.execute(
                 "SELECT 1 FROM relationships WHERE id = ?", (relationship_id,)
             ).fetchone() is not None
-            connection.execute(
+            writer.execute(
                 """INSERT INTO relationships (
                     id, source_type, source_id, target_type, target_id, relation,
                     evidence_id, confidence, created_at, metadata_json
@@ -291,7 +372,10 @@ class EvidenceStore:
                     relation, evidence_id, confidence, created_at, _json(metadata or {}),
                 ),
             )
-        return self.get_relationship(relationship_id), not exists
+            row = writer.execute(
+                "SELECT * FROM relationships WHERE id = ?", (relationship_id,)
+            ).fetchone()
+        return self._relationship(row), not exists
 
     def list_assets(
         self,
@@ -313,6 +397,146 @@ class EvidenceStore:
                 f"SELECT * FROM assets{where} ORDER BY last_seen_at DESC, id", values
             ).fetchall()
         return tuple(self._asset(row) for row in rows)
+
+    def list_asset_provenance(
+        self,
+        *,
+        include_denied: bool = False,
+    ) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        """Return source and run-ID summaries for all assets in one database read."""
+        denied_filter = "" if include_denied else " AND a.scope_disposition != 'denied'"
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT e.asset_id, e.source, e.run_id
+                   FROM evidence_records e
+                   JOIN assets a ON a.id = e.asset_id
+                   WHERE e.asset_id IS NOT NULL"""
+                + denied_filter
+                + " ORDER BY e.observed_at DESC, e.id"
+            ).fetchall()
+
+        sources: dict[str, list[str]] = {}
+        run_ids: dict[str, list[str]] = {}
+        for row in rows:
+            asset_id = str(row["asset_id"])
+            source = str(row["source"])
+            source_items = sources.setdefault(asset_id, [])
+            if source not in source_items:
+                source_items.append(source)
+            if row["run_id"]:
+                run_id = str(row["run_id"])
+                run_items = run_ids.setdefault(asset_id, [])
+                if run_id not in run_items:
+                    run_items.append(run_id)
+        return {
+            asset_id: (tuple(source_items), tuple(run_ids.get(asset_id, ())))
+            for asset_id, source_items in sources.items()
+        }
+
+    def list_finding_scopes(self) -> dict[str, str]:
+        """Return linked asset scope for every finding without materializing assets."""
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT f.id, COALESCE(a.scope_disposition, 'unmatched') AS scope
+                   FROM findings f LEFT JOIN assets a ON a.id = f.asset_id"""
+            ).fetchall()
+        return {str(row["id"]): str(row["scope"]) for row in rows}
+
+    def list_evidence_node_counts(
+        self,
+        *,
+        include_denied: bool = False,
+    ) -> dict[str, tuple[int, int]]:
+        """Return evidence and relationship counts using two set-based queries."""
+        denied_filter = "" if include_denied else " WHERE a.scope_disposition != 'denied'"
+        with self.database.read() as connection:
+            evidence_rows = connection.execute(
+                """SELECT e.asset_id, COUNT(*) AS count
+                   FROM evidence_records e
+                   JOIN assets a ON a.id = e.asset_id"""
+                + denied_filter
+                + " GROUP BY e.asset_id"
+            ).fetchall()
+            relationship_rows = connection.execute(
+                """SELECT endpoints.object_id, COUNT(DISTINCT endpoints.relationship_id) AS count
+                   FROM (
+                       SELECT id AS relationship_id, source_id AS object_id FROM relationships
+                       UNION ALL
+                       SELECT id AS relationship_id, target_id AS object_id FROM relationships
+                   ) endpoints
+                   JOIN assets a ON a.id = endpoints.object_id"""
+                + denied_filter
+                + " GROUP BY endpoints.object_id"
+            ).fetchall()
+
+        evidence_counts = {
+            str(row["asset_id"]): int(row["count"]) for row in evidence_rows
+        }
+        relationship_counts = {
+            str(row["object_id"]): int(row["count"]) for row in relationship_rows
+        }
+        return {
+            asset_id: (count, relationship_counts.get(asset_id, 0))
+            for asset_id, count in evidence_counts.items()
+        } | {
+            asset_id: (evidence_counts.get(asset_id, 0), count)
+            for asset_id, count in relationship_counts.items()
+        }
+
+    def list_related_assets(
+        self,
+        object_id: str,
+        *,
+        include_denied: bool = False,
+    ) -> tuple[AssetRecord, ...]:
+        """Load only asset records directly related to one selected object."""
+        denied_filter = "" if include_denied else " AND a.scope_disposition != 'denied'"
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT a.* FROM assets a
+                   JOIN (
+                       SELECT target_id AS related_id FROM relationships WHERE source_id = ?
+                       UNION
+                       SELECT source_id AS related_id FROM relationships WHERE target_id = ?
+                   ) related ON related.related_id = a.id
+                   WHERE a.id != ?"""
+                + denied_filter
+                + " ORDER BY a.last_seen_at DESC, a.id",
+                (object_id, object_id, object_id),
+            ).fetchall()
+        return tuple(self._asset(row) for row in rows)
+
+    def search_evidence_asset_ids(self, query: str) -> set[str]:
+        """Search lazy Evidence detail fields without materializing every node."""
+        needle = f"%{query}%"
+        values = (needle,) * 15
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT id FROM assets
+                   WHERE display_name LIKE ? OR normalized_key LIKE ? OR kind LIKE ?
+                      OR COALESCE(matched_rule_id, '') LIKE ?
+                   UNION
+                   SELECT asset_id FROM evidence_records
+                   WHERE asset_id IS NOT NULL AND (
+                       id LIKE ? OR kind LIKE ? OR raw_value LIKE ? OR source LIKE ?
+                       OR integrity_status LIKE ?
+                   )
+                   UNION
+                   SELECT r.source_id FROM relationships r
+                   JOIN assets related ON related.id = r.target_id
+                   WHERE related.scope_disposition != 'denied'
+                     AND (related.kind LIKE ? OR related.normalized_key LIKE ?)
+                   UNION
+                   SELECT r.target_id FROM relationships r
+                   JOIN assets related ON related.id = r.source_id
+                   WHERE related.scope_disposition != 'denied'
+                     AND (related.kind LIKE ? OR related.normalized_key LIKE ?)
+                   UNION
+                   SELECT source_id FROM relationships
+                   WHERE relation LIKE ? OR confidence LIKE ?""",
+                values,
+            ).fetchall()
+        return {str(row["id"]) for row in rows if row["id"] is not None}
 
     def list_scope_review_assets(self) -> tuple[AssetRecord, ...]:
         with self.database.read() as connection:

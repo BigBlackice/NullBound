@@ -109,6 +109,17 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual({item.raw_value for item in evidence}, {
             "Portal.Example.com.", "portal.example.com",
         })
+        provenance = self.store.list_asset_provenance()
+        sources, run_ids = provenance[assets[0].id]
+        self.assertEqual(set(sources), {"dnsx", "subfinder"})
+        self.assertEqual(set(run_ids), {"RUN-001", "RUN-002"})
+        self.assertEqual(
+            self.store.list_evidence_node_counts()[assets[0].id], (2, 0)
+        )
+        self.assertEqual(
+            self.store.search_evidence_asset_ids("Portal.Example.com."),
+            {assets[0].id},
+        )
 
     def test_url_enrichment_correlates_a_host_without_guessing_a_root_domain(self) -> None:
         result = self.pipeline.ingest((ParsedRecord(
@@ -121,6 +132,8 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual(result.relationships_created, 1)
         self.assertEqual({asset.kind for asset in assets}, {AssetKind.URL, AssetKind.DOMAIN})
         self.assertEqual(relations[0].relation, "hosted_by")
+        related = self.store.list_related_assets(relations[0].source_id)
+        self.assertEqual({item.id for item in related}, {relations[0].target_id})
 
     def test_denied_assets_are_retained_but_hidden_from_normal_queries(self) -> None:
         self.pipeline.ingest((ParsedRecord(
@@ -146,6 +159,33 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual(second.findings_created, 0)
         self.assertEqual(len(self.store.list_findings()), 1)
         self.assertEqual(self.store.list_relationships()[0].relation, "affects")
+        finding = self.store.list_findings()[0]
+        self.assertEqual(self.store.list_finding_scopes()[finding.id], "allowed")
+
+    def test_unchanged_scope_sync_skips_asset_reevaluation(self) -> None:
+        self.store.sync_scope(self.scope)
+        original = self.store._scope_for
+        self.store._scope_for = lambda *_args: self.fail("scope was reevaluated")
+        try:
+            self.assertEqual(self.store.sync_scope(self.scope), len(self.scope.rules))
+        finally:
+            self.store._scope_for = original
+
+    def test_failed_ingestion_rolls_back_partial_normalized_records(self) -> None:
+        records = (
+            ParsedRecord(AssetKind.DOMAIN, "valid.example.com", "fixture"),
+            ParsedRecord(AssetKind.IPV4, "not-an-address", "fixture"),
+        )
+
+        with self.assertRaises(ValueError):
+            self.pipeline.ingest(records, scope=self.scope, source="fixture")
+
+        self.assertEqual(self.store.list_assets(include_denied=True), ())
+        with self.store.database.read() as connection:
+            batch = connection.execute(
+                "SELECT status FROM ingestion_batches ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(batch["status"], "failed")
 
     def test_neutral_jsonl_parser_produces_typed_records(self) -> None:
         path = self.project_path / "records.jsonl"

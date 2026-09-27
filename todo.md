@@ -36,6 +36,9 @@ name and trademark check are completed.
   contracts operating-system agnostic unless a platform difference is unavoidable.
 - **Adapters over special cases.** Tool behavior should eventually be described by
   a common adapter contract instead of being embedded throughout the UI.
+- **Single tools and workflows are distinct.** A single-tool launcher exposes one
+  adapter directly; a chained workflow composes launchers through typed artifacts
+  without hiding stage commands, scope decisions, or provenance.
 - **FOSS-first integrations.** Core workflows must not depend on proprietary tools
   or services. Optional integrations must be clearly identified and replaceable.
 - **Original visual identity.** Use an industrial/cyber command-center aesthetic,
@@ -43,7 +46,12 @@ name and trademark check are completed.
 
 ## Core information architecture
 
-- **Launchpad:** searchable module grid, favorites, recent tools, and tool health.
+- **Launchpad:** distinct single-tool launcher and chained-workflow collections,
+  with shared search, favorites, recent use, and tool health.
+- **Single-tool launchers:** direct access to one executable adapter and its
+  profiles, parameters, exact command preview, output, and artifacts.
+- **Chained workflows:** ordered launchers joined by typed normalized handoffs,
+  with every stage still visible and independently auditable.
 - **Runs:** queued, active, completed, failed, and cancelled executions.
 - **Project workspaces:** open projects appear as switchable tabs in the command
   bar; findings, assets, evidence, and scope remain project-aware rail views.
@@ -132,8 +140,8 @@ The persistent shell should include:
   must not contain a separate project selector: runs launched inside a project are
   filed into it automatically, while launchpad runs outside a project remain
   unattached.
-- [x] Add run-history filtering by project ID/name, including a `No project`
-  filter. This can follow the first polished UI implementation.
+- [x] Make run history follow the active project workspace without a duplicate
+  project dropdown; when no project is active, show session-only unattached runs.
 
 ### v0.1c — One complete execution path
 
@@ -198,14 +206,29 @@ The persistent shell should include:
 - [x] Automatically parse project-attached terminal runs into the evidence index.
   Native parsers cover Subfinder/dnsx/httpx/gau/tlsx JSONL and Nmap XML;
   no-project runs remain session-only and never create a project database.
-- [x] Drive Assets from normalized project records with a live search field, an
-  independent in-scope-only filter, multi-row selection/actions, and per-row
-  context actions for adding supported assets to scope.
+- [x] Drive Assets from normalized project records with live filtering through the
+  global top-bar search, multi-row selection/actions, and per-row context actions
+  for adding supported assets to scope.
+- [x] Add the shared tri-state scope filter to Assets, Findings, and Runs: all
+  records, in-scope only, or out-of-scope only. Findings inherit their linked
+  asset's status; Runs evaluate all recorded targets against the active project's
+  current scope rules.
 - [x] Keep Scope limited to explicit portable scope rules and allow operators to
   add domains, wildcard domains, IPs, CIDRs, exact URLs, and conservative wildcard
   URL patterns manually.
-- [x] Refresh an open Assets view when any concurrent project run finishes evidence
-  indexing, without requiring navigation or a browser reload.
+- [x] Refresh open Assets, Findings, and Evidence result tables when any concurrent
+  project run finishes evidence indexing, and update Runs on lifecycle changes.
+  Replace only the affected table rows and inspector data so searches, filters, and
+  other workspace controls are not disrupted by a full workspace rebuild.
+- [x] Keep large Subfinder result sets responsive: batch asset provenance reads,
+  render Assets in bounded 50-row pages, and represent the run-log tail with one
+  text surface instead of thousands of per-line UI components.
+- [x] Apply the same scale discipline across active surfaces: use set-based Evidence
+  counts with lazy inspector detail; bound Findings, Evidence, Scope, and Runs to
+  50 mounted rows; cache unchanged project adapters and run manifests; update row
+  selection without rebuilding workspaces; batch live console browser updates;
+  stream JSONL input; hash artifacts off the event loop; and commit each normalized
+  ingestion batch atomically instead of opening transactions per record.
 - [x] Replace active Amass support with Subfinder JSONL discovery, retain provider
   provenance, and index submitted root domains as seed assets even when no
   subdomains are returned.
@@ -267,10 +290,56 @@ Run directories are append-only by application policy. SHA-256 hashes in the
 manifest provide integrity checks; an ordinary folder should not be described as
 physically immutable.
 
+## Long-term performance and scale
+
+These changes are deferred until profiling shows the current bounded, cached views
+or atomic ingestion pipeline approaching their practical limits. Preserve current
+behavior and evidence guarantees while implementing them.
+
+- [ ] Move Assets, Findings, and Evidence to SQL-backed keyset pagination and add
+  SQLite FTS search. This has the highest payoff for projects with hundreds of
+  thousands or millions of records, but requires schema migrations and careful
+  handling of filters, stable ordering, multi-selection, and search semantics.
+- [ ] Evaluate a client-side virtualized data grid or a deliberately small custom
+  virtual list before raising the current 50-row page size. Preserve keyboard
+  navigation, context actions, multi-selection, non-disruptive live updates, the
+  Cyberpunk visual language, and NiceGUI lifecycle stability. Prototype this
+  separately because it carries medium-to-high UI regression risk.
+- [ ] Let parsers yield normalized records incrementally and commit very large
+  imports in recoverable chunks, so multi-million-line artifacts do not require a
+  complete tuple in memory. Define resume, rollback, visibility, and crash-recovery
+  semantics before replacing the current atomic ingestion transaction.
+- [ ] Page observations and relationships inside the Evidence inspector for nodes
+  with unusually high degree or extensive repeated observations. This is a
+  low-to-medium-risk safeguard even though top-level Evidence paging is already
+  bounded.
+- [ ] Compile or index scope matchers and reevaluate very large asset inventories
+  in a background job with visible progress. Define how temporarily stale scope
+  labels and enforcement decisions are represented before making reevaluation
+  asynchronous.
+- [ ] Add a reconciled persistent run index if projects commonly reach thousands
+  of run directories. Preserve portable self-contained run manifests as the source
+  of truth; the index must remain rebuildable and must not introduce stale history.
+
 ## v0.3 — Workflows and integrations
 
-- [ ] Prove cross-tool interoperability by using normalized output from one adapter
-  as typed input to a second adapter.
+- [ ] Split the Launchpad catalog into distinct **Single tools** and **Workflows**
+  collections. Every executable adapter remains directly launchable; workflows
+  reference existing launchers instead of duplicating module/profile definitions.
+- [ ] Prove cross-tool interoperability with the first built-in chain:
+  **Subfinder -> dnsx**. Pass normalized domain assets from Subfinder into dnsx for
+  DNS validation and record enrichment while preserving each stage's raw artifacts,
+  exact command, scope decision, and provenance.
+- [ ] Add **Manual chaining** to Runs: a run-row right-click menu plus `Send to...`
+  in the visible selection/action menu, including bulk handoff from multiple
+  selected runs. Filter destinations to adapters that can consume the selected
+  runs' normalized output. Let the operator review/select the records, target
+  profile, parameters, and scope policy before launching linked runs. Runs created
+  by a manual handoff must expose the same `Send to...` actions so operators can
+  continue chaining recursively while retaining the complete provenance chain.
+- [ ] Add a workflow-run manifest that links ordered child runs and exposes stage
+  status, output, cancellation, failure, and retry without flattening them into one
+  opaque process.
 - [ ] Add saved multi-tool workflows with explicit inputs and outputs.
 - [ ] Store relationships between assets, findings, artifacts, and runs as part of
   the Evidence model.
@@ -306,6 +375,9 @@ stateful systems, and internal libraries for reusable behavior.
 
 - [x] Add `subfinder` for passive subdomain discovery and normalize discovered
   names into candidate assets with source provenance.
+- [x] Keep `dnsx` available as a standalone DNS resolution and record-enrichment
+  launcher with JSONL normalization, executable health/version checks, and setup
+  support; also use it as the second stage of the planned Subfinder -> dnsx workflow.
 - [ ] Add ProjectDiscovery `httpx` for reachability checks, HTTP metadata, and
   validation of output from `subfinder` and other discovery adapters.
 - [x] Place Amass on indefinite hold and keep its disconnected implementation in
@@ -352,8 +424,9 @@ stateful systems, and internal libraries for reusable behavior.
   for operators who use `jq` outside Blackwall.
 
 Adapter workflows should compose typed outputs where practical, for example
-`subfinder -> httpx -> Katana or Nuclei`, while retaining the raw output
-and provenance from every individual stage.
+`subfinder -> dnsx -> httpx -> Katana or Nuclei`, while retaining the same tools as
+independent single-tool launchers plus the raw output and provenance from every
+individual workflow stage.
 
 The application must not claim that all traffic is proxied. Environment proxy
 variables do not affect every scanner, DNS client, or raw-socket tool.

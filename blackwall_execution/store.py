@@ -38,6 +38,7 @@ class RunStore:
         self._temporary_directory = TemporaryDirectory(prefix="blackwall-runs-") if standalone_root is None else None
         root = Path(self._temporary_directory.name) if self._temporary_directory else standalone_root
         self.standalone_root = Path(root).expanduser().resolve(False)
+        self._manifest_cache: dict[Path, tuple[tuple[int, int], RunManifest]] = {}
 
     def reserve(self, project_path: Path | None = None) -> tuple[str, Path]:
         root = (
@@ -98,19 +99,31 @@ class RunStore:
                 json.dumps(manifest.to_mapping(), indent=2) + "\n", encoding="utf-8"
             )
             os.replace(temporary, path)
+            stat = path.stat()
+            self._manifest_cache[manifest.run_path.resolve()] = (
+                (stat.st_mtime_ns, stat.st_size), manifest
+            )
         finally:
             temporary.unlink(missing_ok=True)
         return manifest
 
     def load(self, run_path: Path) -> RunManifest:
-        path = Path(run_path) / RUN_MANIFEST_NAME
+        resolved_run_path = Path(run_path).resolve()
+        path = resolved_run_path / RUN_MANIFEST_NAME
         try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            cached = self._manifest_cache.get(resolved_run_path)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise ExecutionError(f"cannot read run manifest: {path}") from error
         if not isinstance(payload, dict):
             raise ExecutionError(f"run manifest must contain an object: {path}")
-        return RunManifest.from_mapping(payload, Path(run_path))
+        manifest = RunManifest.from_mapping(payload, resolved_run_path)
+        self._manifest_cache[resolved_run_path] = (signature, manifest)
+        return manifest
 
     def list_runs(self, project_paths: tuple[Path, ...] = ()) -> tuple[RunManifest, ...]:
         roots = (self.standalone_root, *(Path(path) / "runs" for path in project_paths))
@@ -150,6 +163,7 @@ class RunStore:
             if run.run_path is None:
                 continue
             destination = destination_root / run.id
+            self._manifest_cache.pop(run.run_path.resolve(), None)
             shutil.move(str(run.run_path), str(destination))
             adopted.append(self.save(run.evolve(
                 project_id=str(getattr(project, "id")),
@@ -166,6 +180,7 @@ class RunStore:
         removed: list[str] = []
         for run in runs:
             if run.run_path and run.run_path.is_dir():
+                self._manifest_cache.pop(run.run_path.resolve(), None)
                 shutil.rmtree(run.run_path)
             removed.append(run.id)
         return tuple(removed)

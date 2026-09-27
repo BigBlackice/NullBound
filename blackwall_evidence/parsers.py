@@ -57,9 +57,13 @@ def _dedupe_references(items: Iterable[AssetReference]) -> tuple[AssetReference,
 
 def _json_lines(path: Path) -> Iterator[tuple[int, Mapping[str, object]]]:
     with path.open("r", encoding="utf-8", errors="replace") as stream:
-        lines = stream.readlines()
-        for line_number, line in enumerate(lines, 1):
+        line = stream.readline()
+        line_number = 0
+        while line:
+            line_number += 1
+            next_line = stream.readline()
             if not line.strip():
+                line = next_line
                 continue
             try:
                 data = json.loads(line)
@@ -67,14 +71,15 @@ def _json_lines(path: Path) -> Iterator[tuple[int, Mapping[str, object]]]:
                 # Cancelled/timed-out tools can leave one unterminated tail record.
                 # Keep every complete record before it; a malformed complete line
                 # still fails loudly because it indicates an incompatible schema.
-                if line_number == len(lines) and not line.endswith(("\n", "\r")):
-                    continue
+                if not next_line and not line.endswith(("\n", "\r")):
+                    break
                 raise ValueError(f"invalid JSONL record at line {line_number}") from error
             if isinstance(data, str):
                 data = {"url": data}
             if not isinstance(data, dict):
                 raise ValueError(f"JSONL record at line {line_number} is not an object")
             yield line_number, data
+            line = next_line
 
 
 class JsonLinesEnvelopeParser:

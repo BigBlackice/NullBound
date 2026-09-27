@@ -238,7 +238,9 @@ class ExecutionManager:
                             manifest, RunState.FAILED, exit_code=process.returncode,
                             error=f"run timed out after {manifest.timeout_seconds} seconds",
                             finished_at=utc_now(), duration_seconds=round(time.monotonic() - started_clock, 3),
-                            artifacts=self.store.collect_artifacts(manifest.run_path),
+                            artifacts=await asyncio.to_thread(
+                                self.store.collect_artifacts, manifest.run_path
+                            ),
                         )
                         self._publish_output(
                             run_id, "system",
@@ -254,7 +256,9 @@ class ExecutionManager:
                     terminal = self._transition(
                         manifest, state, exit_code=exit_code, error=error,
                         finished_at=utc_now(), duration_seconds=round(time.monotonic() - started_clock, 3),
-                        artifacts=self.store.collect_artifacts(manifest.run_path),
+                        artifacts=await asyncio.to_thread(
+                            self.store.collect_artifacts, manifest.run_path
+                        ),
                     )
                     self._publish_output(
                         run_id, "system",
@@ -272,14 +276,18 @@ class ExecutionManager:
         except asyncio.CancelledError:
             terminal = self._transition(
                 manifest, RunState.CANCELLED, finished_at=utc_now(),
-                artifacts=self.store.collect_artifacts(manifest.run_path),
+                artifacts=await asyncio.to_thread(
+                    self.store.collect_artifacts, manifest.run_path
+                ),
             )
             self._publish_output(run_id, "system", "[blackwall] Run cancelled.")
             await self._post_process(terminal)
         except Exception as error:
             terminal = self._transition(
                 manifest, RunState.FAILED, finished_at=utc_now(), error=str(error),
-                artifacts=self.store.collect_artifacts(manifest.run_path),
+                artifacts=await asyncio.to_thread(
+                    self.store.collect_artifacts, manifest.run_path
+                ),
             )
             self._publish_output(run_id, "system", f"[blackwall] Run failed: {error}")
             await self._post_process(terminal)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from functools import partial
+import json
 from pathlib import Path
 import re
 import shlex
@@ -19,6 +20,7 @@ from blackwall_projects.picker import LocalDirectoryPicker
 from blackwall_scope import (
     ExecutionContext,
     OwnershipConfidence,
+    ScopeRule,
     ScopeStatus,
     ScopeStore,
     ScopeValidationError,
@@ -84,6 +86,15 @@ VIEW_NAMES = {
 }
 
 FUNCTIONAL_VIEWS = {"launchpad", "findings", "assets", "evidence", "scope", "runs"}
+ASSET_PAGE_SIZE = 50
+RECORD_PAGE_SIZE = 50
+CONSOLE_MAX_LINES = 5000
+CONSOLE_TAIL_BYTES = 2_000_000
+SCOPE_FILTER_LABELS = {
+    False: "ALL ITEMS",
+    True: "IN SCOPE ONLY",
+    None: "OUT OF SCOPE ONLY",
+}
 SETTINGS_SECTIONS = (
     ("tune", "General", "general"),
     ("folder_open", "Projects", "projects"),
@@ -127,8 +138,23 @@ class DashboardUI:
         self.selected_run_id: str | None = None
         self.selected_asset_ids: set[str] = set()
         self._asset_selection_project_id: str | None = None
-        self.asset_search_query = ""
-        self.asset_in_scope_only = False
+        self.asset_page_index = 0
+        self.record_page_indexes = {
+            "findings": 0,
+            "evidence": 0,
+            "scope": 0,
+            "runs": 0,
+        }
+        self._project_record_cache: dict[
+            str, tuple[object, tuple[dict[str, object], ...]]
+        ] = {}
+        self._visible_record_sets: dict[str, tuple[dict[str, object], ...]] = {}
+        self._row_elements: dict[str, dict[str, object]] = {}
+        self.record_scope_filters: dict[str, bool | None] = {
+            "assets": False,
+            "findings": False,
+            "runs": False,
+        }
         self.target_modes = {module.id: "direct" for module in modules}
         self.direct_targets = {module.id: "" for module in modules}
         self.selected_profiles = {module.id: module.default_profile.name for module in modules}
@@ -149,7 +175,6 @@ class DashboardUI:
         self.settings_profile_index = 0
         self.settings_profile_drafts: dict[str, list[dict[str, object]]] = {}
         self.module_health: dict[str, ToolHealth] = {}
-        self.run_project_filter = "ALL"
         self.run_state_filter = "ALL"
         self.run_timeout_values = {module.id: "" for module in modules}
         self._pending_project: tuple[str, Path] | None = None
@@ -171,8 +196,9 @@ class DashboardUI:
             )
         self.active_run_id: str | None = None
         self._run_unsubscribe = None
-        self._evidence_unsubscribe = None
+        self._workspace_unsubscribe = None
         self._last_evidence_refresh: tuple[str, str] | None = None
+        self._pending_run_output: list[str] = []
         self._client = None
 
     # Resolve the selected ID through the module catalog instead of duplicating data.
@@ -215,6 +241,31 @@ class DashboardUI:
             self.evidence_scope_versions[key] = scope_version
         return store
 
+    def _cached_project_records(
+        self,
+        view_id: str,
+        store: EvidenceStore,
+        loader,
+    ) -> tuple[dict[str, object], ...]:
+        """Reuse immutable view adapters until the project database changes."""
+        token = (self.active_project_id, store.change_token())
+        cache = getattr(self, "_project_record_cache", {})
+        cached = cache.get(view_id)
+        if cached is not None and cached[0] == token:
+            return cached[1]
+        records = tuple(loader())
+        cache[view_id] = (token, records)
+        self._project_record_cache = cache
+        return records
+
+    def _invalidate_project_record_cache(self, *view_ids: str) -> None:
+        cache = getattr(self, "_project_record_cache", {})
+        if view_ids:
+            for view_id in view_ids:
+                cache.pop(view_id, None)
+        else:
+            cache.clear()
+
     @staticmethod
     def _scope_label(value: str) -> str:
         return {
@@ -226,42 +277,40 @@ class DashboardUI:
         store = self.active_evidence_store()
         if store is None:
             return ()
-        records: list[dict[str, str]] = []
-        for asset in store.list_assets():
-            evidence = store.list_evidence(asset_id=asset.id)
-            sources = ", ".join(dict.fromkeys(item.source.upper() for item in evidence)) or "—"
-            run_ids = ", ".join(dict.fromkeys(item.run_id for item in evidence if item.run_id))
-            metadata = dict(asset.metadata)
-            records.append({
-                "id": asset.id, "type": asset.kind.value.upper(), "name": asset.display_name,
-                "target_kind": asset.kind.value, "normalized": asset.normalized_key,
-                "address": str(metadata.get("address", "—")),
-                "ports": str(metadata.get("ports", "—")),
-                "scope": self._scope_label(asset.scope.value), "source": sources,
-                "scope_rule": asset.matched_rule_id or "",
-                "first_seen": asset.first_seen_at, "last_seen": asset.last_seen_at,
-                "technology": str(metadata.get("technology", "—")),
-                "provenance": run_ids or sources,
-                "notes": str(metadata.get("notes", "")),
-            })
-        return tuple(records)
+
+        def load() -> tuple[dict[str, str], ...]:
+            records: list[dict[str, str]] = []
+            provenance = store.list_asset_provenance(include_denied=True)
+            for asset in store.list_assets(include_denied=True):
+                source_items, run_items = provenance.get(asset.id, ((), ()))
+                sources = ", ".join(item.upper() for item in source_items) or "—"
+                run_ids = ", ".join(run_items)
+                metadata = dict(asset.metadata)
+                records.append({
+                    "id": asset.id, "type": asset.kind.value.upper(), "name": asset.display_name,
+                    "target_kind": asset.kind.value, "normalized": asset.normalized_key,
+                    "address": str(metadata.get("address", "—")),
+                    "ports": str(metadata.get("ports", "—")),
+                    "scope": self._scope_label(asset.scope.value), "source": sources,
+                    "scope_rule": asset.matched_rule_id or "",
+                    "first_seen": asset.first_seen_at, "last_seen": asset.last_seen_at,
+                    "technology": str(metadata.get("technology", "—")),
+                    "provenance": run_ids or sources,
+                    "notes": str(metadata.get("notes", "")),
+                })
+            return tuple(records)
+
+        return self._cached_project_records("assets", store, load)  # type: ignore[return-value]
 
     def filtered_asset_records(self) -> tuple[dict[str, str], ...]:
-        records = self.asset_records()
-        queries = tuple(
-            query.strip().casefold()
-            for query in (self.search_query, self.asset_search_query)
-            if query.strip()
+        records = self._filter_records_by_scope(
+            self.asset_records(), self._scope_filter_state("assets")
         )
-        if self.asset_in_scope_only:
-            records = tuple(record for record in records if record["scope"] == "ALLOWED")
-        if queries:
+        query = self.search_query.strip().casefold()
+        if query:
             records = tuple(
                 record for record in records
-                if all(
-                    query in " ".join(str(value) for value in record.values()).casefold()
-                    for query in queries
-                )
+                if query in " ".join(str(value) for value in record.values()).casefold()
             )
         return records
 
@@ -269,77 +318,135 @@ class DashboardUI:
         store = self.active_evidence_store()
         if store is None:
             return ()
-        return tuple({
-            "id": finding.id, "severity": finding.severity.value, "title": finding.title,
-            "asset": finding.asset_name or "—", "source": finding.source,
-            "confidence": finding.confidence, "seen": finding.last_seen_at,
-            "location": finding.location, "description": finding.description,
-            "evidence": finding.evidence, "recommendation": finding.recommendation,
-            "state": finding.state.value,
-        } for finding in store.list_findings())
+
+        def load() -> tuple[dict[str, str], ...]:
+            scopes = store.list_finding_scopes()
+            return tuple({
+                "id": finding.id, "severity": finding.severity.value, "title": finding.title,
+                "asset": finding.asset_name or "—", "source": finding.source,
+                "scope": self._scope_label(scopes.get(finding.id, "unmatched")),
+                "confidence": finding.confidence, "seen": finding.last_seen_at,
+                "location": finding.location, "description": finding.description,
+                "evidence": finding.evidence, "recommendation": finding.recommendation,
+                "state": finding.state.value,
+            } for finding in store.list_findings(include_denied=True))
+
+        return self._cached_project_records("findings", store, load)  # type: ignore[return-value]
+
+    def filtered_finding_records(self) -> tuple[dict[str, str], ...]:
+        records = self._filter_records_by_scope(
+            self.finding_records(), self._scope_filter_state("findings")
+        )
+        query = self.search_query.strip().casefold()
+        if query:
+            records = tuple(
+                record for record in records
+                if query in " ".join(record.values()).casefold()
+            )
+        return records
+
+    def _scope_filter_state(self, view_id: str) -> bool | None:
+        return getattr(self, "record_scope_filters", {}).get(view_id, False)
+
+    @staticmethod
+    def _filter_records_by_scope(
+        records: tuple[dict[str, object], ...],
+        state: bool | None,
+    ) -> tuple[dict[str, object], ...]:
+        if state is False:
+            return records
+        in_scope = state is True
+        return tuple(
+            record for record in records
+            if (record.get("scope") == "ALLOWED") is in_scope
+        )
 
     def evidence_node_records(self) -> tuple[dict[str, object], ...]:
         store = self.active_evidence_store()
         if store is None:
             return ()
-        assets = store.list_assets()
-        by_id = {asset.id: asset for asset in assets}
-        records: list[dict[str, object]] = []
-        for asset in assets:
-            evidence = store.list_evidence(asset_id=asset.id)
-            relationships = store.list_relationships(asset.id)
-            identifiers: list[tuple[str, str]] = [(asset.kind.value.upper(), asset.normalized_key)]
-            for relationship in relationships:
-                related_id = (
-                    relationship.target_id
-                    if relationship.source_id == asset.id else relationship.source_id
-                )
-                related = by_id.get(related_id)
-                if related:
-                    identifiers.append((related.kind.value.upper(), related.normalized_key))
-            records.append({
+
+        def load() -> tuple[dict[str, object], ...]:
+            counts = store.list_evidence_node_counts()
+            return tuple({
                 "id": asset.id, "kind": asset.kind.value.upper(),
                 "identifier": asset.display_name,
                 "scope": "IN SCOPE" if asset.scope.value == "allowed" else "REVIEW REQUIRED",
                 "scope_anchor": asset.matched_rule_id or "NO MATCHED RULE",
-                "relations": f"{len(relationships):02d}",
-                "artifact_count": f"{len(evidence):02d}", "updated": asset.last_seen_at,
-                "context": "Normalized evidence node with retained raw observations and provenance.",
-                "identifiers": tuple(dict.fromkeys(identifiers)),
-                "artifacts": tuple(
-                    (item.kind.value.upper(), item.id, item.raw_value, item.source.upper(),
-                     item.integrity_status.upper())
-                    for item in evidence
-                ),
-            })
-        return tuple(records)
+                "relations": f"{counts.get(asset.id, (0, 0))[1]:02d}",
+                "artifact_count": f"{counts.get(asset.id, (0, 0))[0]:02d}",
+                "updated": asset.last_seen_at,
+                "search_context": "Normalized evidence node with retained raw observations and provenance.",
+            } for asset in store.list_assets())
+
+        return self._cached_project_records("evidence", store, load)
+
+    def evidence_node_record(self, asset_id: str) -> dict[str, object]:
+        """Load heavier Evidence inspector details only for the selected node."""
+        store = self.active_evidence_store()
+        if store is None:
+            raise KeyError(asset_id)
+        asset = store.get_asset(asset_id)
+        evidence = store.list_evidence(asset_id=asset.id)
+        relationships = store.list_relationships(asset.id)
+        identifiers = [(asset.kind.value.upper(), asset.normalized_key)]
+        identifiers.extend(
+            (related.kind.value.upper(), related.normalized_key)
+            for related in store.list_related_assets(asset.id)
+        )
+        return {
+            "id": asset.id, "kind": asset.kind.value.upper(),
+            "identifier": asset.display_name,
+            "scope": "IN SCOPE" if asset.scope.value == "allowed" else "REVIEW REQUIRED",
+            "scope_anchor": asset.matched_rule_id or "NO MATCHED RULE",
+            "relations": f"{len(relationships):02d}",
+            "artifact_count": f"{len(evidence):02d}", "updated": asset.last_seen_at,
+            "context": "Normalized evidence node with retained raw observations and provenance.",
+            "identifiers": tuple(dict.fromkeys(identifiers)),
+            "artifacts": tuple(
+                (item.kind.value.upper(), item.id, item.raw_value, item.source.upper(),
+                 item.integrity_status.upper())
+                for item in evidence
+            ),
+        }
 
     def scope_records(self) -> tuple[dict[str, str], ...]:
         store = self.active_evidence_store()
         if store is None:
             return ()
-        records = []
-        for rule in store.list_scope_rules():
-            decision = "REVIEW REQUIRED" if rule["review_required"] else str(rule["scope_status"]).upper()
-            records.append({
-                "id": str(rule["id"]), "target": str(rule["original_target"]),
-                "type": str(rule["target_kind"]).upper(), "decision": decision,
-                "ownership": str(rule["ownership_confidence"]).upper(),
-                "source": str(rule["source"]).upper(), "updated": str(rule["synced_at"]),
-                "reason": str(rule["notes"] or "Portable scope rule mirrored from scope.json."),
-                "applies": str(rule["normalized_target"]), "notes": str(rule["notes"]),
-            })
-        return tuple(records)
+
+        def load() -> tuple[dict[str, str], ...]:
+            records = []
+            for rule in store.list_scope_rules():
+                decision = "REVIEW REQUIRED" if rule["review_required"] else str(rule["scope_status"]).upper()
+                records.append({
+                    "id": str(rule["id"]), "target": str(rule["original_target"]),
+                    "type": str(rule["target_kind"]).upper(), "decision": decision,
+                    "ownership": str(rule["ownership_confidence"]).upper(),
+                    "source": str(rule["source"]).upper(), "updated": str(rule["synced_at"]),
+                    "reason": str(rule["notes"] or "Portable scope rule mirrored from scope.json."),
+                    "applies": str(rule["normalized_target"]), "notes": str(rule["notes"]),
+                })
+            return tuple(records)
+
+        return self._cached_project_records("scope", store, load)  # type: ignore[return-value]
 
     @staticmethod
     def _record(records: tuple[dict[str, str], ...], record_id: str) -> dict[str, str]:
         return next(record for record in records if record["id"] == record_id)
 
     def run_records(self) -> tuple[dict[str, str], ...]:
-        """Adapt durable manifests to the existing dense Runs table component."""
-        project_paths = tuple(project.path for project in self.projects)
+        """Adapt manifests from the active project, or the no-project session."""
+        project = self.active_project
+        project_paths = (project.path,) if project is not None else ()
         manifests = self.execution_manager.list_runs(project_paths)
-        return tuple(self._run_record(manifest) for manifest in manifests)
+        project_id = project.id if project is not None else None
+        manifests = tuple(run for run in manifests if run.project_id == project_id)
+        rules = ScopeStore(project.path).load().rules if project is not None else ()
+        return tuple(
+            self._run_record(manifest, self._run_scope_label(manifest, rules))
+            for manifest in manifests
+        )
 
     def filtered_run_records(self) -> tuple[dict[str, str], ...]:
         """Apply the Runs view filters for both the table and its inspector."""
@@ -352,13 +459,9 @@ class DashboardUI:
             records = tuple(
                 record for record in records if record["state"] == self.run_state_filter
             )
-        if self.run_project_filter == "NONE":
-            records = tuple(record for record in records if not record["project_id"])
-        elif self.run_project_filter != "ALL":
-            records = tuple(
-                record for record in records
-                if record["project_id"] == self.run_project_filter
-            )
+        records = self._filter_records_by_scope(
+            records, self._scope_filter_state("runs")
+        )
         query = self.search_query.strip().casefold()
         if query:
             records = tuple(
@@ -387,23 +490,61 @@ class DashboardUI:
             path = self.execution_manager.store.resolve_artifact(
                 self.run_manifest(run_id), relative_path
             )
-            if path.stat().st_size > 2_000_000:
+            size = path.stat().st_size
+            if size > 2_000_000:
                 raise ExecutionError("artifact is too large to preview; use download")
             content = path.read_text(encoding="utf-8", errors="replace")
         except (ExecutionError, OSError, StopIteration) as error:
             ui.notify(str(error), type="negative")
             return
-        with ui.dialog().classes("project-dialog") as dialog, ui.card().classes("project-modal"):
+
+        artifact_preview = None
+
+        def set_wrap(event: events.ValueChangeEventArguments) -> None:
+            if artifact_preview is None:
+                return
+            if bool(event.value):
+                artifact_preview.classes(add="wrap-text")
+            else:
+                artifact_preview.classes(remove="wrap-text")
+
+        line_count = len(content.splitlines())
+        with ui.dialog().classes("project-dialog") as dialog, ui.card().classes(
+            "project-modal artifact-modal"
+        ):
             with ui.element("header").classes("settings-header"):
                 ui.label(path.name).classes("settings-title")
                 ui.button("×", on_click=dialog.close).props("flat dense")
-            ui.textarea(value=content).props("readonly outlined").classes(
-                "config-control artifact-preview"
-            )
+            with ui.element("div").classes("artifact-toolbar"):
+                ui.label(f"{line_count:,} LINES / {size:,} BYTES").classes("artifact-stats")
+                ui.checkbox("WRAP TEXT", value=True, on_change=set_wrap).props(
+                    "dense"
+                ).classes("artifact-wrap-toggle")
+            artifact_preview = ui.element("div").classes("artifact-preview wrap-text")
+            with artifact_preview:
+                ui.label(content).classes("artifact-preview-content")
         dialog.open()
 
     @staticmethod
-    def _run_record(run: RunManifest) -> dict[str, str]:
+    def _run_scope_label(run: RunManifest, rules: tuple[ScopeRule, ...]) -> str:
+        """Classify all recorded targets against the active project's current scope."""
+        targets: list[Target] = []
+        try:
+            for item in run.targets:
+                targets.append(Target(TargetKind(item["kind"]), item["value"]))
+        except (KeyError, ScopeValidationError, ValueError):
+            return "REVIEW"
+        if not targets:
+            return "REVIEW"
+        evaluations = evaluate_targets(tuple(targets), rules, enforce=False)
+        if all(item.scope_status is ScopeStatus.ALLOWED for item in evaluations):
+            return "ALLOWED"
+        if any(item.scope_status is ScopeStatus.DENIED for item in evaluations):
+            return "DENIED"
+        return "REVIEW"
+
+    @staticmethod
+    def _run_record(run: RunManifest, scope: str = "REVIEW") -> dict[str, str]:
         targets = ", ".join(item["value"] for item in run.targets) or "—"
         project = f"{run.project_name} / {run.project_id}" if run.project_id else "—"
         command = shlex.join((run.executable, *run.arguments))
@@ -424,6 +565,7 @@ class DashboardUI:
             "target": targets,
             "project": project,
             "project_id": run.project_id or "",
+            "scope": scope,
             "duration": duration,
             "started": run.started_at or run.created_at,
             "exit_code": "—" if run.exit_code is None else str(run.exit_code),
@@ -440,8 +582,8 @@ class DashboardUI:
         # Run events are emitted by background subprocess tasks. Retain the
         # page client so those callbacks can safely re-enter its UI context.
         self._client = ui.context.client
-        self._evidence_unsubscribe = self.execution_manager.subscribe_all(
-            self.handle_evidence_event
+        self._workspace_unsubscribe = self.execution_manager.subscribe_all(
+            self.handle_workspace_event
         )
         self._client.on_delete(self.dispose)
         ui.add_css(STYLESHEET.read_text(encoding="utf-8"))
@@ -461,6 +603,7 @@ class DashboardUI:
         self.render_workspace()
         self.render_inspector()
         self.render_console()
+        self._run_output_timer = ui.timer(0.1, self.flush_run_output)
         self.render_settings_dialog()
         self.render_project_dialogs()
         self.render_scope_dialog()
@@ -488,15 +631,31 @@ class DashboardUI:
         self.render_inspector()
 
     def select_record(self, view_id: str, record_id: str) -> None:
-        setattr(self, f"selected_{view_id.rstrip('s')}_id", record_id)
+        attribute = f"selected_{view_id.rstrip('s')}_id"
+        previous_id = getattr(self, attribute, None)
+        setattr(self, attribute, record_id)
+        self._update_selected_row(view_id, previous_id, record_id)
         if view_id == "runs":
             self.active_run_id = record_id
             self.render_console()
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
-        self.render_workspace()
         self.render_inspector()
+
+    def _update_selected_row(
+        self,
+        view_id: str,
+        previous_id: str | None,
+        selected_id: str | None,
+    ) -> None:
+        rows = getattr(self, "_row_elements", {}).get(view_id, {})
+        previous = rows.get(previous_id or "")
+        selected = rows.get(selected_id or "")
+        if previous is not None and previous is not selected:
+            previous.classes(remove="selected")
+        if selected is not None:
+            selected.classes(add="selected")
 
     def preview_evidence_filter(self, label: str) -> None:
         ui.notify(f"{label.title()} evidence filtering is not connected yet")
@@ -777,6 +936,7 @@ class DashboardUI:
             evidence_store = EvidenceStore(key)
             self.evidence_stores[key] = evidence_store
         evidence_store.sync_scope(scope_store.load())
+        self._invalidate_project_record_cache("assets", "findings", "evidence", "scope")
         stat = scope_store.path.stat()
         self.evidence_scope_versions[key] = (stat.st_mtime_ns, stat.st_size)
 
@@ -800,11 +960,12 @@ class DashboardUI:
         self.render_settings_content()
 
     def select_finding(self, finding_id: str) -> None:
+        previous_id = self.selected_finding_id
         self.selected_finding_id = finding_id
+        self._update_selected_row("findings", previous_id, finding_id)
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
-        self.render_workspace()
         self.render_inspector()
 
     def select_module(self, module_id: str) -> None:
@@ -849,17 +1010,38 @@ class DashboardUI:
 
     def set_search_query(self, event: events.ValueChangeEventArguments) -> None:
         self.search_query = str(event.value or "")
+        if self.active_view == "assets":
+            self.asset_page_index = 0
+        elif self.active_view in getattr(self, "record_page_indexes", {}):
+            self.record_page_indexes[self.active_view] = 0
         if self.active_view in FUNCTIONAL_VIEWS:
             self.render_workspace()
 
-    def set_run_project_filter(self, event: events.ValueChangeEventArguments) -> None:
-        self.run_project_filter = str(event.value or "ALL")
+    def set_run_state_filter(self, state: str) -> None:
+        self.run_state_filter = state
+        self.record_page_indexes["runs"] = 0
         self.render_workspace()
         self.render_inspector()
 
-    def set_run_state_filter(self, state: str) -> None:
-        self.run_state_filter = state
-        self.render_workspace()
+    def set_record_scope_filter(
+        self,
+        view_id: str,
+        event: events.ValueChangeEventArguments,
+    ) -> None:
+        state = event.value if event.value is None or type(event.value) is bool else False
+        self.record_scope_filters[view_id] = state
+        checkbox = getattr(self, f"{view_id}_scope_filter", None)
+        if checkbox is not None:
+            checkbox.set_text(SCOPE_FILTER_LABELS[state])
+        if view_id == "assets":
+            self.asset_page_index = 0
+            self.refresh_asset_results()
+        elif view_id == "findings":
+            self.record_page_indexes["findings"] = 0
+            self.refresh_finding_results()
+        elif view_id == "runs":
+            self.record_page_indexes["runs"] = 0
+            self.refresh_run_results()
         self.render_inspector()
 
     def set_proxy_enabled(self, event: events.ValueChangeEventArguments) -> None:
@@ -952,26 +1134,50 @@ class DashboardUI:
             return
         self._apply_run_event(event)
 
-    def handle_evidence_event(self, event: RunEvent) -> None:
-        """Refresh project data once any run finishes evidence indexing."""
-        if event.text is not None or event.run.evidence_state not in {
-            "indexed", "failed", "no_artifact",
-        }:
+    def handle_workspace_event(self, event: RunEvent) -> None:
+        """Apply metadata changes to visible data surfaces without rebuilding them."""
+        if event.text is not None:
             return
-        if event.run.project_id != self.active_project_id:
-            return
-        marker = (event.run.id, event.run.evidence_state)
-        if marker == self._last_evidence_refresh:
+
+        evidence_marker = None
+        if (
+            event.run.project_id == self.active_project_id
+            and event.run.evidence_state in {"indexed", "failed", "no_artifact"}
+        ):
+            evidence_marker = (event.run.id, event.run.evidence_state)
+            if evidence_marker == self._last_evidence_refresh:
+                evidence_marker = None
+
+        if self.active_view != "runs" and evidence_marker is None:
             return
         if self._client is not None:
-            self._client.safe_invoke(lambda: self._apply_evidence_refresh(marker))
+            self._client.safe_invoke(
+                lambda: self._apply_workspace_refresh(evidence_marker)
+            )
             return
-        self._apply_evidence_refresh(marker)
+        self._apply_workspace_refresh(evidence_marker)
 
-    def _apply_evidence_refresh(self, marker: tuple[str, str]) -> None:
-        self._last_evidence_refresh = marker
+    def _apply_workspace_refresh(
+        self,
+        evidence_marker: tuple[str, str] | None,
+    ) -> None:
+        """Refresh only the active table host after a run metadata event."""
+        if self.active_view == "runs" and hasattr(self, "runs_result_host"):
+            self.refresh_run_results()
+            self.render_inspector()
+
+        if evidence_marker is None:
+            return
+        self._last_evidence_refresh = evidence_marker
+        self._invalidate_project_record_cache("assets", "findings", "evidence")
         if self.active_view == "assets" and hasattr(self, "assets_result_host"):
             self.refresh_asset_results()
+            self.render_inspector()
+        elif self.active_view == "findings" and hasattr(self, "findings_result_host"):
+            self.refresh_finding_results()
+            self.render_inspector()
+        elif self.active_view == "evidence" and hasattr(self, "evidence_result_host"):
+            self.refresh_evidence_results()
             self.render_inspector()
 
     def dispose(self) -> None:
@@ -979,35 +1185,55 @@ class DashboardUI:
         if self._run_unsubscribe:
             self._run_unsubscribe()
             self._run_unsubscribe = None
-        if self._evidence_unsubscribe:
-            self._evidence_unsubscribe()
-            self._evidence_unsubscribe = None
+        if self._workspace_unsubscribe:
+            self._workspace_unsubscribe()
+            self._workspace_unsubscribe = None
 
     def _apply_run_event(self, event: RunEvent) -> None:
         """Apply a run event after the page's NiceGUI context is active."""
         if event.text is not None and hasattr(self, "run_output"):
             self.push_run_output(event.text)
+        elif event.text is None:
+            self.flush_run_output()
         if hasattr(self, "console_state_label"):
             self.console_state_label.set_text(f"{event.run.id} / {event.run.state.value.upper()}")
         if hasattr(self, "cancel_run_button"):
             self.cancel_run_button.set_visibility(not event.run.state.terminal)
-        if self.active_view == "runs" and event.text is None:
-            self.render_workspace()
-            self.render_inspector()
 
     async def cancel_active_run(self) -> None:
         if self.active_run_id and await self.execution_manager.cancel(self.active_run_id):
             ui.notify(f"Cancellation requested for {self.active_run_id}")
 
     def push_run_output(self, text: str) -> None:
-        """Append one line to the native, size-constrained console viewport."""
-        with self.run_output:
-            ui.label(text).classes("console-line")
-        while len(self.run_output.default_slot.children) > 5000:
-            self.run_output.remove(0)
+        """Queue live output so bursts become one browser update per timer tick."""
+        pending = getattr(self, "_pending_run_output", [])
+        pending.append(text)
+        self._pending_run_output = pending
+
+    def flush_run_output(self) -> None:
+        """Append one bounded output batch without server-side elements per line."""
+        if not hasattr(self, "run_output_content"):
+            return
+        pending = getattr(self, "_pending_run_output", [])
+        if not pending:
+            return
+        self._pending_run_output = []
+        payload = json.dumps("".join(f"{line}\n" for line in pending))
+        line_count = len(pending)
         ui.run_javascript(
-            f'const output = document.querySelector("#c{self.run_output.id}"); '
-            'if (output) output.scrollTop = output.scrollHeight;'
+            f'const output = document.querySelector("#c{self.run_output.id}");'
+            f'const content = document.querySelector("#c{self.run_output_content.id}");'
+            'if (output && content) {'
+            f'content.textContent += {payload};'
+            f'let count = Number(content.dataset.lineCount || "0") + {line_count};'
+            f'if (count > {CONSOLE_MAX_LINES + 500}) {{'
+            'const lines = content.textContent.split("\\n");'
+            f'content.textContent = lines.slice(-{CONSOLE_MAX_LINES + 1}).join("\\n");'
+            f'count = {CONSOLE_MAX_LINES};'
+            '}'
+            'content.dataset.lineCount = String(count);'
+            'output.scrollTop = output.scrollHeight;'
+            '}'
         )
 
     # Project-tab actions delegate persistence and validation to blackwall_projects.
@@ -1341,82 +1567,189 @@ class DashboardUI:
     # === END: LAUNCHPAD VIEW ===
 
     # === START: FINDINGS VIEW ===
+    def render_scope_state_filter(self, view_id: str, classes: str = "") -> None:
+        state = self._scope_filter_state(view_id)
+        checkbox = ui.checkbox(
+            SCOPE_FILTER_LABELS[state],
+            value=state,
+            on_change=partial(self.set_record_scope_filter, view_id),
+        ).props(
+            f"dense toggle-indeterminate toggle-order=ft aria-label={view_id}-scope-filter"
+        ).classes(f"scope-state-filter {classes}")
+        setattr(self, f"{view_id}_scope_filter", checkbox)
+
+    def render_record_pagination(self, view_id: str) -> None:
+        with ui.element("div").classes("record-pagination"):
+            previous = ui.button(
+                icon="chevron_left",
+                on_click=partial(self.change_record_page, view_id, -1),
+            ).props(f"flat dense aria-label=Previous-{view_id}-page").classes(
+                "asset-page-button"
+            )
+            label = ui.label("").classes("asset-page-label")
+            following = ui.button(
+                icon="chevron_right",
+                on_click=partial(self.change_record_page, view_id, 1),
+            ).props(f"flat dense aria-label=Next-{view_id}-page").classes(
+                "asset-page-button"
+            )
+        setattr(self, f"{view_id}_prev_button", previous)
+        setattr(self, f"{view_id}_page_label", label)
+        setattr(self, f"{view_id}_next_button", following)
+
+    def _update_record_pagination(
+        self, view_id: str, page_index: int, page_count: int
+    ) -> None:
+        label = getattr(self, f"{view_id}_page_label", None)
+        previous = getattr(self, f"{view_id}_prev_button", None)
+        following = getattr(self, f"{view_id}_next_button", None)
+        if label is None or previous is None or following is None:
+            return
+        label.set_text(f"PAGE {page_index + 1:02d} / {page_count:02d}")
+        if page_index:
+            previous.enable()
+        else:
+            previous.disable()
+        if page_index + 1 < page_count:
+            following.enable()
+        else:
+            following.disable()
+
+    def change_record_page(self, view_id: str, delta: int) -> None:
+        self.record_page_indexes[view_id] += delta
+        if view_id == "findings":
+            self.refresh_finding_results()
+        elif view_id == "evidence":
+            self.refresh_evidence_results()
+        elif view_id == "runs":
+            self.refresh_run_results()
+        elif view_id == "scope":
+            records = self.scope_records()
+            self._refresh_record_results(
+                view_id="scope", index=f"{len(records):02d} RULES", records=records,
+                columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
+                         ("ownership", "OWNERSHIP"), ("source", "SOURCE"),
+                         ("updated", "UPDATED")),
+                selected_id=self.selected_scope_id or "", tone_key="decision",
+            )
+        self.render_inspector()
+
     def render_findings_workspace(self) -> None:
         """Render a compact, packet-list-inspired finding table."""
-        findings = self.finding_records()
+        findings = self.filtered_finding_records()
         if findings and self.selected_finding_id not in {item["id"] for item in findings}:
             self.selected_finding_id = findings[0]["id"]
+        elif not findings:
+            self.selected_finding_id = None
         ui.label("ASSESSMENT / FINDINGS").classes("section-kicker")
         with ui.element("div").classes("title-row"):
             ui.label("Findings").classes("page-title")
-            ui.label(f"{len(findings):02d} RECORDS").classes("view-index")
+            self.findings_index_label = ui.label().classes("view-index")
 
-        with ui.element("div").classes("finding-summary"):
-            ui.label("ALL").classes("filter-active")
-            for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
-                count = sum(finding["severity"] == severity.lower() for finding in findings)
-                ui.label(f"{severity} {count:02d}")
+        with ui.element("div").classes("finding-scope-controls"):
+            self.render_scope_state_filter("findings")
+            self.render_record_pagination("findings")
+        self.findings_result_host = ui.element("div").classes("findings-results")
+        self.refresh_finding_results(findings)
 
-        query = self.search_query.strip().casefold()
-        visible_findings = tuple(
-            finding for finding in findings
-            if not query or query in " ".join(finding.values()).casefold()
+    def refresh_finding_results(
+        self,
+        findings: tuple[dict[str, str], ...] | None = None,
+    ) -> None:
+        """Refresh the Findings summary and rows without replacing the workspace."""
+        if not hasattr(self, "findings_result_host"):
+            return
+        findings = self.filtered_finding_records() if findings is None else findings
+        visible_sets = getattr(self, "_visible_record_sets", {})
+        visible_sets["findings"] = findings
+        self._visible_record_sets = visible_sets
+        page, page_index, page_count, start = self._record_page(
+            findings, self.record_page_indexes["findings"]
         )
-        with ui.element("section").classes("finding-table"):
-            with ui.element("div").classes("finding-row finding-header"):
-                ui.label("SEVERITY").classes("finding-cell finding-severity")
-                ui.label("FINDING").classes("finding-cell finding-name")
-                ui.label("ASSET").classes("finding-cell finding-asset")
-                ui.label("SOURCE").classes("finding-cell finding-source")
-                ui.label("CONFIDENCE").classes("finding-cell finding-confidence")
-                ui.label("SEEN").classes("finding-cell finding-seen")
+        self.record_page_indexes["findings"] = page_index
+        finding_ids = {finding["id"] for finding in page}
+        if self.selected_finding_id not in finding_ids:
+            self.selected_finding_id = page[0]["id"] if page else None
+        if hasattr(self, "findings_index_label"):
+            end = start + len(page)
+            self.findings_index_label.set_text(
+                f"{start + 1:,}-{end:,} / {len(findings):,} RECORDS"
+                if findings else "0 / 0 RECORDS"
+            )
+        self._update_record_pagination("findings", page_index, page_count)
+        self.findings_result_host.clear()
+        row_elements: dict[str, object] = {}
+        with self.findings_result_host:
+            with ui.element("div").classes("finding-summary"):
+                ui.label("ALL").classes("filter-active")
+                for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+                    count = sum(
+                        finding["severity"] == severity.lower() for finding in findings
+                    )
+                    ui.label(f"{severity} {count:02d}")
 
-            for finding in visible_findings:
-                selected = finding["id"] == self.selected_finding_id
-                classes = f"finding-row severity-{finding['severity']}"
-                if selected:
-                    classes += " selected"
-                with ui.element("button").classes(classes).props(
-                    f'type=button aria-label="Open finding {finding["id"]}: {finding["title"]}"'
-                ).on("click", partial(self.select_finding, finding["id"])):
-                    ui.label(finding["severity"].upper()).classes("finding-cell finding-severity")
-                    with ui.element("div").classes("finding-cell finding-name"):
-                        ui.label(finding["title"]).classes("finding-title")
-                        ui.label(finding["id"]).classes("finding-id")
-                    ui.label(finding["asset"]).classes("finding-cell finding-asset")
-                    ui.label(finding["source"].upper()).classes("finding-cell finding-source")
-                    ui.label(finding["confidence"].upper()).classes("finding-cell finding-confidence")
-                    ui.label(finding["seen"]).classes("finding-cell finding-seen")
-        if not visible_findings:
-            ui.label("NO FINDINGS MATCH THE CURRENT SEARCH").classes("module-empty")
+            with ui.element("section").classes("finding-table"):
+                with ui.element("div").classes("finding-row finding-header"):
+                    ui.label("SEVERITY").classes("finding-cell finding-severity")
+                    ui.label("FINDING").classes("finding-cell finding-name")
+                    ui.label("ASSET").classes("finding-cell finding-asset")
+                    ui.label("SOURCE").classes("finding-cell finding-source")
+                    ui.label("CONFIDENCE").classes("finding-cell finding-confidence")
+                    ui.label("SEEN").classes("finding-cell finding-seen")
+
+                for finding in page:
+                    selected = finding["id"] == self.selected_finding_id
+                    classes = f"finding-row severity-{finding['severity']}"
+                    if selected:
+                        classes += " selected"
+                    with ui.element("button").classes(classes).props(
+                        f'type=button aria-label="Open finding {finding["id"]}: {finding["title"]}"'
+                    ).on("click", partial(self.select_finding, finding["id"])) as row:
+                        row_elements[finding["id"]] = row
+                        ui.label(finding["severity"].upper()).classes(
+                            "finding-cell finding-severity"
+                        )
+                        with ui.element("div").classes("finding-cell finding-name"):
+                            ui.label(finding["title"]).classes("finding-title")
+                            ui.label(finding["id"]).classes("finding-id")
+                        ui.label(finding["asset"]).classes("finding-cell finding-asset")
+                        ui.label(finding["source"].upper()).classes(
+                            "finding-cell finding-source"
+                        )
+                        ui.label(finding["confidence"].upper()).classes(
+                            "finding-cell finding-confidence"
+                        )
+                        ui.label(finding["seen"]).classes("finding-cell finding-seen")
+            if not page:
+                ui.label("NO FINDINGS MATCH THE CURRENT SEARCH").classes("module-empty")
+        rows = getattr(self, "_row_elements", {})
+        rows["findings"] = row_elements
+        self._row_elements = rows
 
     # === END: FINDINGS VIEW ===
 
     # === START: PROJECT RECORD VIEWS ===
     def render_assets_workspace(self) -> None:
         records = self.filtered_asset_records()
-        if records and self.selected_asset_id not in {item["id"] for item in records}:
-            self.selected_asset_id = records[0]["id"]
         ui.label("INVENTORY / ASSETS").classes("section-kicker")
         with ui.element("div").classes("title-row"):
             ui.label("Assets").classes("page-title")
-            self.assets_index_label = ui.label(f"{len(records):02d} RECORDS").classes("view-index")
+            self.assets_index_label = ui.label("").classes("view-index")
 
         with ui.element("div").classes("asset-controls"):
-            with ui.element("div").classes("asset-search"):
-                icon("search")
-                ui.input(
-                    value=self.asset_search_query,
-                    placeholder="SEARCH ASSETS",
-                    on_change=self.set_asset_search_query,
-                ).props(
-                    "borderless dense debounce=100 aria-label=Search-assets-table"
-                ).classes("asset-search-input")
-            ui.checkbox(
-                "IN SCOPE ONLY",
-                value=self.asset_in_scope_only,
-                on_change=self.set_asset_scope_filter,
-            ).props("dense").classes("asset-scope-filter")
+            self.render_scope_state_filter("assets", "asset-scope-filter")
+            with ui.element("div").classes("asset-pagination"):
+                self.asset_prev_button = ui.button(
+                    icon="chevron_left", on_click=partial(self.change_asset_page, -1)
+                ).props("flat dense aria-label=Previous-assets-page").classes(
+                    "asset-page-button"
+                )
+                self.asset_page_label = ui.label("").classes("asset-page-label")
+                self.asset_next_button = ui.button(
+                    icon="chevron_right", on_click=partial(self.change_asset_page, 1)
+                ).props("flat dense aria-label=Next-assets-page").classes(
+                    "asset-page-button"
+                )
             self.asset_selection_label = ui.label("").classes("asset-selection-count")
             with ui.button("ACTIONS", icon="more_horiz").props(
                 "flat dense no-caps"
@@ -1427,22 +1760,13 @@ class DashboardUI:
         self.assets_result_host = ui.element("div").classes("asset-results")
         self.refresh_asset_results(records)
 
-    def set_asset_search_query(self, event: events.ValueChangeEventArguments) -> None:
-        self.asset_search_query = str(event.value or "")
-        self.refresh_asset_results()
-        self.render_inspector()
-
-    def set_asset_scope_filter(self, event: events.ValueChangeEventArguments) -> None:
-        self.asset_in_scope_only = bool(event.value)
-        self.refresh_asset_results()
-        self.render_inspector()
-
     def select_asset_record(self, asset_id: str) -> None:
+        previous_id = self.selected_asset_id
         self.selected_asset_id = asset_id
+        self._update_selected_row("assets", previous_id, asset_id)
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
-        self.refresh_asset_results()
         self.render_inspector()
 
     def toggle_asset_selection(
@@ -1455,7 +1779,9 @@ class DashboardUI:
         self.refresh_asset_results()
 
     def toggle_visible_asset_selection(self, event: events.ValueChangeEventArguments) -> None:
-        visible_ids = {record["id"] for record in self.filtered_asset_records()}
+        visible_ids = {
+            record["id"] for record in getattr(self, "_visible_asset_records", ())
+        }
         if event.value:
             self.selected_asset_ids.update(visible_ids)
         else:
@@ -1485,23 +1811,70 @@ class DashboardUI:
             else:
                 self.asset_action_button.disable()
 
+    @staticmethod
+    def _record_page(
+        records: tuple[dict[str, object], ...],
+        page_index: int,
+        page_size: int = RECORD_PAGE_SIZE,
+    ) -> tuple[tuple[dict[str, object], ...], int, int, int]:
+        """Return one bounded page plus its clamped index and starting offset."""
+        page_count = max(1, (len(records) + page_size - 1) // page_size)
+        page_index = min(max(page_index, 0), page_count - 1)
+        start = page_index * page_size
+        return records[start:start + page_size], page_index, page_count, start
+
+    @staticmethod
+    def _asset_page(
+        records: tuple[dict[str, str], ...], page_index: int
+    ) -> tuple[tuple[dict[str, str], ...], int, int, int]:
+        page, page_index, page_count, start = DashboardUI._record_page(
+            records, page_index, ASSET_PAGE_SIZE
+        )
+        return page, page_index, page_count, start  # type: ignore[return-value]
+
+    def change_asset_page(self, delta: int) -> None:
+        self.asset_page_index += delta
+        self.refresh_asset_results()
+        self.render_inspector()
+
     def refresh_asset_results(
         self, records: tuple[dict[str, str], ...] | None = None
     ) -> None:
         if not hasattr(self, "assets_result_host"):
             return
-        all_records = self.asset_records()
-        all_ids = {record["id"] for record in all_records}
-        self.selected_asset_ids.intersection_update(all_ids)
-        visible_records = records if records is not None else self.filtered_asset_records()
+        filtered_records = records if records is not None else self.filtered_asset_records()
+        visible_sets = getattr(self, "_visible_record_sets", {})
+        visible_sets["assets"] = filtered_records
+        self._visible_record_sets = visible_sets
+        visible_records, self.asset_page_index, page_count, start = self._asset_page(
+            filtered_records, self.asset_page_index
+        )
+        self._visible_asset_records = visible_records
         visible_ids = {record["id"] for record in visible_records}
         if self.selected_asset_id not in visible_ids:
             self.selected_asset_id = visible_records[0]["id"] if visible_records else None
         if hasattr(self, "assets_index_label"):
-            self.assets_index_label.set_text(f"{len(visible_records):02d} RECORDS")
+            end = start + len(visible_records)
+            self.assets_index_label.set_text(
+                f"{start + 1:,}-{end:,} / {len(filtered_records):,} RECORDS"
+                if filtered_records else "0 / 0 RECORDS"
+            )
+        if hasattr(self, "asset_page_label"):
+            self.asset_page_label.set_text(
+                f"PAGE {self.asset_page_index + 1:02d} / {page_count:02d}"
+            )
+            if self.asset_page_index:
+                self.asset_prev_button.enable()
+            else:
+                self.asset_prev_button.disable()
+            if self.asset_page_index + 1 < page_count:
+                self.asset_next_button.enable()
+            else:
+                self.asset_next_button.disable()
         self._update_asset_action_state()
 
         self.assets_result_host.clear()
+        row_elements: dict[str, object] = {}
         with self.assets_result_host:
             with ui.element("section").classes("record-table assets-table"):
                 with ui.element("div").classes("record-row record-header"):
@@ -1528,7 +1901,8 @@ class DashboardUI:
                         "click", partial(self.select_asset_record, record["id"])
                     ).on(
                         "keydown.enter", partial(self.select_asset_record, record["id"])
-                    ):
+                    ) as row:
+                        row_elements[record["id"]] = row
                         ui.checkbox(
                             value=record["id"] in self.selected_asset_ids,
                             on_change=partial(self.toggle_asset_selection, record["id"]),
@@ -1562,6 +1936,9 @@ class DashboardUI:
                                 "DESELECT" if record["id"] in self.selected_asset_ids else "SELECT",
                                 partial(self.toggle_asset_selection_from_menu, record["id"]),
                             )
+        rows = getattr(self, "_row_elements", {})
+        rows["assets"] = row_elements
+        self._row_elements = rows
         if not visible_records:
             with self.assets_result_host:
                 ui.label("NO ASSETS MATCH THE CURRENT FILTERS").classes("module-empty")
@@ -1570,13 +1947,37 @@ class DashboardUI:
         records = self.evidence_node_records()
         if records and self.selected_evidence_id not in {item["id"] for item in records}:
             self.selected_evidence_id = str(records[0]["id"])
+        elif not records:
+            self.selected_evidence_id = None
         self.render_record_workspace(
             view_id="evidence", kicker="PROVENANCE / EVIDENCE", title="Evidence",
             index=f"{len(records):02d} NODES",
             filters=("ALL", "ASSETS", "VULNERABILITIES", "IDENTITIES", "DOMAINS", "URLS"), records=records,
             columns=(("kind", "TYPE"), ("identifier", "IDENTIFIER"), ("scope_anchor", "SCOPE ANCHOR"),
                      ("relations", "RELATED"), ("artifact_count", "ARTIFACTS"), ("updated", "UPDATED")),
-            selected_id=self.selected_evidence_id, tone_key="scope", interactive_filters=True,
+            selected_id=self.selected_evidence_id or "", tone_key="scope",
+            interactive_filters=True,
+        )
+
+    def refresh_evidence_results(self) -> None:
+        """Refresh indexed Evidence rows without replacing filters or other UI state."""
+        if not hasattr(self, "evidence_result_host"):
+            return
+        records = self.evidence_node_records()
+        record_ids = {str(record["id"]) for record in records}
+        if self.selected_evidence_id not in record_ids:
+            self.selected_evidence_id = str(records[0]["id"]) if records else None
+        self._refresh_record_results(
+            view_id="evidence",
+            index=f"{len(records):02d} NODES",
+            records=records,
+            columns=(
+                ("kind", "TYPE"), ("identifier", "IDENTIFIER"),
+                ("scope_anchor", "SCOPE ANCHOR"), ("relations", "RELATED"),
+                ("artifact_count", "ARTIFACTS"), ("updated", "UPDATED"),
+            ),
+            selected_id=self.selected_evidence_id or "",
+            tone_key="scope",
         )
 
     def render_scope_workspace(self) -> None:
@@ -1596,12 +1997,35 @@ class DashboardUI:
         records = self.filtered_run_records()
         if records and self.selected_run_id not in {record["id"] for record in records}:
             self.selected_run_id = records[0]["id"]
+        elif not records:
+            self.selected_run_id = None
         self.render_record_workspace(
             view_id="runs", kicker="EXECUTION / RUNS", title="Runs", index=f"{len(records):02d} RECORDS",
             filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED", "CANCELLED"), records=records,
             columns=(("state", "STATE"), ("module", "MODULE"), ("target", "TARGET"),
-                     ("project", "PROJECT"), ("duration", "DURATION"), ("started", "STARTED")),
+                     ("scope", "SCOPE"), ("duration", "DURATION"), ("started", "STARTED")),
             selected_id=self.selected_run_id or "", tone_key="state",
+        )
+
+    def refresh_run_results(self) -> None:
+        """Refresh run rows and state labels without rebuilding the Runs workspace."""
+        if not hasattr(self, "runs_result_host"):
+            return
+        records = self.filtered_run_records()
+        record_ids = {record["id"] for record in records}
+        if self.selected_run_id not in record_ids:
+            self.selected_run_id = records[0]["id"] if records else None
+        self._refresh_record_results(
+            view_id="runs",
+            index=f"{len(records):02d} RECORDS",
+            records=records,
+            columns=(
+                ("state", "STATE"), ("module", "MODULE"), ("target", "TARGET"),
+                ("scope", "SCOPE"), ("duration", "DURATION"),
+                ("started", "STARTED"),
+            ),
+            selected_id=self.selected_run_id or "",
+            tone_key="state",
         )
 
     def render_record_workspace(
@@ -1612,7 +2036,7 @@ class DashboardUI:
         title: str,
         index: str,
         filters: tuple[str, ...],
-        records: tuple[dict[str, str], ...],
+        records: tuple[dict[str, object], ...],
         columns: tuple[tuple[str, str], ...],
         selected_id: str,
         tone_key: str,
@@ -1622,7 +2046,8 @@ class DashboardUI:
         ui.label(kicker).classes("section-kicker")
         with ui.element("div").classes("title-row"):
             ui.label(title).classes("page-title")
-            ui.label(index).classes("view-index")
+            index_label = ui.label(index).classes("view-index")
+            setattr(self, f"{view_id}_index_label", index_label)
 
         with ui.element("div").classes(f"record-filters {view_id}-filters"):
             if view_id == "scope":
@@ -1631,7 +2056,7 @@ class DashboardUI:
                 ).props("flat dense no-caps").classes("record-filter-button scope-add-button")
                 if self.active_project is None:
                     add_scope_button.disable()
-            for index, label in enumerate(filters):
+            for filter_index, label in enumerate(filters):
                 if view_id == "runs":
                     ui.button(label, on_click=partial(self.set_run_state_filter, label)).props(
                         "flat dense no-caps"
@@ -1643,40 +2068,98 @@ class DashboardUI:
                     ui.button(label, on_click=partial(self.preview_evidence_filter, label)).props(
                         "flat dense no-caps"
                     ).classes(
-                        "record-filter-button active" if index == 0 else "record-filter-button"
+                        "record-filter-button active" if filter_index == 0 else "record-filter-button"
                     )
                 else:
-                    ui.label(label).classes("filter-active" if index == 0 else "")
+                    ui.label(label).classes("filter-active" if filter_index == 0 else "")
             if view_id == "runs":
-                project_options = {"ALL": "ALL PROJECTS", "NONE": "NO PROJECT"}
-                project_options.update({
-                    project.id: f"{project.name} / {project.id}" for project in self.projects
-                })
-                ui.select(
-                    project_options, value=self.run_project_filter,
-                    on_change=self.set_run_project_filter,
-                ).props("dense outlined options-dense").classes(
-                    "config-control settings-select-control run-project-filter"
-                )
+                self.render_scope_state_filter("runs", "run-scope-filter")
+            if view_id in {"evidence", "scope", "runs"}:
+                self.render_record_pagination(view_id)
 
-        query = self.search_query.strip().casefold()
-        visible_records = tuple(
-            record for record in records
-            if not query or query in " ".join(str(value) for value in record.values()).casefold()
+        result_host = ui.element("section").classes(f"record-table {view_id}-table")
+        setattr(self, f"{view_id}_result_host", result_host)
+        self._refresh_record_results(
+            view_id=view_id,
+            index=index,
+            records=records,
+            columns=columns,
+            selected_id=selected_id,
+            tone_key=tone_key,
         )
-        with ui.element("section").classes(f"record-table {view_id}-table"):
+
+    def _refresh_record_results(
+        self,
+        *,
+        view_id: str,
+        index: str,
+        records: tuple[dict[str, object], ...],
+        columns: tuple[tuple[str, str], ...],
+        selected_id: str,
+        tone_key: str,
+    ) -> None:
+        """Replace one generic record table's rows while preserving its controls."""
+        result_host = getattr(self, f"{view_id}_result_host", None)
+        if result_host is None:
+            return
+        index_label = getattr(self, f"{view_id}_index_label", None)
+        if index_label is not None:
+            index_label.set_text(index)
+        query = self.search_query.strip().casefold()
+        if query and view_id == "evidence":
+            store = self.active_evidence_store()
+            detailed_matches = store.search_evidence_asset_ids(query) if store else set()
+            visible_records = tuple(
+                record for record in records
+                if str(record["id"]) in detailed_matches
+                or query in " ".join(str(value) for value in record.values()).casefold()
+            )
+        else:
+            visible_records = tuple(
+                record for record in records
+                if not query
+                or query in " ".join(str(value) for value in record.values()).casefold()
+            )
+        visible_sets = getattr(self, "_visible_record_sets", {})
+        visible_sets[view_id] = visible_records
+        self._visible_record_sets = visible_sets
+        page_index = self.record_page_indexes.get(view_id, 0)
+        page, page_index, page_count, start = self._record_page(
+            visible_records, page_index
+        )
+        self.record_page_indexes[view_id] = page_index
+        page_ids = {str(record["id"]) for record in page}
+        if selected_id not in page_ids:
+            selected_id = str(page[0]["id"]) if page else ""
+            attribute = f"selected_{view_id.rstrip('s')}_id"
+            if hasattr(self, attribute):
+                setattr(self, attribute, selected_id or None)
+
+        noun = index.rsplit(" ", 1)[-1]
+        if index_label is not None:
+            end = start + len(page)
+            index_label.set_text(
+                f"{start + 1:,}-{end:,} / {len(visible_records):,} {noun}"
+                if visible_records else f"0 / 0 {noun}"
+            )
+        self._update_record_pagination(view_id, page_index, page_count)
+
+        result_host.clear()
+        row_elements: dict[str, object] = {}
+        with result_host:
             with ui.element("div").classes("record-row record-header"):
                 for key, label in columns:
                     ui.label(label).classes(f"record-cell record-{key}")
 
-            for record in visible_records:
+            for record in page:
                 tone = record[tone_key].lower().replace(" ", "-").replace("/", "-")
                 classes = f"record-row tone-{tone}"
                 if record["id"] == selected_id:
                     classes += " selected"
                 with ui.element("button").classes(classes).props(
                     f'type=button aria-label="Open {view_id} record {record["id"]}"'
-                ).on("click", partial(self.select_record, view_id, record["id"])):
+                ).on("click", partial(self.select_record, view_id, record["id"])) as row:
+                    row_elements[str(record["id"])] = row
                     for column_index, (key, _label) in enumerate(columns):
                         if column_index == 1:
                             with ui.element("div").classes(f"record-cell record-{key} record-primary"):
@@ -1684,8 +2167,13 @@ class DashboardUI:
                                 ui.label(record["id"]).classes("record-id")
                         else:
                             ui.label(record[key]).classes(f"record-cell record-{key}")
-        if not visible_records:
-            ui.label(f"NO {view_id.upper()} RECORDS MATCH THE CURRENT SEARCH").classes("module-empty")
+            if not page:
+                ui.label(
+                    f"NO {view_id.upper()} RECORDS MATCH THE CURRENT SEARCH"
+                ).classes("module-empty")
+        rows = getattr(self, "_row_elements", {})
+        rows[view_id] = row_elements
+        self._row_elements = rows
 
     # === END: PROJECT RECORD VIEWS ===
 
@@ -1745,7 +2233,11 @@ class DashboardUI:
         self.inspector.clear()
         if self.active_view == "findings":
             with self.inspector:
-                records = self.finding_records()
+                visible_sets = getattr(self, "_visible_record_sets", {})
+                records = (
+                    visible_sets["findings"]
+                    if "findings" in visible_sets else self.filtered_finding_records()
+                )
                 if not records:
                     self.render_empty_inspector("Findings")
                     return
@@ -1754,7 +2246,11 @@ class DashboardUI:
             return
         if self.active_view == "assets":
             with self.inspector:
-                records = self.filtered_asset_records()
+                visible_sets = getattr(self, "_visible_record_sets", {})
+                records = (
+                    visible_sets["assets"]
+                    if "assets" in visible_sets else self.filtered_asset_records()
+                )
                 if not records:
                     self.render_empty_inspector("Assets")
                     return
@@ -1770,16 +2266,25 @@ class DashboardUI:
             return
         if self.active_view == "evidence":
             with self.inspector:
-                records = self.evidence_node_records()
+                visible_sets = getattr(self, "_visible_record_sets", {})
+                records = (
+                    visible_sets["evidence"]
+                    if "evidence" in visible_sets else self.evidence_node_records()
+                )
                 if not records:
                     self.render_empty_inspector("Evidence")
                     return
-                record = self._record(records, self.selected_evidence_id or str(records[0]["id"]))
+                record_id = self.selected_evidence_id or str(records[0]["id"])
+                record = self.evidence_node_record(record_id)
                 self.render_evidence_inspector(record)
             return
         if self.active_view == "scope":
             with self.inspector:
-                records = self.scope_records()
+                visible_sets = getattr(self, "_visible_record_sets", {})
+                records = (
+                    visible_sets["scope"]
+                    if "scope" in visible_sets else self.scope_records()
+                )
                 if not records:
                     self.render_empty_inspector("Scope")
                     return
@@ -1795,7 +2300,11 @@ class DashboardUI:
             return
         if self.active_view == "runs":
             with self.inspector:
-                records = self.filtered_run_records()
+                visible_sets = getattr(self, "_visible_record_sets", {})
+                records = (
+                    visible_sets["runs"]
+                    if "runs" in visible_sets else self.filtered_run_records()
+                )
                 if not records:
                     with ui.element("div").classes("inspector-header"):
                         with ui.element("div").classes("inspector-header-copy"):
@@ -1968,6 +2477,7 @@ class DashboardUI:
         with ui.element("div").classes("inspector-body finding-detail"):
             for label, value in (
                 ("ASSET", finding["asset"]),
+                ("SCOPE", finding["scope"]),
                 ("LOCATION", finding["location"]),
                 ("SOURCE", finding["source"].upper()),
                 ("CONFIDENCE", finding["confidence"].upper()),
@@ -2072,7 +2582,8 @@ class DashboardUI:
         run = self.run_manifest(record["id"])
         self.render_record_inspector(
             record, "RUN", record["module"], record["state"],
-            (("TARGET", record["target"]), ("PROJECT", record["project"]),
+            (("TARGET", record["target"]), ("SCOPE", record["scope"]),
+             ("PROJECT", record["project"]),
              ("PROFILE", record["profile"]), ("DURATION", record["duration"]),
              ("STARTED", record["started"]), ("EXIT CODE", record["exit_code"]),
              ("EVIDENCE", record["evidence_state"])),
@@ -2582,7 +3093,34 @@ class DashboardUI:
 
     # === START: RUN OUTPUT ===
     # Bottom output region backed by persistent stdout/stderr logs.
+    @staticmethod
+    def _tail_text_lines(
+        path: Path,
+        max_lines: int = CONSOLE_MAX_LINES,
+        max_bytes: int = CONSOLE_TAIL_BYTES,
+    ) -> tuple[tuple[str, ...], bool]:
+        """Read a bounded UTF-8 tail without loading an arbitrarily large log."""
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            read_size = min(size, max_bytes)
+            stream.seek(-read_size, 2)
+            data = stream.read(read_size)
+
+        truncated = read_size < size
+        if truncated:
+            newline = data.find(b"\n")
+            if newline >= 0:
+                data = data[newline + 1:]
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+            truncated = True
+        return tuple(lines), truncated
+
     def render_console(self) -> None:
+        # The persisted log already contains pending live lines; avoid replaying them.
+        self._pending_run_output = []
         self.console.clear()
         run = next(
             (
@@ -2623,6 +3161,8 @@ class DashboardUI:
             self.run_output = ui.element("div").classes(log_classes).props(
                 'aria-label="Run output" role=log aria-live=polite'
             )
+            output_lines: list[str] = []
+            output_truncated = False
             if run and run.run_path:
                 console_path = run.run_path / "console.log"
                 paths = (console_path,) if console_path.is_file() else (
@@ -2633,12 +3173,23 @@ class DashboardUI:
                     if not path.is_file():
                         continue
                     try:
-                        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                            with self.run_output:
-                                ui.label(line).classes("console-line")
+                        lines, truncated = self._tail_text_lines(path)
+                        output_lines.extend(lines)
+                        output_truncated = output_truncated or truncated
                     except OSError:
-                        with self.run_output:
-                            ui.label(f"Unable to read {path.name}").classes("console-line")
+                        output_lines.append(f"Unable to read {path.name}")
+            if len(output_lines) > CONSOLE_MAX_LINES:
+                output_lines = output_lines[-CONSOLE_MAX_LINES:]
+                output_truncated = True
+            if output_truncated:
+                output_lines.insert(
+                    0,
+                    f"[BLACKWALL] OUTPUT TRUNCATED — SHOWING LAST {CONSOLE_MAX_LINES:,} LINES",
+                )
+            with self.run_output:
+                self.run_output_content = ui.label("\n".join(output_lines)).classes(
+                    "console-content"
+                ).props(f'data-line-count="{len(output_lines)}"')
 
     # === END: RUN OUTPUT ===
 
