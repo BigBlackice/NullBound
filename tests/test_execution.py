@@ -345,7 +345,7 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
         finished = await self.manager.wait(run.id)
 
         self.assertEqual(finished.project_id, "P-0042")
-        self.assertEqual(finished.run_path.parent, project / "runs")
+        self.assertTrue(finished.run_path.parent.samefile(project / "runs"))
 
     async def test_project_run_is_post_processed_without_changing_terminal_state(self) -> None:
         processed = []
@@ -464,7 +464,7 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
         adopted = self.manager.adopt_unattached(project)
 
         self.assertEqual(adopted[0].project_id, "P-0099")
-        self.assertEqual(adopted[0].run_path.parent, project_path / "runs")
+        self.assertTrue(adopted[0].run_path.parent.samefile(project_path / "runs"))
         self.assertFalse((self.store.standalone_root / run.id).exists())
 
     async def test_standalone_runs_can_be_permanently_deleted(self) -> None:
