@@ -14,12 +14,12 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'This bootstrapper installs Windows executables and can only run on Windows.'
 }
 if (-not [Environment]::Is64BitOperatingSystem) {
-    throw 'Blackwall tool bootstrap currently supports 64-bit Windows only.'
+    throw 'NullBound tool bootstrap currently supports 64-bit Windows only.'
 }
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $DefinitionsPath = Join-Path $ProjectRoot 'recon_modules\definitions.json'
-$ToolsRoot = Join-Path $ProjectRoot '.blackwall-tools'
+$ToolsRoot = Join-Path $ProjectRoot '.nullbound-tools'
 $BinPath = Join-Path $ToolsRoot 'bin'
 $PackagesPath = Join-Path $ToolsRoot 'packages'
 $DownloadsPath = Join-Path $ToolsRoot 'downloads'
@@ -185,7 +185,7 @@ function Install-GitHubTool {
     )
 
     Write-Step "Installing $Name from $Repository"
-    $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Blackwall-tool-bootstrap' }
+    $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'NullBound-tool-bootstrap' }
     $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repository/releases/latest"
     $assetPattern = Get-WindowsAssetRegex
     $asset = $release.assets |
@@ -321,7 +321,7 @@ function Show-DependencyStatus {
     }
     else {
         Write-Warning (
-            'OpenSSL was not found. Blackwall tlsx profiles still use the built-in ctls/ztls modes; ' +
+            'OpenSSL was not found. NullBound tlsx profiles still use the built-in ctls/ztls modes; ' +
             'only explicit OpenSSL mode and its extra fallback coverage are unavailable.'
         )
     }
@@ -356,13 +356,13 @@ function Add-ToolDirectoriesToPath {
 }
 
 if (-not (Test-Path -LiteralPath $DefinitionsPath -PathType Leaf)) {
-    throw "Cannot find Blackwall module definitions at $DefinitionsPath"
+    throw "Cannot find NullBound module definitions at $DefinitionsPath"
 }
 $catalog = Get-Content -LiteralPath $DefinitionsPath -Raw | ConvertFrom-Json
 $requiredModules = @($catalog.modules)
 $status = [ordered]@{}
 
-Write-Step 'Checking Blackwall module executables'
+Write-Step 'Checking NullBound module executables'
 foreach ($module in $requiredModules) {
     $name = [string]$module.bin
     $found = Find-ToolExecutable -Name $name -ConfiguredPath ([string]$module.path)
@@ -382,7 +382,7 @@ if ($CheckOnly) {
         Write-Host "`nMissing: $($missing -join ', ')" -ForegroundColor Yellow
         exit 1
     }
-    Write-Host "`nAll Blackwall module executables are available." -ForegroundColor Green
+    Write-Host "`nAll NullBound module executables are available." -ForegroundColor Green
     exit 0
 }
 
@@ -415,7 +415,7 @@ foreach ($module in $installModules) {
     catch {
         $installErrors[$name] = $_.Exception.Message
         Write-Warning "$name installation failed: $($_.Exception.Message)"
-        Write-Warning 'Continuing with the remaining Blackwall tools.'
+        Write-Warning 'Continuing with the remaining NullBound tools.'
     }
 }
 
@@ -442,7 +442,7 @@ foreach ($module in $requiredModules) {
 
 if (-not $NoPersistPath) {
     Write-Host "`nThe project tool directories were added to your user PATH." -ForegroundColor Cyan
-    Write-Host 'Open a new terminal before starting Blackwall, or dot-source this script to update the current shell.'
+    Write-Host 'Open a new terminal before starting NullBound, or dot-source this script to update the current shell.'
 }
 if ($failed) {
     foreach ($name in $installErrors.Keys) {

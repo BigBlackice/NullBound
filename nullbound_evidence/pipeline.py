@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from blackwall_scope import ScopeDocument
+from nullbound_scope import ScopeDocument
 
 from .models import (
     AssetKind,

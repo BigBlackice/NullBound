@@ -1,4 +1,4 @@
-"""Native artifact parsers for Blackwall's supported discovery tools."""
+"""Native artifact parsers for NullBound's supported discovery tools."""
 
 from __future__ import annotations
 
@@ -83,9 +83,9 @@ def _json_lines(path: Path) -> Iterator[tuple[int, Mapping[str, object]]]:
 
 
 class JsonLinesEnvelopeParser:
-    """Parse Blackwall-neutral JSONL for imports and extension adapters."""
+    """Parse NullBound-neutral JSONL for imports and extension adapters."""
 
-    key = "blackwall-jsonl"
+    key = "nullbound-jsonl"
 
     def __init__(self, source: str) -> None:
         self.source = source

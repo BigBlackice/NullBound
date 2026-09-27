@@ -1,4 +1,4 @@
-"""Filesystem-backed Blackwall project creation and discovery."""
+"""Filesystem-backed NullBound project creation and discovery."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import shutil
 from typing import Final
 from uuid import uuid4
 
-from blackwall_evidence import DatabaseVersionError, ProjectDatabase
+from nullbound_evidence import DatabaseVersionError, ProjectDatabase
 
 from .models import (
     PROJECT_ID_PATTERN,
@@ -27,9 +27,9 @@ PROJECT_RUNS_DIRECTORY: Final = "runs"
 
 
 def default_projects_root(home: Path | None = None) -> Path:
-    """Return Blackwall's managed project root below the current user's home."""
+    """Return NullBound's managed project root below the current user's home."""
     user_home = (home or Path.home()).expanduser()
-    return user_home / ".blackwall" / "projects"
+    return user_home / ".nullbound" / "projects"
 
 
 def _utc_now() -> str:

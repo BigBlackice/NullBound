@@ -1,4 +1,4 @@
-# Recon Dashboard
+# NullBound
 
 ## Product statement
 
@@ -7,16 +7,16 @@ application should let an operator launch compatible tools from a consistent
 interface, optionally organize work into scoped projects, preserve evidence, and
 turn tool output into traceable assets and findings.
 
-Blackwall is intended to provide a free and open-source web-testing workflow built
+NullBound is intended to provide a free and open-source web-testing workflow built
 around ZAP and other FOSS tools, without requiring Burp or another proprietary
-platform. Over time, Blackwall should become the primary operator interface and use
+platform. Over time, NullBound should become the primary operator interface and use
 ZAP as a headless interception and scanning engine wherever practical.
 
 The first goal is not to replace every security tool. It is to make the common
 recon workflow calmer, faster, and easier to audit.
 
-Working title: **Blackwall**. Treat this as an internal codename until a public
-name and trademark check are completed.
+Public name: **NullBound**. Render the primary application header and browser title
+as **NULL//BOUND**.
 
 ## Product principles
 
@@ -117,8 +117,8 @@ The persistent shell should include:
 ### v0.1b — Optional project and scope foundation
 
 - [x] Create, open, and validate portable project directories. Default new projects
-  to `~/.blackwall/projects`, but allow the operator to choose any parent path.
-- [x] Add a local directory browser, starting in `~/.blackwall`, for opening any
+  to `~/.nullbound/projects`, but allow the operator to choose any parent path.
+- [x] Add a local directory browser, starting in `~/.nullbound`, for opening any
   folder containing a valid `project.json` as a workspace tab.
 - [x] Persist the open project-tab set in local application state and restore it on
   restart; tabs explicitly closed with their close control remain closed.
@@ -167,7 +167,7 @@ The persistent shell should include:
   between launch and the first process output.
 - [x] Prototype managed Amass v5 execution and OAM indexing, then place the
   integration on indefinite hold. Preserve the disconnected implementation under
-  `recon_modules/amass_hold` without registering it in Blackwall.
+  `recon_modules/amass_hold` without registering it in NullBound.
 - [x] Support queueing, concurrency limits, timeouts, and process-group cancellation.
 - [x] Preserve run state if the browser disconnects or refreshes.
 - [x] Record executable path, version, arguments, inputs, timestamps, duration,
@@ -234,7 +234,7 @@ The persistent shell should include:
   subdomains are returned.
 - Amass is on indefinite hold. Its engine adapter, OAM SQLite parser, and catalog
   profiles are disconnected backups under `recon_modules/amass_hold`; they must
-  not be imported or installed by Blackwall. The standalone Windows Mullvad DNS
+  not be imported or installed by NullBound. The standalone Windows Mullvad DNS
   helper remains under `scripts/` for manual testing of DNS discovery tools only.
 - [x] Preserve every raw value alongside its normalized comparison key.
 - [x] Treat URL canonicalization conservatively and record the normalization
@@ -354,15 +354,15 @@ behavior and evidence guarantees while implementing them.
   interoperability and must never become a dependency or required paid workflow.
 - [ ] Clearly identify tools whose traffic cannot be routed through the configured
   HTTP or SOCKS proxy.
-- [ ] Connect to the ZAP API and treat ZAP as Blackwall's headless interception and
+- [ ] Connect to the ZAP API and treat ZAP as NullBound's headless interception and
   scanning engine rather than as the primary operator interface.
 - [ ] Manage ZAP availability, API authentication, sessions, contexts, scope,
-  authentication, users, and scan policies from Blackwall.
+  authentication, users, and scan policies from NullBound.
 - [ ] Import proxied HTTP history, request/response bodies, passive-scan alerts,
   active-scan results, spider results, and AJAX-spider results with provenance.
-- [ ] Add Blackwall-native request/response inspection, editing, resend/replay, and
+- [ ] Add NullBound-native request/response inspection, editing, resend/replay, and
   comparison so common manual proxy work no longer requires opening the ZAP UI.
-- [ ] Keep a temporary route to the complete ZAP UI for capabilities Blackwall has
+- [ ] Keep a temporary route to the complete ZAP UI for capabilities NullBound has
   not exposed yet; record those fallbacks to prioritize later replacement.
 
 ### Planned bug-bounty tool integrations
@@ -395,7 +395,7 @@ stateful systems, and internal libraries for reusable behavior.
 
 - [ ] Configure ZAP routing in **Settings > Proxy**, control supported operations
   through its API, and expose the resulting traffic and evidence through
-  Blackwall-native views.
+  NullBound-native views.
 - [ ] Add Playwright as a managed browser-automation integration for authenticated
   navigation, screenshots, traces, and operator-authored workflows. Keep browser
   profiles, cookies, and credentials out of ordinary logs and manifests.
@@ -403,7 +403,7 @@ stateful systems, and internal libraries for reusable behavior.
   create or register sessions, protect correlation tokens, poll interactions, and
   link callbacks to the originating run, request, asset, and finding.
 - [ ] Evaluate GraphQL Voyager as an optional schema visualization inside Evidence
-  after Blackwall can import or introspect a GraphQL schema. It is not a scanner or
+  after NullBound can import or introspect a GraphQL schema. It is not a scanner or
   a general-purpose Launchpad module.
 
 #### Internal capabilities and external interoperability
@@ -416,12 +416,12 @@ stateful systems, and internal libraries for reusable behavior.
   workflows only after request redaction, deterministic replay, concurrency limits,
   and scope checks are in place.
 - [ ] Replace the useful Param Miner workflow with native hidden-input discovery
-  over requests selected from ZAP history or created in Blackwall. Support query,
+  over requests selected from ZAP history or created in NullBound. Support query,
   body, header, and cookie insertion points, configurable wordlists, safe batching,
   and differential response scoring with reproducible evidence.
-- [ ] Do not require `jq` as Blackwall's JSON database or parser. Preserve JSON and
+- [ ] Do not require `jq` as NullBound's JSON database or parser. Preserve JSON and
   JSONL artifacts, parse them natively, and optionally offer copy/export recipes
-  for operators who use `jq` outside Blackwall.
+  for operators who use `jq` outside NullBound.
 
 Adapter workflows should compose typed outputs where practical, for example
 `subfinder -> dnsx -> httpx -> Katana or Nuclei`, while retaining the same tools as
@@ -435,7 +435,7 @@ The retired Amass prototype exposed a v5.1.1 bootstrap dependency on hard-coded
 public DNS resolvers that VPN DNS-leak protection can block. The standalone
 `scripts/amass-mullvad-dns.ps1` helper can temporarily enable that broader resolver
 pool for manual testing of Amass or other DNS discovery tools, then restore the
-known Mullvad defaults. Blackwall never invokes it or changes operator VPN/DNS settings.
+known Mullvad defaults. NullBound never invokes it or changes operator VPN/DNS settings.
 
 ## v1.0 — Extensibility
 
@@ -457,7 +457,7 @@ a clear need:
 - A general-purpose interactive terminal or custom shell.
 - System-wide transparent proxying.
 - A one-for-one recreation of the complete ZAP interface. Replace common manual
-  workflows with Blackwall-native views based on actual operator needs instead.
+  workflows with NullBound-native views based on actual operator needs instead.
 - Automatic `apt`, `pacman`, or other privileged package-manager calls.
 - Decorative globes, ambient animations, or metrics without operator value.
 - Multiple finished visual themes before the primary design system is stable.

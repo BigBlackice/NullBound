@@ -1,4 +1,4 @@
-# Recon Dashboard
+# NullBound
 
 This is the interactive NiceGUI shell for the proposed recon workspace. The
 Launchpad module cards open module-specific configuration panels, and the primary
@@ -10,25 +10,25 @@ The application entry point is `main.py`, UI composition and state live in
 scan profiles, validation, and automatic ID allocation live in the
 `recon_modules` package; the bundled catalog is `recon_modules/definitions.json`.
 Project manifests, validation, filesystem persistence, and open-workspace state
-live in the `blackwall_projects` package. UI-independent target normalization,
+live in the `nullbound_projects` package. UI-independent target normalization,
 saved target sets, scope rules, enforcement evaluation, and launch-time context
-live in `blackwall_scope`.
+live in `nullbound_scope`.
 The adapter contract, subprocess lifecycle, cancellation, and portable run
-manifests live in `blackwall_execution`. Module scan profiles store argument arrays;
-Blackwall never interpolates target input into a shell command.
+manifests live in `nullbound_execution`. Module scan profiles store argument arrays;
+NullBound never interpolates target input into a shell command.
 The project-local SQLite schema, typed evidence records, parser contracts,
 normalization, deduplication, scope review, and correlation rules live in
-`blackwall_evidence`. Raw artifacts remain ordinary files; `project.db` is their
+`nullbound_evidence`. Raw artifacts remain ordinary files; `project.db` is their
 searchable, rebuildable index. Terminal project runs are indexed automatically:
 Subfinder, dnsx, httpx, gau, and tlsx use native JSONL outputs, while Nmap uses
 XML. Failed or cancelled scans can still
 contribute complete records from partial artifacts, while parser failures are
 recorded separately and never rewrite the scan's terminal status.
 
-New projects default to the current user's Blackwall directory on every platform:
+New projects default to the current user's NullBound data directory on every platform:
 
 ```text
-~/.blackwall/projects/P-0001/
+~/.nullbound/projects/P-0001/
   project.json
   project.db
   scope.json  # created when target sets or scope rules are first saved
@@ -42,10 +42,10 @@ New projects default to the current user's Blackwall directory on every platform
 
 The parent directory can be changed while creating a project. Existing project
 directories can be opened from anywhere on the local filesystem as long as they
-contain a valid `project.json`; they do not need to remain below `.blackwall`.
+contain a valid `project.json`; they do not need to remain below `.nullbound`.
 Older projects without `scope.json` remain valid and load with empty scope data.
 Their `project.db` index is created and migrated when the project is next opened.
-Open project tabs are stored in local `~/.blackwall/workspace.json` state and are
+Open project tabs are stored in local `~/.nullbound/workspace.json` state and are
 restored after an application restart. Closing a tab removes it from that state;
 the session file is local UI state and is not part of the portable project format.
 
@@ -76,7 +76,7 @@ Open <http://127.0.0.1:8080> in a browser.
 ### Install the Windows scanner tools locally
 
 The PowerShell bootstrapper checks the executable paths configured in
-`recon_modules/definitions.json`, the ignored `.blackwall-tools` directory, and
+`recon_modules/definitions.json`, the ignored `.nullbound-tools` directory, and
 the current `PATH`. Missing Subfinder, dnsx, httpx, gau, and tlsx binaries are fetched
 from their official GitHub releases. Nmap uses its official signed Windows
 installer because current portable ZIP builds are restricted to Nmap OEM users.
@@ -100,9 +100,9 @@ mode or the extra fallback coverage from that mode.
 
 `scripts/amass-mullvad-dns.ps1` remains available as a manual Windows testing
 helper for temporarily allowing a broad public resolver pool through Mullvad. It
-is not called by Blackwall or by the tool bootstrapper.
+is not called by NullBound or by the tool bootstrapper.
 
-Blackwall binds to localhost by default. To make it reachable on a trusted LAN,
+NullBound binds to localhost by default. To make it reachable on a trusted LAN,
 opt in explicitly:
 
 ```powershell
@@ -121,6 +121,28 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+### Install the Linux scanner tools
+
+The Bash bootstrapper checks the module catalog, the ignored `.nullbound-tools`
+directory, and the current `PATH`. On Debian-family, RHEL-family, and Arch-family
+systems it uses `apt`, `dnf`/`yum`, or `pacman` first. Remaining portable Go tools
+are installed into the project-local directory, with official GitHub release
+archives as a fallback.
+
+```bash
+# Report only
+bash ./scripts/setup-tools.sh --check-only
+
+# Install missing tools and add the local bin directory to PATH
+bash ./scripts/setup-tools.sh
+```
+
+Nmap and common build/runtime prerequisites use the detected system package
+manager. Flatpak is intentionally not used for these command-line scanners because
+there are no suitable official Flatpak packages and sandboxed executables would not
+behave like normal `PATH` commands. The installer falls back to upstream Go builds,
+release archives, and an Nmap source build when required.
 
 The same `--host` and `--port` options are available on Linux and macOS.
 

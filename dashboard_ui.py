@@ -1,4 +1,4 @@
-"""Interactive NiceGUI shell for the Blackwall launchpad."""
+"""Interactive NiceGUI shell for the NullBound launchpad."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ import shlex
 
 from nicegui import events, ui
 from app_config import AppConfig
-from blackwall_evidence import EvidenceStore
-from blackwall_execution import (
+from nullbound_evidence import EvidenceStore
+from nullbound_execution import (
     ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest, ToolHealth,
 )
-from blackwall_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
-from blackwall_projects.picker import LocalDirectoryPicker
-from blackwall_scope import (
+from nullbound_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
+from nullbound_projects.picker import LocalDirectoryPicker
+from nullbound_scope import (
     ExecutionContext,
     OwnershipConfidence,
     ScopeRule,
@@ -40,8 +40,8 @@ STYLESHEET = Path(__file__).with_name("styles.css")
 ESCAPE_KEY_BEHAVIOR = """
 <script>
 (() => {
-  if (window.__blackwallEscapeBlurInstalled) return;
-  window.__blackwallEscapeBlurInstalled = true;
+  if (window.__nullboundEscapeBlurInstalled) return;
+  window.__nullboundEscapeBlurInstalled = true;
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
     const active = document.activeElement;
@@ -88,6 +88,15 @@ VIEW_NAMES = {
 FUNCTIONAL_VIEWS = {"launchpad", "findings", "assets", "evidence", "scope", "runs"}
 ASSET_PAGE_SIZE = 50
 RECORD_PAGE_SIZE = 50
+EVIDENCE_CHILD_PAGE_SIZE = 50
+EVIDENCE_LINK_LIMIT = 25
+EVIDENCE_BUCKETS = (
+    ("hostnames", "HOSTNAMES", "language"),
+    ("addresses", "ADDRESSES", "dns"),
+    ("services", "SERVICES", "settings_ethernet"),
+    ("urls", "URLS", "link"),
+    ("other", "OTHER", "account_tree"),
+)
 CONSOLE_MAX_LINES = 5000
 CONSOLE_TAIL_BYTES = 2_000_000
 SCOPE_FILTER_LABELS = {
@@ -134,6 +143,11 @@ class DashboardUI:
         self.selected_finding_id: str | None = None
         self.selected_asset_id: str | None = None
         self.selected_evidence_id: str | None = None
+        self.selected_evidence_anchor_id: str | None = None
+        self.expanded_evidence_anchor_id: str | None = None
+        self.expanded_evidence_bucket: str | None = None
+        self.expanded_evidence_asset_id: str | None = None
+        self.evidence_bucket_page_index = 0
         self.selected_scope_id: str | None = None
         self.selected_run_id: str | None = None
         self.selected_asset_ids: set[str] = set()
@@ -381,25 +395,70 @@ class DashboardUI:
 
         return self._cached_project_records("evidence", store, load)
 
+    def evidence_anchor_records(self) -> tuple[dict[str, object], ...]:
+        """Return bounded top-level Evidence rows grouped by scope anchor."""
+        store = self.active_evidence_store()
+        if store is None:
+            return ()
+
+        def load() -> tuple[dict[str, object], ...]:
+            return tuple({
+                "id": anchor.id,
+                "label": anchor.label,
+                "kind": anchor.kind,
+                "scope": anchor.scope_status,
+                "rule_ids": anchor.rule_ids,
+                "assets": anchor.asset_count,
+                "hostnames": anchor.hostname_count,
+                "addresses": anchor.address_count,
+                "services": anchor.service_count,
+                "urls": anchor.url_count,
+                "other": anchor.other_count,
+                "findings": anchor.finding_count,
+                "sources": anchor.source_count,
+                "updated": anchor.last_seen_at,
+            } for anchor in store.list_evidence_anchors())
+
+        if self.search_query.strip():
+            return tuple({
+                "id": anchor.id,
+                "label": anchor.label,
+                "kind": anchor.kind,
+                "scope": anchor.scope_status,
+                "rule_ids": anchor.rule_ids,
+                "assets": anchor.asset_count,
+                "hostnames": anchor.hostname_count,
+                "addresses": anchor.address_count,
+                "services": anchor.service_count,
+                "urls": anchor.url_count,
+                "other": anchor.other_count,
+                "findings": anchor.finding_count,
+                "sources": anchor.source_count,
+                "updated": anchor.last_seen_at,
+            } for anchor in store.list_evidence_anchors(self.search_query))
+        return self._cached_project_records("evidence_anchors", store, load)
+
     def evidence_node_record(self, asset_id: str) -> dict[str, object]:
         """Load heavier Evidence inspector details only for the selected node."""
         store = self.active_evidence_store()
         if store is None:
             raise KeyError(asset_id)
         asset = store.get_asset(asset_id)
-        evidence = store.list_evidence(asset_id=asset.id)
-        relationships = store.list_relationships(asset.id)
+        evidence = store.list_evidence(asset_id=asset.id, limit=EVIDENCE_LINK_LIMIT)
+        links, relationship_count = store.list_evidence_asset_links(
+            asset.id, limit=EVIDENCE_LINK_LIMIT
+        )
         identifiers = [(asset.kind.value.upper(), asset.normalized_key)]
         identifiers.extend(
-            (related.kind.value.upper(), related.normalized_key)
-            for related in store.list_related_assets(asset.id)
+            (link.asset.kind.value.upper(), link.asset.normalized_key)
+            for link in links
         )
         return {
             "id": asset.id, "kind": asset.kind.value.upper(),
             "identifier": asset.display_name,
             "scope": "IN SCOPE" if asset.scope.value == "allowed" else "REVIEW REQUIRED",
             "scope_anchor": asset.matched_rule_id or "NO MATCHED RULE",
-            "relations": f"{len(relationships):02d}",
+            "relations": f"{relationship_count:02d}",
             "artifact_count": f"{len(evidence):02d}", "updated": asset.last_seen_at,
             "context": "Normalized evidence node with retained raw observations and provenance.",
             "identifiers": tuple(dict.fromkeys(identifiers)),
@@ -693,7 +752,7 @@ class DashboardUI:
             asyncio.create_task(self.refresh_module_health())
 
     # === START: PROJECT DIALOGS ===
-    # Thin NiceGUI forms; all filesystem work remains in blackwall_projects.
+    # Thin NiceGUI forms; all filesystem work remains in nullbound_projects.
     def render_project_dialogs(self) -> None:
         with ui.dialog().classes("project-dialog") as self.create_project_dialog:
             with ui.card().classes("project-modal"):
@@ -760,42 +819,28 @@ class DashboardUI:
                     with ui.element("button").classes("settings-close").props(
                         'type=button aria-label="Close add scope items" data-escape-close=true'
                     ).on("click", self.scope_add_dialog.close):
-                        ui.label("Ã—")
+                        ui.icon("close")
                 ui.label(
                     "One target per line. Supports domains, IPs, CIDRs, exact URLs, "
-                    "*.example.com, and https://*.example.com/* patterns."
+                    "*.example.com, and https://*.example.com/* patterns. Regex mode "
+                    "matches each complete normalized asset value."
                 ).classes("settings-section-copy scope-dialog-copy")
                 with ui.element("div").classes("settings-field"):
                     ui.label("TARGETS").classes("field-label")
                     self.scope_add_targets = ui.textarea(
                         placeholder="*.example.com\nhttps://*.example.com/*"
-                    ).props("dense outlined autogrow").classes("config-control")
-                with ui.element("div").classes("settings-field-grid scope-dialog-grid"):
-                    with ui.element("div").classes("settings-field"):
-                        ui.label("DECISION").classes("field-label")
-                        self.scope_add_decision = ui.select(
-                            {"allowed": "ALLOWED", "denied": "DENIED"}, value="allowed",
-                            on_change=self.set_scope_add_decision,
-                        ).props("dense outlined options-dense").classes("config-control")
-                    with ui.element("div").classes("settings-field"):
-                        ui.label("OWNERSHIP").classes("field-label")
-                        self.scope_add_ownership = ui.select(
-                            {
-                                "unknown": "UNKNOWN",
-                                "likely": "LIKELY",
-                                "confirmed": "CONFIRMED",
-                            },
-                            value="unknown",
-                        ).props("dense outlined options-dense").classes("config-control")
+                    ).props("dense outlined autogrow rows=3").classes(
+                        "config-control scope-targets-control"
+                    )
+                with ui.element("div").classes("settings-field scope-regex-field"):
+                    self.scope_add_regex = ui.checkbox(
+                        "REGEX MATCHING", value=False
+                    ).props("dense").classes("setting-check")
                 with ui.element("div").classes("settings-field"):
                     ui.label("NOTES").classes("field-label")
                     self.scope_add_notes = ui.input(
                         placeholder="Authorization reference or operator note"
                     ).props("dense outlined").classes("config-control")
-                with ui.element("div").classes("settings-field scope-review-field"):
-                    self.scope_add_review = ui.checkbox(
-                        "REQUIRE REVIEW", value=False
-                    ).props("dense").classes("setting-check")
                 with ui.element("div").classes("settings-actions"):
                     ui.button(
                         "ADD TO SCOPE", icon="add_task", on_click=self.add_manual_scope_rules
@@ -810,21 +855,9 @@ class DashboardUI:
             ui.notify("Open a project before adding scope items", type="warning")
             return
         self.scope_add_targets.value = ""
-        self.scope_add_decision.value = "allowed"
-        self.scope_add_ownership.value = "unknown"
+        self.scope_add_regex.value = False
         self.scope_add_notes.value = ""
-        self.scope_add_review.value = False
-        self.scope_add_review.enable()
         self.scope_add_dialog.open()
-
-    def set_scope_add_decision(self, event: events.ValueChangeEventArguments) -> None:
-        if not hasattr(self, "scope_add_review"):
-            return
-        if str(event.value) == "denied":
-            self.scope_add_review.value = False
-            self.scope_add_review.disable()
-        else:
-            self.scope_add_review.enable()
 
     def add_manual_scope_rules(self) -> None:
         project = self.active_project
@@ -839,11 +872,15 @@ class DashboardUI:
         try:
             if not values:
                 raise ScopeValidationError("enter at least one scope target")
+            regex_mode = bool(self.scope_add_regex.value)
             created = ScopeStore(project.path).add_rules(
-                tuple(Target.parse(value) for value in values),
-                scope_status=ScopeStatus(str(self.scope_add_decision.value)),
-                ownership_confidence=OwnershipConfidence(str(self.scope_add_ownership.value)),
-                review_required=bool(self.scope_add_review.value),
+                tuple(
+                    Target(TargetKind.REGEX, value) if regex_mode else Target.parse(value)
+                    for value in values
+                ),
+                scope_status=ScopeStatus.ALLOWED,
+                ownership_confidence=OwnershipConfidence.UNKNOWN,
+                review_required=False,
                 source="manual",
                 notes=str(self.scope_add_notes.value or "").strip(),
             )
@@ -936,7 +973,9 @@ class DashboardUI:
             evidence_store = EvidenceStore(key)
             self.evidence_stores[key] = evidence_store
         evidence_store.sync_scope(scope_store.load())
-        self._invalidate_project_record_cache("assets", "findings", "evidence", "scope")
+        self._invalidate_project_record_cache(
+            "assets", "findings", "evidence", "evidence_anchors", "scope"
+        )
         stat = scope_store.path.stat()
         self.evidence_scope_versions[key] = (stat.st_mtime_ns, stat.st_size)
 
@@ -1169,7 +1208,7 @@ class DashboardUI:
         if evidence_marker is None:
             return
         self._last_evidence_refresh = evidence_marker
-        self._invalidate_project_record_cache("assets", "findings", "evidence")
+        self._invalidate_project_record_cache("assets", "findings", "evidence", "evidence_anchors")
         if self.active_view == "assets" and hasattr(self, "assets_result_host"):
             self.refresh_asset_results()
             self.render_inspector()
@@ -1236,7 +1275,7 @@ class DashboardUI:
             '}'
         )
 
-    # Project-tab actions delegate persistence and validation to blackwall_projects.
+    # Project-tab actions delegate persistence and validation to nullbound_projects.
     def select_project(self, project_id: str) -> None:
         self.project_workspace.select(project_id)
         self.refresh_project_surfaces()
@@ -1409,7 +1448,7 @@ class DashboardUI:
             with ui.element("div").classes("brand"):
                 ui.image(FAVICON_DATA_URL).classes("brand-mark").props("fit=contain")
                 with ui.element("div").classes("brand-copy"):
-                    ui.label("BLACKWALL").classes("brand-title")
+                    ui.label("NULL//BOUND").classes("brand-title")
                     ui.label("RECON WORKSPACE").classes("brand-sub")
 
             ui.label("WORKSPACE").classes("rail-label")
@@ -1944,41 +1983,257 @@ class DashboardUI:
                 ui.label("NO ASSETS MATCH THE CURRENT FILTERS").classes("module-empty")
 
     def render_evidence_workspace(self) -> None:
-        records = self.evidence_node_records()
-        if records and self.selected_evidence_id not in {item["id"] for item in records}:
-            self.selected_evidence_id = str(records[0]["id"])
-        elif not records:
-            self.selected_evidence_id = None
-        self.render_record_workspace(
-            view_id="evidence", kicker="PROVENANCE / EVIDENCE", title="Evidence",
-            index=f"{len(records):02d} NODES",
-            filters=("ALL", "ASSETS", "VULNERABILITIES", "IDENTITIES", "DOMAINS", "URLS"), records=records,
-            columns=(("kind", "TYPE"), ("identifier", "IDENTIFIER"), ("scope_anchor", "SCOPE ANCHOR"),
-                     ("relations", "RELATED"), ("artifact_count", "ARTIFACTS"), ("updated", "UPDATED")),
-            selected_id=self.selected_evidence_id or "", tone_key="scope",
-            interactive_filters=True,
-        )
+        records = self.evidence_anchor_records()
+        ui.label("PROVENANCE / EVIDENCE").classes("section-kicker")
+        with ui.element("div").classes("title-row"):
+            ui.label("Evidence").classes("page-title")
+            self.evidence_index_label = ui.label("").classes("view-index")
+        with ui.element("div").classes("record-filters evidence-filters"):
+            ui.label("SCOPE-FIRST HIERARCHY").classes("filter-active")
+            ui.label("EXPAND ONE BRANCH AT A TIME")
+            self.render_record_pagination("evidence")
+        self.evidence_result_host = ui.element("section").classes("evidence-tree")
+        self.refresh_evidence_results(records)
 
-    def refresh_evidence_results(self) -> None:
-        """Refresh indexed Evidence rows without replacing filters or other UI state."""
+    def refresh_evidence_results(
+        self,
+        records: tuple[dict[str, object], ...] | None = None,
+    ) -> None:
+        """Refresh the bounded Evidence hierarchy while preserving expansion state."""
         if not hasattr(self, "evidence_result_host"):
             return
-        records = self.evidence_node_records()
+        records = records if records is not None else self.evidence_anchor_records()
         record_ids = {str(record["id"]) for record in records}
-        if self.selected_evidence_id not in record_ids:
-            self.selected_evidence_id = str(records[0]["id"]) if records else None
-        self._refresh_record_results(
-            view_id="evidence",
-            index=f"{len(records):02d} NODES",
-            records=records,
-            columns=(
-                ("kind", "TYPE"), ("identifier", "IDENTIFIER"),
-                ("scope_anchor", "SCOPE ANCHOR"), ("relations", "RELATED"),
-                ("artifact_count", "ARTIFACTS"), ("updated", "UPDATED"),
-            ),
-            selected_id=self.selected_evidence_id or "",
-            tone_key="scope",
+        if self.selected_evidence_anchor_id not in record_ids:
+            self.selected_evidence_anchor_id = str(records[0]["id"]) if records else None
+            self.selected_evidence_id = None
+        if self.expanded_evidence_anchor_id not in record_ids:
+            self.expanded_evidence_anchor_id = None
+            self.expanded_evidence_bucket = None
+            self.expanded_evidence_asset_id = None
+
+        page, page_index, page_count, start = self._record_page(
+            records, self.record_page_indexes["evidence"]
         )
+        self.record_page_indexes["evidence"] = page_index
+        end = start + len(page)
+        self.evidence_index_label.set_text(
+            f"{start + 1:,}-{end:,} / {len(records):,} ROOTS"
+            if records else "0 / 0 ROOTS"
+        )
+        self._update_record_pagination("evidence", page_index, page_count)
+
+        self.evidence_result_host.clear()
+        with self.evidence_result_host:
+            with ui.element("div").classes("evidence-anchor-row evidence-tree-header"):
+                ui.label("").classes("evidence-tree-toggle")
+                ui.label("SCOPE / ROOT").classes("evidence-tree-name")
+                ui.label("HOSTS").classes("evidence-tree-metric")
+                ui.label("IPS").classes("evidence-tree-metric")
+                ui.label("SERVICES").classes("evidence-tree-metric")
+                ui.label("FINDINGS").classes("evidence-tree-metric")
+                ui.label("SOURCES").classes("evidence-tree-metric")
+                ui.label("SEEN").classes("evidence-tree-seen")
+            for record in page:
+                anchor_id = str(record["id"])
+                expanded = anchor_id == self.expanded_evidence_anchor_id
+                selected = anchor_id == self.selected_evidence_anchor_id and not self.selected_evidence_id
+                tone = str(record["scope"]).lower()
+                classes = f"evidence-anchor-group tone-{tone}"
+                if expanded:
+                    classes += " expanded"
+                if selected:
+                    classes += " selected"
+                with ui.element("section").classes(classes):
+                    with ui.element("button").classes("evidence-anchor-row").props(
+                        f'type=button aria-label="{"Collapse" if expanded else "Expand"} evidence root {record["label"]}"'
+                    ).on("click", partial(self.toggle_evidence_anchor, anchor_id)):
+                        icon("expand_more" if expanded else "chevron_right", "evidence-tree-toggle")
+                        with ui.element("div").classes("evidence-tree-name"):
+                            ui.label(str(record["label"])).classes("evidence-anchor-name")
+                            rule_count = len(record["rule_ids"])
+                            ui.label(
+                                f"{record['kind']} / {record['scope']} / "
+                                f"{rule_count:02d} RULE{'S' if rule_count != 1 else ''}"
+                            ).classes("record-id")
+                        ui.label(f"{int(record['hostnames']):,}").classes("evidence-tree-metric")
+                        ui.label(f"{int(record['addresses']):,}").classes("evidence-tree-metric")
+                        ui.label(f"{int(record['services']):,}").classes("evidence-tree-metric")
+                        ui.label(f"{int(record['findings']):,}").classes("evidence-tree-metric")
+                        ui.label(f"{int(record['sources']):,}").classes("evidence-tree-metric")
+                        ui.label(str(record["updated"] or "—")).classes("evidence-tree-seen")
+                    if expanded:
+                        self._render_evidence_anchor_children(record)
+            if not page:
+                ui.label("NO EVIDENCE ROOTS MATCH THE CURRENT SEARCH").classes("module-empty")
+
+    def toggle_evidence_anchor(self, anchor_id: str) -> None:
+        if self.expanded_evidence_anchor_id == anchor_id:
+            self.expanded_evidence_anchor_id = None
+            self.expanded_evidence_bucket = None
+            self.expanded_evidence_asset_id = None
+        else:
+            self.expanded_evidence_anchor_id = anchor_id
+            record = next(
+                item for item in self.evidence_anchor_records() if item["id"] == anchor_id
+            )
+            self.expanded_evidence_bucket = next(
+                (key for key, _label, _icon in EVIDENCE_BUCKETS if int(record[key]) > 0),
+                None,
+            )
+            self.expanded_evidence_asset_id = None
+            self.evidence_bucket_page_index = 0
+        self.selected_evidence_anchor_id = anchor_id
+        self.selected_evidence_id = None
+        self.refresh_evidence_results()
+        self.render_inspector()
+
+    def toggle_evidence_bucket(self, anchor_id: str, category: str) -> None:
+        self.expanded_evidence_anchor_id = anchor_id
+        self.expanded_evidence_bucket = None if self.expanded_evidence_bucket == category else category
+        self.expanded_evidence_asset_id = None
+        self.evidence_bucket_page_index = 0
+        self.refresh_evidence_results()
+
+    def change_evidence_bucket_page(self, delta: int) -> None:
+        self.evidence_bucket_page_index = max(0, self.evidence_bucket_page_index + delta)
+        self.expanded_evidence_asset_id = None
+        self.refresh_evidence_results()
+
+    def select_evidence_asset(self, asset_id: str) -> None:
+        previous_id = self.selected_evidence_id
+        self.selected_evidence_id = asset_id
+        self._update_selected_row("evidence_assets", previous_id, asset_id)
+        if self.inspector_collapsed:
+            self.inspector_collapsed = False
+            self.update_inspector_layout()
+        self.render_inspector()
+
+    def toggle_evidence_asset_links(self, asset_id: str) -> None:
+        self.selected_evidence_id = asset_id
+        self.expanded_evidence_asset_id = (
+            None if self.expanded_evidence_asset_id == asset_id else asset_id
+        )
+        self.refresh_evidence_results()
+        self.render_inspector()
+
+    def _render_evidence_anchor_children(self, record: dict[str, object]) -> None:
+        anchor_id = str(record["id"])
+        if not int(record["assets"]):
+            ui.label("NO ASSETS OBSERVED FOR THIS SCOPE ROOT").classes("evidence-tree-empty")
+            return
+        with ui.element("div").classes("evidence-buckets"):
+            for category, label, icon_name in EVIDENCE_BUCKETS:
+                count = int(record[category])
+                if not count:
+                    continue
+                active = category == self.expanded_evidence_bucket
+                with ui.element("button").classes(
+                    "evidence-bucket active" if active else "evidence-bucket"
+                ).props(f'type=button aria-label="Open {label.lower()}"').on(
+                    "click", partial(self.toggle_evidence_bucket, anchor_id, category)
+                ):
+                    icon(icon_name)
+                    ui.label(label)
+                    ui.label(f"{count:,}").classes("evidence-bucket-count")
+        category = self.expanded_evidence_bucket
+        if category is None:
+            return
+        store = self.active_evidence_store()
+        if store is None:
+            return
+        offset = self.evidence_bucket_page_index * EVIDENCE_CHILD_PAGE_SIZE
+        assets, total = store.list_evidence_anchor_assets(
+            anchor_id,
+            category,
+            query=self.search_query,
+            limit=EVIDENCE_CHILD_PAGE_SIZE,
+            offset=offset,
+        )
+        page_count = max(1, (total + EVIDENCE_CHILD_PAGE_SIZE - 1) // EVIDENCE_CHILD_PAGE_SIZE)
+        page_index = min(self.evidence_bucket_page_index, page_count - 1)
+        if page_index != self.evidence_bucket_page_index:
+            self.evidence_bucket_page_index = page_index
+            assets, total = store.list_evidence_anchor_assets(
+                anchor_id,
+                category,
+                query=self.search_query,
+                limit=EVIDENCE_CHILD_PAGE_SIZE,
+                offset=page_index * EVIDENCE_CHILD_PAGE_SIZE,
+            )
+        row_elements: dict[str, object] = {}
+        with ui.element("div").classes("evidence-asset-list"):
+            for summary in assets:
+                asset = summary.asset
+                selected = asset.id == self.selected_evidence_id
+                expanded = asset.id == self.expanded_evidence_asset_id
+                with ui.element("div").classes(
+                    "evidence-asset-branch selected" if selected else "evidence-asset-branch"
+                ) as row:
+                    row_elements[asset.id] = row
+                    with ui.element("div").classes("evidence-asset-row"):
+                        expand_button = ui.button(
+                            icon="expand_more" if expanded else "chevron_right",
+                            on_click=partial(self.toggle_evidence_asset_links, asset.id),
+                        ).props("flat dense aria-label=Expand-related-assets").classes(
+                            "evidence-asset-expand"
+                        )
+                        if not summary.relationship_count:
+                            expand_button.disable()
+                        with ui.element("button").classes("evidence-asset-select").props(
+                            f'type=button aria-label="Open evidence for {asset.display_name}"'
+                        ).on("click", partial(self.select_evidence_asset, asset.id)):
+                            ui.label(asset.kind.value.upper()).classes("evidence-asset-kind")
+                            with ui.element("div").classes("evidence-asset-copy"):
+                                ui.label(asset.display_name).classes("evidence-asset-name")
+                                ui.label(asset.id).classes("record-id")
+                            ui.label(f"{summary.evidence_count:02d} EVIDENCE").classes("evidence-asset-stat")
+                            ui.label(f"{summary.relationship_count:02d} LINKS").classes("evidence-asset-stat")
+                            ui.label(f"{summary.finding_count:02d} FINDINGS").classes("evidence-asset-stat")
+                    if expanded:
+                        self._render_evidence_asset_links(asset.id)
+            if not assets:
+                ui.label("NO ASSETS IN THIS GROUP MATCH THE CURRENT SEARCH").classes(
+                    "evidence-tree-empty"
+                )
+        rows = getattr(self, "_row_elements", {})
+        rows["evidence_assets"] = row_elements
+        self._row_elements = rows
+        if total > EVIDENCE_CHILD_PAGE_SIZE:
+            with ui.element("div").classes("evidence-child-pagination"):
+                previous = ui.button(
+                    icon="chevron_left", on_click=partial(self.change_evidence_bucket_page, -1)
+                ).props("flat dense aria-label=Previous-evidence-assets").classes("asset-page-button")
+                if not page_index:
+                    previous.disable()
+                ui.label(f"PAGE {page_index + 1:02d} / {page_count:02d} · {total:,} ITEMS").classes(
+                    "asset-page-label evidence-child-page-label"
+                )
+                following = ui.button(
+                    icon="chevron_right", on_click=partial(self.change_evidence_bucket_page, 1)
+                ).props("flat dense aria-label=Next-evidence-assets").classes("asset-page-button")
+                if page_index + 1 >= page_count:
+                    following.disable()
+
+    def _render_evidence_asset_links(self, asset_id: str) -> None:
+        store = self.active_evidence_store()
+        if store is None:
+            return
+        links, total = store.list_evidence_asset_links(asset_id, limit=EVIDENCE_LINK_LIMIT)
+        with ui.element("div").classes("evidence-linked-assets"):
+            for link in links:
+                with ui.element("button").classes("evidence-linked-row").props(
+                    f'type=button aria-label="Open linked asset {link.asset.display_name}"'
+                ).on("click", partial(self.select_evidence_asset, link.asset.id)):
+                    ui.label("↳").classes("evidence-link-glyph")
+                    ui.label(link.relation.replace("_", " ").upper()).classes("evidence-link-relation")
+                    ui.label(link.asset.kind.value.upper()).classes("evidence-linked-kind")
+                    ui.label(link.asset.display_name).classes("evidence-linked-name")
+                    ui.label(link.confidence.upper()).classes("evidence-link-confidence")
+            if total > len(links):
+                ui.label(f"{total - len(links):,} ADDITIONAL LINKS NOT SHOWN").classes(
+                    "evidence-tree-limit"
+                )
 
     def render_scope_workspace(self) -> None:
         records = self.scope_records()
@@ -2266,17 +2521,26 @@ class DashboardUI:
             return
         if self.active_view == "evidence":
             with self.inspector:
-                visible_sets = getattr(self, "_visible_record_sets", {})
-                records = (
-                    visible_sets["evidence"]
-                    if "evidence" in visible_sets else self.evidence_node_records()
+                if self.selected_evidence_id:
+                    try:
+                        record = self.evidence_node_record(self.selected_evidence_id)
+                    except KeyError:
+                        self.selected_evidence_id = None
+                    else:
+                        self.render_evidence_inspector(record)
+                        return
+                records = self.evidence_anchor_records()
+                record = next(
+                    (
+                        item for item in records
+                        if item["id"] == self.selected_evidence_anchor_id
+                    ),
+                    records[0] if records else None,
                 )
-                if not records:
+                if record is None:
                     self.render_empty_inspector("Evidence")
                     return
-                record_id = self.selected_evidence_id or str(records[0]["id"])
-                record = self.evidence_node_record(record_id)
-                self.render_evidence_inspector(record)
+                self.render_evidence_anchor_inspector(record)
             return
         if self.active_view == "scope":
             with self.inspector:
@@ -2497,8 +2761,48 @@ class DashboardUI:
                     ui.label(label).classes("field-label")
                     ui.label(value).classes("finding-detail-copy")
 
+    def render_evidence_anchor_inspector(self, record: dict[str, object]) -> None:
+        """Show a compact summary for the selected scope-derived Evidence root."""
+        with ui.element("div").classes("inspector-header evidence-inspector-header"):
+            with ui.element("button").classes("inspector-toggle").props(
+                f'type=button aria-label="{"Expand" if self.inspector_collapsed else "Collapse"} evidence details"'
+            ).on("click", self.toggle_inspector_collapsed):
+                icon("chevron_left" if self.inspector_collapsed else "chevron_right")
+            with ui.element("div").classes("inspector-header-copy"):
+                ui.label(f"EVIDENCE ROOT / {record['id']}").classes("panel-number")
+                ui.label(str(record["label"])).classes("panel-title evidence-panel-title")
+                ui.label(f"{record['kind']} / {record['scope']}").classes(
+                    f"panel-tool record-tone tone-{str(record['scope']).lower()}"
+                )
+        if self.inspector_collapsed:
+            return
+        with ui.element("div").classes("inspector-body evidence-detail"):
+            ui.label("SCOPE ANCHOR SUMMARY").classes("field-label")
+            with ui.element("div").classes("evidence-root-summary"):
+                for label, value in (
+                    ("ASSETS", record["assets"]),
+                    ("HOSTNAMES", record["hostnames"]),
+                    ("ADDRESSES", record["addresses"]),
+                    ("SERVICES", record["services"]),
+                    ("URLS", record["urls"]),
+                    ("FINDINGS", record["findings"]),
+                    ("SOURCES", record["sources"]),
+                    ("LAST SEEN", record["updated"] or "—"),
+                ):
+                    with ui.element("div").classes("evidence-root-stat"):
+                        ui.label(label).classes("finding-detail-label")
+                        ui.label(str(value)).classes("finding-detail-value")
+            ui.label("SCOPE RULES").classes("field-label evidence-subheading")
+            with ui.element("div").classes("evidence-identifiers"):
+                for rule_id in record["rule_ids"]:
+                    with ui.element("div").classes("evidence-identifier"):
+                        ui.label("RULE").classes("evidence-identifier-type")
+                        ui.label(str(rule_id)).classes("evidence-identifier-value")
+                if not record["rule_ids"]:
+                    ui.label("Assets without a matching scope rule.").classes("evidence-context")
+
     def render_evidence_inspector(self, record: dict[str, object]) -> None:
-        """Show the identifiers and artifacts connected to one in-scope evidence node."""
+        """Show a bounded set of identifiers and observations for one asset."""
         with ui.element("div").classes("inspector-header evidence-inspector-header"):
             with ui.element("button").classes("inspector-toggle").props(
                 f'type=button aria-label="{"Expand evidence details" if self.inspector_collapsed else "Collapse evidence details"}"'
@@ -2514,9 +2818,9 @@ class DashboardUI:
 
         with ui.element("div").classes("inspector-body evidence-detail"):
             with ui.element("div").classes("evidence-scope-banner"):
-                icon("gpp_good")
+                icon("gpp_good" if record["scope"] == "IN SCOPE" else "help_outline")
                 with ui.element("div"):
-                    ui.label("IN SCOPE").classes("evidence-scope-state")
+                    ui.label(str(record["scope"])).classes("evidence-scope-state")
                     ui.label(f"ANCHOR / {record['scope_anchor']}").classes("evidence-scope-anchor")
 
             ui.label(str(record["context"])).classes("evidence-context")
@@ -2529,8 +2833,8 @@ class DashboardUI:
                         ui.label(value).classes("evidence-identifier-value")
 
             with ui.element("div").classes("evidence-artifact-heading"):
-                ui.label("RELATED ARTIFACTS").classes("field-label")
-                ui.label(f"{len(record['artifacts']):02d} RECORDS").classes("settings-meta")
+                ui.label("LATEST EVIDENCE").classes("field-label")
+                ui.label(f"UP TO {EVIDENCE_LINK_LIMIT:02d} RECORDS").classes("settings-meta")
             with ui.element("div").classes("evidence-artifacts"):
                 for artifact_type, artifact_id, name, source, integrity in record["artifacts"]:
                     with ui.element("button").classes("evidence-artifact").props(
@@ -2616,7 +2920,7 @@ class DashboardUI:
             with ui.card().classes("settings-modal"):
                 with ui.element("header").classes("settings-header"):
                     with ui.element("div"):
-                        ui.label("BLACKWALL / CONTROL PLANE").classes("section-kicker")
+                        ui.label("NULL//BOUND / CONTROL PLANE").classes("section-kicker")
                         ui.label("Settings").classes("settings-title")
                     with ui.element("button").classes("settings-close").props(
                         'type=button aria-label="Close settings" data-escape-close=true'
@@ -2776,7 +3080,7 @@ class DashboardUI:
             self.render_setting_field("BYPASS TARGETS", "localhost, 127.0.0.1, ::1")
             ui.label(
                 "Proxy capability is adapter-specific. Raw sockets, DNS clients, and some scanners may not support "
-                "HTTP or SOCKS routing; Blackwall must never imply that unsupported traffic is proxied."
+                "HTTP or SOCKS routing; NullBound must never imply that unsupported traffic is proxied."
             ).classes("settings-note warning")
 
     # === START: MODULE SETTINGS ===
@@ -2906,7 +3210,7 @@ class DashboardUI:
     def delete_settings_module(self, module_id: str) -> None:
         try:
             if len(self.module_catalog) <= 1:
-                raise ValueError("Blackwall requires at least one module")
+                raise ValueError("NullBound requires at least one module")
             self.module_catalog.remove_module(module_id)
             self.module_catalog.save()
         except (OSError, ValueError) as error:
@@ -3057,7 +3361,7 @@ class DashboardUI:
                     ui.element("span").classes("swatch structure")
                     ui.element("span").classes("swatch interactive")
                 with ui.element("div"):
-                    ui.label("BLACKWALL DEFAULT").classes("settings-project-name")
+                    ui.label("NULLBOUND DEFAULT").classes("settings-project-name")
                     ui.label("VOID / STRUCTURE RED / INTERACTIVE BLUE").classes("settings-meta")
                 icon("check")
 
@@ -3184,7 +3488,7 @@ class DashboardUI:
             if output_truncated:
                 output_lines.insert(
                     0,
-                    f"[BLACKWALL] OUTPUT TRUNCATED — SHOWING LAST {CONSOLE_MAX_LINES:,} LINES",
+                    f"[NULLBOUND] OUTPUT TRUNCATED — SHOWING LAST {CONSOLE_MAX_LINES:,} LINES",
                 )
             with self.run_output:
                 self.run_output_content = ui.label("\n".join(output_lines)).classes(

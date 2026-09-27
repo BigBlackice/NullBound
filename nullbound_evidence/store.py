@@ -10,12 +10,15 @@ from pathlib import Path, PurePosixPath
 import sqlite3
 from uuid import uuid4
 
-from blackwall_scope import ScopeDocument, Target, TargetKind, evaluate_target
+from nullbound_scope import ScopeDocument, Target, TargetKind, evaluate_target
 
 from .database import ProjectDatabase
 from .models import (
     AssetKind,
     AssetRecord,
+    EvidenceAnchorSummary,
+    EvidenceAssetLink,
+    EvidenceAssetSummary,
     EvidenceKind,
     EvidenceRecord,
     FindingRecord,
@@ -483,6 +486,273 @@ class EvidenceStore:
             for asset_id, count in relationship_counts.items()
         }
 
+    @staticmethod
+    def _evidence_anchor_identity(rule: dict[str, object]) -> tuple[str, str, str]:
+        """Return a stable grouping key, display label, and visible anchor kind."""
+        target_kind = str(rule["target_kind"])
+        target = str(rule["normalized_target"])
+        if target_kind == "domain":
+            label = target.removeprefix("*.")
+            key = f"domain:{label}"
+            return stable_id("EA", key), label, "ROOT DOMAIN"
+        if target_kind == "regex":
+            return stable_id("EA", f"regex:{rule['id']}"), target, "REGEX"
+        return stable_id("EA", f"{target_kind}:{target}"), target, target_kind.upper()
+
+    def _evidence_anchor_groups(self) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
+        groups: dict[str, dict[str, object]] = {}
+        rule_to_anchor: dict[str, str] = {}
+        for rule in self.list_scope_rules():
+            anchor_id, label, kind = self._evidence_anchor_identity(rule)
+            group = groups.setdefault(anchor_id, {
+                "id": anchor_id,
+                "label": label,
+                "kind": kind,
+                "rules": [],
+            })
+            group["rules"].append(rule)  # type: ignore[union-attr]
+            rule_to_anchor[str(rule["id"])] = anchor_id
+        return groups, rule_to_anchor
+
+    @staticmethod
+    def _evidence_category(kind: str) -> str:
+        if kind in {"domain", "host"}:
+            return "hostnames"
+        if kind in {"ipv4", "ipv6", "cidr"}:
+            return "addresses"
+        if kind == "service":
+            return "services"
+        if kind == "url":
+            return "urls"
+        return "other"
+
+    def list_evidence_anchors(self, query: str = "") -> tuple[EvidenceAnchorSummary, ...]:
+        """Return compact scope-root summaries without materializing asset rows."""
+        groups, rule_to_anchor = self._evidence_anchor_groups()
+        unmatched_id = "EA-UNMATCHED"
+        counts: dict[str, dict[str, object]] = {}
+        source_sets: dict[str, set[str]] = {}
+        finding_counts: dict[str, int] = {}
+
+        with self.database.read() as connection:
+            asset_rows = connection.execute(
+                """SELECT matched_rule_id, kind, COUNT(*) AS count,
+                          MAX(last_seen_at) AS last_seen_at
+                   FROM assets WHERE scope_disposition != 'denied'
+                   GROUP BY matched_rule_id, kind"""
+            ).fetchall()
+            source_rows = connection.execute(
+                """SELECT DISTINCT a.matched_rule_id, e.source
+                   FROM evidence_records e JOIN assets a ON a.id = e.asset_id
+                   WHERE a.scope_disposition != 'denied'"""
+            ).fetchall()
+            finding_rows = connection.execute(
+                """SELECT a.matched_rule_id, COUNT(DISTINCT f.id) AS count
+                   FROM findings f JOIN assets a ON a.id = f.asset_id
+                   WHERE a.scope_disposition != 'denied'
+                   GROUP BY a.matched_rule_id"""
+            ).fetchall()
+            matching_rule_ids: set[str | None] | None = None
+            needle = query.strip()
+            if needle:
+                like = f"%{needle}%"
+                matching_rows = connection.execute(
+                    """SELECT DISTINCT a.matched_rule_id
+                       FROM assets a LEFT JOIN evidence_records e ON e.asset_id = a.id
+                       WHERE a.scope_disposition != 'denied' AND (
+                           a.display_name LIKE ? OR a.normalized_key LIKE ? OR a.kind LIKE ?
+                           OR e.raw_value LIKE ? OR e.source LIKE ?
+                       )""",
+                    (like, like, like, like, like),
+                ).fetchall()
+                matching_rule_ids = {
+                    str(row["matched_rule_id"]) if row["matched_rule_id"] is not None else None
+                    for row in matching_rows
+                }
+
+        def anchor_for(rule_id: object) -> str:
+            return rule_to_anchor.get(str(rule_id), unmatched_id) if rule_id else unmatched_id
+
+        for row in asset_rows:
+            anchor_id = anchor_for(row["matched_rule_id"])
+            summary = counts.setdefault(anchor_id, {
+                "assets": 0, "hostnames": 0, "addresses": 0, "services": 0,
+                "urls": 0, "other": 0, "last_seen": "",
+            })
+            amount = int(row["count"])
+            summary["assets"] = int(summary["assets"]) + amount
+            category = self._evidence_category(str(row["kind"]))
+            summary[category] = int(summary[category]) + amount
+            summary["last_seen"] = max(str(summary["last_seen"]), str(row["last_seen_at"] or ""))
+
+        for row in source_rows:
+            source_sets.setdefault(anchor_for(row["matched_rule_id"]), set()).add(str(row["source"]))
+        for row in finding_rows:
+            anchor_id = anchor_for(row["matched_rule_id"])
+            finding_counts[anchor_id] = finding_counts.get(anchor_id, 0) + int(row["count"])
+
+        if unmatched_id in counts:
+            groups[unmatched_id] = {
+                "id": unmatched_id,
+                "label": "Unmatched discoveries",
+                "kind": "UNMATCHED",
+                "rules": [],
+            }
+
+        query_folded = query.strip().casefold()
+        summaries: list[EvidenceAnchorSummary] = []
+        for anchor_id, group in groups.items():
+            rules = tuple(sorted(group["rules"], key=lambda rule: str(rule["id"])))
+            rule_ids = tuple(str(rule["id"]) for rule in rules)
+            if query_folded:
+                anchor_matches = query_folded in " ".join((
+                    str(group["label"]), str(group["kind"]), *rule_ids,
+                    *(str(rule["original_target"]) for rule in rules),
+                )).casefold()
+                asset_matches = matching_rule_ids is not None and (
+                    (None in matching_rule_ids and anchor_id == unmatched_id)
+                    or any(rule_id in matching_rule_ids for rule_id in rule_ids)
+                )
+                if not anchor_matches and not asset_matches:
+                    continue
+            metrics = counts.get(anchor_id, {})
+            scope_status = "UNMATCHED"
+            if rules:
+                if any(str(rule["scope_status"]) == "denied" for rule in rules):
+                    scope_status = "DENIED"
+                elif any(bool(rule["review_required"]) for rule in rules):
+                    scope_status = "REVIEW"
+                else:
+                    scope_status = "ALLOWED"
+            summaries.append(EvidenceAnchorSummary(
+                id=anchor_id,
+                label=str(group["label"]),
+                kind=str(group["kind"]),
+                scope_status=scope_status,
+                rule_ids=rule_ids,
+                asset_count=int(metrics.get("assets", 0)),
+                hostname_count=int(metrics.get("hostnames", 0)),
+                address_count=int(metrics.get("addresses", 0)),
+                service_count=int(metrics.get("services", 0)),
+                url_count=int(metrics.get("urls", 0)),
+                other_count=int(metrics.get("other", 0)),
+                finding_count=finding_counts.get(anchor_id, 0),
+                source_count=len(source_sets.get(anchor_id, set())),
+                last_seen_at=str(metrics.get("last_seen", "")),
+            ))
+        return tuple(sorted(
+            summaries,
+            key=lambda item: (item.kind == "UNMATCHED", item.kind == "REGEX", item.label.casefold()),
+        ))
+
+    def _evidence_anchor_rule_ids(self, anchor_id: str) -> tuple[str, ...] | None:
+        if anchor_id == "EA-UNMATCHED":
+            return None
+        groups, _ = self._evidence_anchor_groups()
+        group = groups.get(anchor_id)
+        if group is None:
+            raise KeyError(anchor_id)
+        return tuple(str(rule["id"]) for rule in group["rules"])
+
+    def list_evidence_anchor_assets(
+        self,
+        anchor_id: str,
+        category: str,
+        *,
+        query: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[tuple[EvidenceAssetSummary, ...], int]:
+        """Load one bounded hierarchy bucket for an expanded Evidence anchor."""
+        categories = {
+            "hostnames": ("domain", "host"),
+            "addresses": ("ipv4", "ipv6", "cidr"),
+            "services": ("service",),
+            "urls": ("url",),
+            "other": ("email", "username", "organization", "autonomous_system", "technology"),
+        }
+        if category not in categories:
+            raise ValueError(f"unknown evidence category: {category}")
+        limit = min(max(int(limit), 1), 50)
+        offset = max(int(offset), 0)
+        rule_ids = self._evidence_anchor_rule_ids(anchor_id)
+        conditions = ["a.scope_disposition != 'denied'"]
+        values: list[object] = []
+        if rule_ids is None:
+            conditions.append("a.matched_rule_id IS NULL")
+        else:
+            placeholders = ", ".join("?" for _ in rule_ids)
+            conditions.append(f"a.matched_rule_id IN ({placeholders})")
+            values.extend(rule_ids)
+        kind_placeholders = ", ".join("?" for _ in categories[category])
+        conditions.append(f"a.kind IN ({kind_placeholders})")
+        values.extend(categories[category])
+        if query.strip():
+            needle = f"%{query.strip()}%"
+            conditions.append("(a.display_name LIKE ? OR a.normalized_key LIKE ? OR a.kind LIKE ?)")
+            values.extend((needle, needle, needle))
+        where = " AND ".join(conditions)
+        with self.database.read() as connection:
+            total = int(connection.execute(
+                f"SELECT COUNT(*) FROM assets a WHERE {where}", values
+            ).fetchone()[0])
+            rows = connection.execute(
+                f"""SELECT a.*,
+                       (SELECT COUNT(*) FROM evidence_records e WHERE e.asset_id = a.id) AS evidence_count,
+                       (SELECT COUNT(*) FROM relationships r
+                        WHERE (r.source_type = 'asset' AND r.source_id = a.id
+                               AND r.target_type = 'asset')
+                           OR (r.target_type = 'asset' AND r.target_id = a.id
+                               AND r.source_type = 'asset')) AS relationship_count,
+                       (SELECT COUNT(*) FROM findings f WHERE f.asset_id = a.id) AS finding_count
+                    FROM assets a WHERE {where}
+                    ORDER BY CASE a.kind
+                        WHEN 'domain' THEN 0 WHEN 'host' THEN 1 WHEN 'ipv4' THEN 2
+                        WHEN 'ipv6' THEN 3 WHEN 'cidr' THEN 4 WHEN 'service' THEN 5
+                        WHEN 'url' THEN 6 ELSE 7 END,
+                        a.display_name COLLATE NOCASE, a.id
+                    LIMIT ? OFFSET ?""",
+                (*values, limit, offset),
+            ).fetchall()
+        return tuple(EvidenceAssetSummary(
+            asset=self._asset(row),
+            evidence_count=int(row["evidence_count"]),
+            relationship_count=int(row["relationship_count"]),
+            finding_count=int(row["finding_count"]),
+        ) for row in rows), total
+
+    def list_evidence_asset_links(
+        self,
+        asset_id: str,
+        *,
+        limit: int = 25,
+    ) -> tuple[tuple[EvidenceAssetLink, ...], int]:
+        """Load a bounded set of direct asset links for one expanded hierarchy row."""
+        limit = min(max(int(limit), 1), 25)
+        link_query = """SELECT r.relation, r.confidence, a.*
+            FROM relationships r
+            JOIN assets a ON a.id = CASE
+                WHEN r.source_type = 'asset' AND r.source_id = ? THEN r.target_id
+                WHEN r.target_type = 'asset' AND r.target_id = ? THEN r.source_id
+            END
+            WHERE ((r.source_type = 'asset' AND r.source_id = ? AND r.target_type = 'asset')
+                OR (r.target_type = 'asset' AND r.target_id = ? AND r.source_type = 'asset'))
+              AND a.scope_disposition != 'denied'"""
+        values = (asset_id, asset_id, asset_id, asset_id)
+        with self.database.read() as connection:
+            total = int(connection.execute(
+                f"SELECT COUNT(*) FROM ({link_query})", values
+            ).fetchone()[0])
+            rows = connection.execute(
+                link_query + " ORDER BY r.created_at DESC, a.display_name COLLATE NOCASE LIMIT ?",
+                (*values, limit),
+            ).fetchall()
+        return tuple(EvidenceAssetLink(
+            relation=str(row["relation"]),
+            confidence=str(row["confidence"]),
+            asset=self._asset(row),
+        ) for row in rows), total
+
     def list_related_assets(
         self,
         object_id: str,
@@ -576,6 +846,7 @@ class EvidenceStore:
         *,
         asset_id: str | None = None,
         include_denied: bool = False,
+        limit: int | None = None,
     ) -> tuple[EvidenceRecord, ...]:
         conditions: list[str] = []
         values: list[object] = []
@@ -585,11 +856,15 @@ class EvidenceStore:
         if not include_denied:
             conditions.append("(a.scope_disposition IS NULL OR a.scope_disposition != 'denied')")
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            values.append(min(max(int(limit), 1), 100))
         with self.database.read() as connection:
             rows = connection.execute(
                 """SELECT e.* FROM evidence_records e
                    LEFT JOIN assets a ON a.id = e.asset_id"""
-                + where + " ORDER BY e.observed_at DESC, e.id",
+                + where + " ORDER BY e.observed_at DESC, e.id" + limit_sql,
                 values,
             ).fetchall()
         return tuple(self._evidence(row) for row in rows)

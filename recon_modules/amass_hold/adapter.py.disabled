@@ -3,8 +3,8 @@
 from pathlib import Path
 import sqlite3
 
-from blackwall_execution.adapters import DeclarativeAdapter
-from blackwall_execution.models import CommandSpec, CompanionProcessSpec, RunRequest
+from nullbound_execution.adapters import DeclarativeAdapter
+from nullbound_execution.models import CommandSpec, CompanionProcessSpec, RunRequest
 
 
 class AmassAdapter(DeclarativeAdapter):

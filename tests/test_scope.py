@@ -1,4 +1,4 @@
-"""Tests for Blackwall's UI-independent target and scope foundation."""
+"""Tests for NullBound's UI-independent target and scope foundation."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from blackwall_scope import (
+from nullbound_scope import (
     ExecutionContext,
     OwnershipConfidence,
     SCOPE_KIND,
@@ -41,6 +41,12 @@ class TargetTests(unittest.TestCase):
     def test_invalid_target_is_rejected(self) -> None:
         with self.assertRaises(ScopeValidationError):
             Target(TargetKind.URL, "ftp://example.com/file")
+
+    def test_invalid_or_excessive_regex_scope_pattern_is_rejected(self) -> None:
+        with self.assertRaises(ScopeValidationError):
+            Target(TargetKind.REGEX, "(unclosed")
+        with self.assertRaises(ScopeValidationError):
+            Target(TargetKind.REGEX, "x" * 513)
 
 
 class ScopeEvaluationTests(unittest.TestCase):
@@ -109,6 +115,23 @@ class ScopeEvaluationTests(unittest.TestCase):
         ).matched)
         self.assertFalse(evaluate_target(
             Target.parse("https://portal.example.com/admin/"), (rule,), enforce=False
+        ).matched)
+
+    def test_regex_rule_matches_complete_normalized_asset_values(self) -> None:
+        rule = ScopeRule(
+            id="SC-0011",
+            target=Target(TargetKind.REGEX, r"(?:[a-z0-9-]+\.)+example\.com"),
+            scope_status=ScopeStatus.ALLOWED,
+        )
+
+        self.assertTrue(evaluate_target(
+            Target.parse("Portal.Example.com."), (rule,), enforce=False
+        ).matched)
+        self.assertFalse(evaluate_target(
+            Target.parse("example.com"), (rule,), enforce=False
+        ).matched)
+        self.assertFalse(evaluate_target(
+            Target.parse("portal.example.com.evil.test"), (rule,), enforce=False
         ).matched)
 
 
@@ -185,6 +208,17 @@ class ScopeStoreTests(unittest.TestCase):
         rules = self.store.load().rules
         self.assertEqual(len(rules), 2)
         self.assertEqual(rules[0].scope_status, ScopeStatus.DENIED)
+
+    def test_regex_rules_round_trip_through_portable_scope_storage(self) -> None:
+        pattern = r"https://(?:[a-z0-9-]+\.)+example\.com/.*"
+        created = self.store.add_rule(
+            target=Target(TargetKind.REGEX, pattern),
+            scope_status=ScopeStatus.ALLOWED,
+        )
+
+        loaded = next(rule for rule in self.store.load().rules if rule.id == created.id)
+        self.assertEqual(loaded.target.kind, TargetKind.REGEX)
+        self.assertEqual(loaded.target.normalized, pattern)
 
     def test_saved_document_is_versioned_and_portable(self) -> None:
         self.store.add_target_set("Direct", (Target.parse("example.com"),))

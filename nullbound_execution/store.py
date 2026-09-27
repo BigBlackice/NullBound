@@ -26,16 +26,16 @@ RUN_MANIFEST_NAME = "run.json"
 
 
 def default_runs_root(home: Path | None = None) -> Path:
-    return (home or Path.home()).expanduser() / ".blackwall" / "runs"
+    return (home or Path.home()).expanduser() / ".nullbound" / "runs"
 
 
 class RunStore:
     """Create and discover self-contained run records."""
 
     def __init__(self, standalone_root: Path | None = None) -> None:
-        # Unattached runs intentionally live only for this Blackwall process.
+        # Unattached runs intentionally live only for this NullBound process.
         # An explicit root remains available for tests and embedding.
-        self._temporary_directory = TemporaryDirectory(prefix="blackwall-runs-") if standalone_root is None else None
+        self._temporary_directory = TemporaryDirectory(prefix="nullbound-runs-") if standalone_root is None else None
         root = Path(self._temporary_directory.name) if self._temporary_directory else standalone_root
         self.standalone_root = Path(root).expanduser().resolve(False)
         self._manifest_cache: dict[Path, tuple[tuple[int, int], RunManifest]] = {}
@@ -205,7 +205,7 @@ class RunStore:
             recovered.append(self.save(manifest.evolve(
                 state=RunState.FAILED,
                 finished_at=utc_now(),
-                error="Blackwall stopped before the run completed",
+                error="NullBound stopped before the run completed",
             )))
         return tuple(recovered)
 

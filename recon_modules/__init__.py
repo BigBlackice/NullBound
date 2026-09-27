@@ -13,7 +13,7 @@ FAVICON_DATA_URL = f"data:image/svg+xml;base64,{b64encode(FAVICON_SVG.encode()).
 
 
 def load_default_catalog() -> ModuleCatalog:
-    """Load the catalog shipped with Blackwall."""
+    """Load the catalog shipped with NullBound."""
     return ModuleCatalog.load(DEFAULT_CATALOG_PATH)
 
 

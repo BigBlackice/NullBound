@@ -11,7 +11,7 @@ from uuid import uuid4
 from .models import Project
 
 
-WORKSPACE_SESSION_KIND: Final = "blackwall-workspace-session"
+WORKSPACE_SESSION_KIND: Final = "nullbound-workspace-session"
 WORKSPACE_SESSION_SCHEMA_VERSION: Final = 1
 WORKSPACE_SESSION_NAME: Final = "workspace.json"
 

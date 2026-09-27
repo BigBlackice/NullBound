@@ -138,7 +138,7 @@ class DeclarativeAdapter(ToolAdapter):
 
     def preview_command(self, request: RunRequest, executable: str) -> CommandSpec:
         """Use the real builder, replacing its disposable run directory in the result."""
-        with TemporaryDirectory(prefix="blackwall-preview-") as temporary:
+        with TemporaryDirectory(prefix="nullbound-preview-") as temporary:
             root = Path(temporary)
             command = self.build_command(request, root, executable)
             root_text = str(root)
@@ -204,7 +204,11 @@ class ProjectDiscoveryAdapter(DeclarativeAdapter):
 
     def parse_version(self, lines: list[str]) -> str | None:
         for line in lines:
-            match = re.search(r"(?:current\s+)?[^\s]+\s+version:?\s+(v?[^\s(]+)", line, re.IGNORECASE)
+            match = re.search(
+                r"(?:current\s+)?(?:[a-z0-9_-]+\s+)?version:?\s+(v?[0-9][^\s(]*)",
+                line,
+                re.IGNORECASE,
+            )
             if match:
                 return match.group(1)[:240]
         return None

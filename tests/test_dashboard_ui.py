@@ -10,8 +10,8 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from dashboard_ui import ASSET_PAGE_SIZE, RECORD_PAGE_SIZE, DashboardUI
-from blackwall_execution import ExecutionManager, RunStore
-from blackwall_scope import ScopeRule, ScopeStatus, ScopeValidationError, Target, TargetKind
+from nullbound_execution import ExecutionManager, RunStore
+from nullbound_scope import ScopeRule, ScopeStatus, ScopeValidationError, Target, TargetKind
 
 
 class _SafeClient:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from ipaddress import ip_address, ip_network
 from urllib.parse import urlsplit
 
-from blackwall_scope import ScopeValidationError, Target, TargetKind
+from nullbound_scope import ScopeValidationError, Target, TargetKind
 
 from .models import AssetKind, NORMALIZATION_VERSION, NormalizedRecord, ParsedRecord
 

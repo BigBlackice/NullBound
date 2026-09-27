@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from ipaddress import ip_address, ip_network
+import re
 from urllib.parse import urlsplit
 
 from .models import OwnershipConfidence, ScopeRule, ScopeStatus, Target, TargetKind
@@ -31,9 +33,18 @@ def _target_host(target: Target) -> str | None:
     return None
 
 
+@lru_cache(maxsize=512)
+def _compiled_scope_regex(pattern: str) -> re.Pattern[str]:
+    """Compile operator-defined patterns once without allowing an unbounded cache."""
+    return re.compile(pattern)
+
+
 def rule_matches(rule: ScopeRule, target: Target) -> bool:
     """Return whether a rule covers a target across compatible target types."""
     rule_target = rule.target
+    if rule_target.kind is TargetKind.REGEX:
+        return _compiled_scope_regex(rule_target.normalized).fullmatch(target.normalized) is not None
+
     if rule_target.kind is TargetKind.URL:
         if target.kind is not TargetKind.URL:
             return False
@@ -76,6 +87,8 @@ def rule_matches(rule: ScopeRule, target: Target) -> bool:
 
 def _specificity(rule: ScopeRule) -> tuple[int, int]:
     target = rule.target
+    if target.kind is TargetKind.REGEX:
+        return (0, len(target.normalized))
     if target.kind is TargetKind.URL:
         return (5, len(target.normalized))
     if target.kind in (TargetKind.IPV4, TargetKind.IPV6):
@@ -95,7 +108,7 @@ def evaluate_target(
 ) -> ScopeEvaluation:
     """Evaluate a target; enforcement blocks explicit exclusions only.
 
-    An unmatched direct target remains launchable. This preserves Blackwall's
+    An unmatched direct target remains launchable. This preserves NullBound's
     project-optional workflow while still making explicit exclusions effective.
     """
     matches = [rule for rule in rules if rule_matches(rule, target)]

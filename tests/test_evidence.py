@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 
-from blackwall_evidence import (
+from nullbound_evidence import (
     AssetKind,
     AssetReference,
     DATABASE_SCHEMA_VERSION,
@@ -29,15 +29,16 @@ from blackwall_evidence import (
     TlsxJsonlParser,
     normalize_record,
 )
-from blackwall_execution import ArtifactRecord, ExecutionManager, RunStore
-from blackwall_scope import (
+from nullbound_execution import ArtifactRecord, ExecutionManager, RunStore
+from nullbound_scope import (
     OwnershipConfidence,
     ScopeDocument,
     ScopeRule,
     ScopeStatus,
     Target,
+    TargetKind,
 )
-from blackwall_projects import ProjectStore
+from nullbound_projects import ProjectStore
 
 
 class EvidenceFrameworkTests(unittest.TestCase):
@@ -171,6 +172,116 @@ class EvidenceFrameworkTests(unittest.TestCase):
         finally:
             self.store._scope_for = original
 
+    def test_regex_scope_rules_are_mirrored_and_applied_to_assets(self) -> None:
+        scope = ScopeDocument(rules=(ScopeRule(
+            id="SC-0001",
+            target=Target(TargetKind.REGEX, r"api-[0-9]+\.example\.net"),
+            scope_status=ScopeStatus.ALLOWED,
+        ),))
+
+        self.pipeline.ingest(
+            (ParsedRecord(AssetKind.DOMAIN, "api-42.example.net", "fixture"),),
+            scope=scope,
+            source="fixture",
+        )
+
+        asset = self.store.list_assets()[0]
+        self.assertEqual(asset.scope, ScopeDisposition.ALLOWED)
+        self.assertEqual(asset.matched_rule_id, "SC-0001")
+        self.assertEqual(self.store.list_scope_rules()[0]["target_kind"], "regex")
+
+    def test_evidence_anchors_merge_domain_rules_and_keep_regex_explicit(self) -> None:
+        scope = ScopeDocument(rules=(
+            ScopeRule(
+                id="SC-0001", target=Target.parse("example.com"),
+                scope_status=ScopeStatus.ALLOWED,
+            ),
+            ScopeRule(
+                id="SC-0002", target=Target.parse("*.example.com"),
+                scope_status=ScopeStatus.ALLOWED,
+            ),
+            ScopeRule(
+                id="SC-0003",
+                target=Target(TargetKind.REGEX, r"api-[0-9]+\.example\.net"),
+                scope_status=ScopeStatus.ALLOWED,
+            ),
+        ))
+        self.pipeline.ingest((
+            ParsedRecord(AssetKind.DOMAIN, "example.com", "fixture"),
+            ParsedRecord(
+                AssetKind.DOMAIN, "portal.example.com", "fixture",
+                related=(AssetReference(
+                    AssetKind.IPV4, "192.0.2.10", "resolves_to"
+                ),),
+            ),
+            ParsedRecord(AssetKind.DOMAIN, "api-42.example.net", "fixture"),
+        ), scope=scope, source="fixture")
+
+        anchors = self.store.list_evidence_anchors()
+        domain = next(anchor for anchor in anchors if anchor.label == "example.com")
+        regex = next(anchor for anchor in anchors if anchor.kind == "REGEX")
+        unmatched = next(anchor for anchor in anchors if anchor.kind == "UNMATCHED")
+
+        self.assertEqual(domain.rule_ids, ("SC-0001", "SC-0002"))
+        self.assertEqual((domain.asset_count, domain.hostname_count), (2, 2))
+        self.assertEqual(regex.label, r"api-[0-9]+\.example\.net")
+        self.assertEqual(regex.hostname_count, 1)
+        self.assertEqual(unmatched.address_count, 1)
+
+        hostnames, total = self.store.list_evidence_anchor_assets(
+            domain.id, "hostnames", limit=50
+        )
+        self.assertEqual(total, 2)
+        portal = next(item for item in hostnames if item.asset.display_name == "portal.example.com")
+        self.assertEqual(portal.relationship_count, 1)
+        links, link_total = self.store.list_evidence_asset_links(portal.asset.id)
+        self.assertEqual(link_total, 1)
+        self.assertEqual(links[0].asset.display_name, "192.0.2.10")
+        self.assertEqual(links[0].relation, "resolves_to")
+
+    def test_evidence_hierarchy_queries_enforce_rendering_limits(self) -> None:
+        scope = ScopeDocument(rules=(ScopeRule(
+            id="SC-0001", target=Target.parse("*.example.com"),
+            scope_status=ScopeStatus.ALLOWED,
+        ),))
+        records = list(
+            ParsedRecord(AssetKind.DOMAIN, f"host-{index}.example.com", "fixture")
+            for index in range(60)
+        )
+        records[0] = ParsedRecord(
+            AssetKind.DOMAIN,
+            "host-0.example.com",
+            "fixture",
+            related=tuple(
+                AssetReference(AssetKind.IPV4, f"192.0.2.{index}", "resolves_to")
+                for index in range(1, 31)
+            ),
+        )
+        self.pipeline.ingest(tuple(records), scope=scope, source="fixture")
+        anchor = next(
+            item for item in self.store.list_evidence_anchors()
+            if item.label == "example.com"
+        )
+
+        first_page, total = self.store.list_evidence_anchor_assets(
+            anchor.id, "hostnames", limit=10_000
+        )
+        second_page, _ = self.store.list_evidence_anchor_assets(
+            anchor.id, "hostnames", limit=50, offset=50
+        )
+
+        self.assertEqual(total, 60)
+        self.assertEqual(len(first_page), 50)
+        self.assertEqual(len(second_page), 10)
+        first_host = next(
+            item for item in first_page if item.asset.display_name == "host-0.example.com"
+        )
+        links, link_total = self.store.list_evidence_asset_links(
+            first_host.asset.id, limit=10_000
+        )
+        self.assertEqual(link_total, 30)
+        self.assertEqual(len(links), 25)
+
     def test_failed_ingestion_rolls_back_partial_normalized_records(self) -> None:
         records = (
             ParsedRecord(AssetKind.DOMAIN, "valid.example.com", "fixture"),
@@ -299,6 +410,67 @@ class EvidenceFrameworkTests(unittest.TestCase):
             {item.artifact_path for item in evidence},
             {"runs/RUN-INGEST/artifacts/dnsx.jsonl"},
         )
+
+    def test_every_builtin_launcher_artifact_is_picked_up_by_nullbound(self) -> None:
+        fixtures = {
+            "subfinder": (
+                "subfinder.jsonl",
+                json.dumps({"host": "sub.example.com", "sources": ["fixture"]}) + "\n",
+            ),
+            "dnsx": (
+                "dnsx.jsonl",
+                json.dumps({"host": "dns.example.com", "a": ["192.0.2.21"]}) + "\n",
+            ),
+            "nmap": (
+                "nmap.xml",
+                """<nmaprun><host><status state="up"/><address addr="192.0.2.22" addrtype="ipv4"/>
+                <ports><port protocol="tcp" portid="443"><state state="open"/>
+                <service name="https" product="fixture"/></port></ports></host></nmaprun>""",
+            ),
+            "httpx": (
+                "httpx.jsonl",
+                json.dumps({"url": "https://web.example.com", "status_code": 200}) + "\n",
+            ),
+            "gau": (
+                "gau.jsonl",
+                json.dumps({"url": "https://archive.example.com/old", "source": "wayback"}) + "\n",
+            ),
+            "tlsx": (
+                "tlsx.jsonl",
+                json.dumps({"host": "tls.example.com", "port": "443", "tls_version": "tls13"}) + "\n",
+            ),
+        }
+        run_ids: set[str] = set()
+        for module_key, (artifact_name, content) in fixtures.items():
+            with self.subTest(module=module_key):
+                run_id = f"RUN-{module_key.upper()}"
+                run_ids.add(run_id)
+                run_path = self.project_path / "runs" / run_id
+                artifact = run_path / "artifacts" / artifact_name
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text(content, encoding="utf-8")
+                manifest = SimpleNamespace(
+                    id=run_id,
+                    project_id="P-0001",
+                    module_bin=module_key,
+                    run_path=run_path,
+                    artifacts=(ArtifactRecord(
+                        f"artifacts/{artifact_name}", artifact.stat().st_size, "digest"
+                    ),),
+                    target_source="direct",
+                    targets=({
+                        "kind": "domain", "value": "example.com", "normalized": "example.com",
+                    },),
+                )
+
+                summary = ProjectRunIngestor()(manifest)
+                self.assertIsNotNone(summary)
+                self.assertGreaterEqual(summary["evidence_created"], 1)
+
+        indexed_run_ids = {
+            record.run_id for record in EvidenceStore(self.project_path).list_evidence()
+        }
+        self.assertTrue(run_ids.issubset(indexed_run_ids))
 
     def test_subfinder_run_indexes_the_submitted_domain_as_a_seed_without_results(self) -> None:
         run_path = self.project_path / "runs" / "RUN-SEED"

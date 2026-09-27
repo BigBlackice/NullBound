@@ -9,14 +9,14 @@ import re
 from typing import Any, Mapping
 
 
-PROJECT_KIND = "blackwall-project"
+PROJECT_KIND = "nullbound-project"
 PROJECT_SCHEMA_VERSION = 1
 PROJECT_ID_PATTERN = re.compile(r"^P-[0-9]{4,}$")
 MAX_PROJECT_NAME_LENGTH = 120
 
 
 class ProjectValidationError(ValueError):
-    """Raised when a directory is not a valid Blackwall project."""
+    """Raised when a directory is not a valid NullBound project."""
 
 
 def _validate_timestamp(value: object, field: str) -> str:

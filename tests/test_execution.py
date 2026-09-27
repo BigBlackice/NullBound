@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from blackwall_evidence import EvidenceStore, ProjectRunIngestor
-from blackwall_execution import (
+from nullbound_evidence import EvidenceStore, ProjectRunIngestor
+from nullbound_execution import (
     AdapterRegistry,
     CommandSpec,
     CompanionProcessSpec,
@@ -26,7 +26,7 @@ from blackwall_execution import (
     HttpxAdapter,
     expand_argument_template,
 )
-from blackwall_scope import ExecutionContext, Target, TargetSelection
+from nullbound_scope import ExecutionContext, Target, TargetSelection
 from recon_modules import ModuleDefinition, ScanProfile, load_default_catalog
 
 
@@ -97,24 +97,36 @@ class AdapterTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             for module in catalog:
-                with self.subTest(module=module.bin):
-                    request = RunRequest(
-                        module=module,
-                        profile=module.default_profile,
-                        context=ExecutionContext(
-                            selection=TargetSelection.direct((Target.parse(target_values[module.id]),))
-                        ),
-                    )
-                    run_path = root / module.bin
-                    command = registry.get(module.adapter).build_command(
-                        request, run_path, module.bin
-                    )
-                    self.assertEqual(command.executable, module.bin)
-                    self.assertIn(artifact_flags[module.id], command.arguments)
-                    self.assertNotIn(";", command.arguments)
+                for profile in module.profiles:
+                    with self.subTest(module=module.bin, profile=profile.name):
+                        request = RunRequest(
+                            module=module,
+                            profile=profile,
+                            context=ExecutionContext(
+                                selection=TargetSelection.direct((Target.parse(target_values[module.id]),))
+                            ),
+                        )
+                        run_path = root / module.bin
+                        command = registry.get(module.adapter).build_command(
+                            request, run_path, module.bin
+                        )
+                        self.assertEqual(command.executable, module.bin)
+                        self.assertIn(artifact_flags[module.id], command.arguments)
+                        self.assertNotIn(";", command.arguments)
+                        self.assertIn(command.output_format, {"jsonl", "xml"})
 
             dns_targets = root / "dnsx" / "inputs" / "targets.txt"
             self.assertEqual(dns_targets.read_text(encoding="utf-8"), "api.example.com\n")
+
+    def test_projectdiscovery_version_parser_accepts_current_installed_format(self) -> None:
+        adapter = AdapterRegistry().get("subfinder")
+        for line, expected in (
+            ("[INF] Current Version: v2.16.0", "v2.16.0"),
+            ("[INF] Current version: 1.3.1", "1.3.1"),
+            ("subfinder version v2.16.0", "v2.16.0"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(adapter.parse_version([line]), expected)
 
     def test_subfinder_writes_source_attributed_jsonl_without_private_state(self) -> None:
         module = load_default_catalog().get("01")
@@ -214,7 +226,7 @@ class AdapterTests(unittest.TestCase):
             })
             request = RunRequest(module, module.default_profile, original.context)
 
-            with patch("blackwall_execution.adapters.os.access", return_value=False):
+            with patch("nullbound_execution.adapters.os.access", return_value=False):
                 with self.assertRaisesRegex(ExecutionError, "not runnable"):
                     DeclarativeAdapter().resolve_executable(request)
 
@@ -525,7 +537,7 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
                         executable,
                         (
                             "-c",
-                            "import os, sys; print(os.environ['BLACKWALL_COMPANION_TEST'], file=sys.stderr, flush=True); sys.exit(7)",
+                            "import os, sys; print(os.environ['NULLBOUND_COMPANION_TEST'], file=sys.stderr, flush=True); sys.exit(7)",
                         ),
                         "127.0.0.1",
                         unused_port,
@@ -533,7 +545,7 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
                         label="Test engine",
                         startup_timeout_seconds=5,
                     ),
-                    environment=(("BLACKWALL_COMPANION_TEST", "isolated engine startup failed"),),
+                    environment=(("NULLBOUND_COMPANION_TEST", "isolated engine startup failed"),),
                 )
 
         original = request_for("print('unused')")
@@ -602,7 +614,7 @@ class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):
             await server.wait_closed()
 
         self.assertEqual(finished.state, RunState.FAILED)
-        self.assertIn("already running outside this Blackwall run", finished.error)
+        self.assertIn("already running outside this NullBound run", finished.error)
         self.assertFalse((finished.run_path / "stdout.log").exists())
 
 

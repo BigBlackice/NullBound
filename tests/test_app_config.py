@@ -1,4 +1,4 @@
-"""Tests for validated Blackwall startup configuration."""
+"""Tests for validated NullBound startup configuration."""
 
 from __future__ import annotations
 

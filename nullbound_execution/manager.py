@@ -157,7 +157,7 @@ class ExecutionManager:
             recovered.append(self.store.save(manifest.evolve(
                 state=RunState.FAILED,
                 finished_at=utc_now(),
-                error="Blackwall stopped before the run completed",
+                error="NullBound stopped before the run completed",
             )))
         return tuple(recovered)
 
@@ -194,7 +194,7 @@ class ExecutionManager:
                             run_id, manifest, companion_spec, command.environment
                         )
                     self._publish_output(
-                        run_id, "system", f"[blackwall] Launching {manifest.module_bin}."
+                        run_id, "system", f"[nullbound] Launching {manifest.module_bin}."
                     )
                     process = await asyncio.create_subprocess_exec(
                         manifest.executable, *manifest.arguments,
@@ -244,7 +244,7 @@ class ExecutionManager:
                         )
                         self._publish_output(
                             run_id, "system",
-                            f"[blackwall] Run timed out after {manifest.timeout_seconds} seconds.",
+                            f"[nullbound] Run timed out after {manifest.timeout_seconds} seconds.",
                         )
                         await self._post_process(terminal)
                         return
@@ -262,7 +262,7 @@ class ExecutionManager:
                     )
                     self._publish_output(
                         run_id, "system",
-                        f"[blackwall] {state.value.title()} with exit code {exit_code}; "
+                        f"[nullbound] {state.value.title()} with exit code {exit_code}; "
                         f"collected {len(terminal.artifacts)} artifact(s).",
                     )
                     await self._post_process(terminal)
@@ -280,7 +280,7 @@ class ExecutionManager:
                     self.store.collect_artifacts, manifest.run_path
                 ),
             )
-            self._publish_output(run_id, "system", "[blackwall] Run cancelled.")
+            self._publish_output(run_id, "system", "[nullbound] Run cancelled.")
             await self._post_process(terminal)
         except Exception as error:
             terminal = self._transition(
@@ -289,7 +289,7 @@ class ExecutionManager:
                     self.store.collect_artifacts, manifest.run_path
                 ),
             )
-            self._publish_output(run_id, "system", f"[blackwall] Run failed: {error}")
+            self._publish_output(run_id, "system", f"[nullbound] Run failed: {error}")
             await self._post_process(terminal)
         finally:
             self._processes.pop(run_id, None)
@@ -308,10 +308,10 @@ class ExecutionManager:
         """Start a required local service owned and isolated by this run."""
         if await self._endpoint_available(spec):
             raise ExecutionError(
-                f"{spec.label} is already running outside this Blackwall run; "
+                f"{spec.label} is already running outside this NullBound run; "
                 "stop the existing engine before launching another scan"
             )
-        self._publish_output(run_id, "system", f"[blackwall] Starting {spec.label}.")
+        self._publish_output(run_id, "system", f"[nullbound] Starting {spec.label}.")
         process = await asyncio.create_subprocess_exec(
             spec.executable, *spec.arguments,
             cwd=manifest.run_path,
@@ -342,7 +342,7 @@ class ExecutionManager:
                         f"{spec.label} exited before becoming ready{suffix}"
                     )
                 if await self._endpoint_available(spec):
-                    self._publish_output(run_id, "system", f"[blackwall] {spec.label} is ready.")
+                    self._publish_output(run_id, "system", f"[nullbound] {spec.label} is ready.")
                     return process, tasks
                 await asyncio.sleep(0.2)
             detail = self._failure_detail(run_id)
@@ -443,7 +443,7 @@ class ExecutionManager:
             self._publish_output(
                 run_id,
                 "system",
-                f"[blackwall] {manifest.module_bin} still running — "
+                f"[nullbound] {manifest.module_bin} still running — "
                 f"{minutes:02d}:{seconds:02d} elapsed{suffix}.",
             )
 
@@ -482,7 +482,7 @@ class ExecutionManager:
                 console_log.close()
 
     def _publish_output(self, run_id: str, stream_name: str, text: str) -> None:
-        """Persist a concise Blackwall lifecycle message and emit it live."""
+        """Persist a concise NullBound lifecycle message and emit it live."""
         manifest = self._runs[run_id]
         for path in (
             manifest.run_path / f"{stream_name}.log",

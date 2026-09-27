@@ -1,4 +1,4 @@
-"""Portable target, scope, and execution-context models for Blackwall."""
+"""Portable target, scope, and execution-context models for NullBound."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 
-SCOPE_KIND = "blackwall-scope"
+SCOPE_KIND = "nullbound-scope"
 SCOPE_SCHEMA_VERSION = 1
 TARGET_SET_ID_PATTERN = re.compile(r"^TS-[0-9]{4,}$")
 SCOPE_RULE_ID_PATTERN = re.compile(r"^SC-[0-9]{4,}$")
@@ -27,6 +27,7 @@ class TargetKind(StrEnum):
     IPV6 = "ipv6"
     CIDR = "cidr"
     URL = "url"
+    REGEX = "regex"
 
 
 class ScopeStatus(StrEnum):
@@ -58,6 +59,15 @@ def normalize_target(kind: TargetKind, value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
         raise ScopeValidationError("target value cannot be empty")
+
+    if kind is TargetKind.REGEX:
+        if len(raw) > 512:
+            raise ScopeValidationError("regex scope patterns cannot exceed 512 characters")
+        try:
+            re.compile(raw)
+        except re.error as error:
+            raise ScopeValidationError(f"invalid regex scope pattern: {error}") from error
+        return raw
 
     if kind in (TargetKind.IPV4, TargetKind.IPV6):
         try:

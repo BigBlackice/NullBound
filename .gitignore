@@ -8,5 +8,5 @@ dist/
 build/
 *.egg-info/
 .tmp-*
-.blackwall-tools/
+.nullbound-tools/
 archived/

@@ -1,4 +1,4 @@
-"""INERT BACKUP: Amass OAM parser removed from Blackwall's active registry.
+"""INERT BACKUP: Amass OAM parser removed from NullBound's active registry.
 
 This file deliberately uses the .disabled suffix and is not imported anywhere.
 Rename and reconnect it explicitly only if Amass support is reconsidered.
@@ -14,7 +14,7 @@ from pathlib import Path
 import sqlite3
 from typing import Iterable, Mapping
 
-from blackwall_evidence.models import AssetKind, AssetReference, ParsedRecord
+from nullbound_evidence.models import AssetKind, AssetReference, ParsedRecord
 
 
 def _artifact_name(path: Path) -> str:
@@ -228,6 +228,4 @@ class AmassOamSqliteParser:
         except (TypeError, ValueError):
             return {"raw": str(value)}
         return parsed if isinstance(parsed, dict) else {"value": parsed}
-
-
 

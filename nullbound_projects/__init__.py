@@ -1,4 +1,4 @@
-"""Public project workspace API used by Blackwall application surfaces."""
+"""Public project workspace API used by NullBound application surfaces."""
 
 from .models import (
     PROJECT_KIND,

@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from blackwall_scope import ScopeStore
+from nullbound_scope import ScopeStore
 
 from .models import AssetKind, IngestionResult, ParsedRecord
 from .parsers import ParserRegistry
@@ -14,7 +14,7 @@ from .pipeline import EvidencePipeline
 from .store import EvidenceStore
 
 if TYPE_CHECKING:
-    from blackwall_execution.models import RunManifest
+    from nullbound_execution.models import RunManifest
 
 
 class ProjectRunIngestor:

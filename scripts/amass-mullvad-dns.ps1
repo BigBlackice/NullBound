@@ -3,7 +3,7 @@
 Temporarily permits a broad public DNS resolver pool through Mullvad.
 
 .NOTES
-Standalone operator helper; Blackwall never invokes it or changes VPN settings.
+Standalone operator helper; NullBound never invokes it or changes VPN settings.
 
 .EXAMPLE
 .\scripts\amass-mullvad-dns.ps1 Enable
@@ -176,5 +176,4 @@ switch ($Action) {
         exit $commandExitCode
     }
 }
-
 

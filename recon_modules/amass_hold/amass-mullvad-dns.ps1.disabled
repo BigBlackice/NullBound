@@ -1,6 +1,6 @@
 <#
 .NOTES
-INERT BACKUP: Amass is not connected to Blackwall or its setup script.
+INERT BACKUP: Amass is not connected to NullBound or its setup script.
 
 .SYNOPSIS
 Temporarily permits the Amass v5.1.1 DNS resolver pool through Mullvad.

@@ -1,4 +1,4 @@
-"""Validated process-level configuration for starting Blackwall."""
+"""Validated process-level configuration for starting NullBound."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ class AppConfig:
 
     @classmethod
     def from_args(cls, argv: Sequence[str] | None = None) -> AppConfig:
-        parser = argparse.ArgumentParser(description="Run the Blackwall operator console.")
+        parser = argparse.ArgumentParser(description="Run the NullBound operator console.")
         parser.add_argument(
             "--host",
             type=_host_argument,
@@ -80,7 +80,7 @@ class AppConfig:
         if self.is_loopback:
             return None
         return (
-            f"Blackwall is listening on {self.host}:{self.port}. "
+            f"NullBound is listening on {self.host}:{self.port}. "
             "Remote clients can access the host filesystem browser; use only on a trusted network "
             "until authentication is implemented."
         )

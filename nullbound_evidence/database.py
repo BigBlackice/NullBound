@@ -129,7 +129,7 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
 
 
 class DatabaseVersionError(RuntimeError):
-    """Raised when a project database is newer than this Blackwall build."""
+    """Raised when a project database is newer than this NullBound build."""
 
 
 class ProjectDatabase:
@@ -208,7 +208,7 @@ class ProjectDatabase:
             cursor = connection.execute(
                 """UPDATE ingestion_batches
                    SET status = 'failed', finished_at = ?,
-                       error = 'Blackwall stopped before ingestion completed'
+                       error = 'NullBound stopped before ingestion completed'
                    WHERE status = 'running'""",
                 (recovered_at,),
             )

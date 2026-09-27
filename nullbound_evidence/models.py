@@ -1,4 +1,4 @@
-"""Typed records for Blackwall's project-local evidence index."""
+"""Typed records for NullBound's project-local evidence index."""
 
 from __future__ import annotations
 
@@ -179,6 +179,45 @@ class RelationshipRecord:
     confidence: str
     created_at: str
     metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAnchorSummary:
+    """Bounded Evidence workspace summary for one scope-derived root."""
+
+    id: str
+    label: str
+    kind: str
+    scope_status: str
+    rule_ids: tuple[str, ...]
+    asset_count: int
+    hostname_count: int
+    address_count: int
+    service_count: int
+    url_count: int
+    other_count: int
+    finding_count: int
+    source_count: int
+    last_seen_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAssetSummary:
+    """Small hierarchy row loaded only for one expanded anchor bucket."""
+
+    asset: AssetRecord
+    evidence_count: int
+    relationship_count: int
+    finding_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceAssetLink:
+    """One directly observed graph edge shown beneath an expanded asset row."""
+
+    relation: str
+    confidence: str
+    asset: AssetRecord
 
 
 @dataclass(frozen=True, slots=True)

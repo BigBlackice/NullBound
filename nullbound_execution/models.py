@@ -8,11 +8,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
 
-from blackwall_scope import ExecutionContext
+from nullbound_scope import ExecutionContext
 from recon_modules import ModuleDefinition, ScanProfile
 
 
-RUN_KIND = "blackwall-run"
+RUN_KIND = "nullbound-run"
 RUN_SCHEMA_VERSION = 1
 
 

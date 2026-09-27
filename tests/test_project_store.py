@@ -1,4 +1,4 @@
-"""Tests for portable Blackwall project storage."""
+"""Tests for portable NullBound project storage."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from blackwall_projects import (
+from nullbound_projects import (
     PROJECT_KIND,
     PROJECT_SCHEMA_VERSION,
     ProjectStore,
@@ -28,7 +28,7 @@ class ProjectStoreTests(unittest.TestCase):
         fake_home = self.temporary_root / "users" / "operator"
         self.assertEqual(
             default_projects_root(fake_home),
-            fake_home / ".blackwall" / "projects",
+            fake_home / ".nullbound" / "projects",
         )
 
     def test_create_project_writes_portable_versioned_layout(self) -> None:
