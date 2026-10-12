@@ -12,8 +12,15 @@ import shlex
 from nicegui import events, ui
 from app_config import AppConfig
 from nullbound_evidence import EvidenceStore
+from nullbound_modules import (
+    WEB_DISCOVERY_ID,
+    WEB_ENUMERATION_ID,
+    WebDiscoveryModule,
+    WebEnumerationModule,
+)
 from nullbound_execution import (
-    ExecutionError, ExecutionManager, RunEvent, RunManifest, RunRequest, ToolHealth,
+    SECLISTS_WEB_CONTENT_ROOT, ExecutionError, ExecutionManager, RunEvent,
+    RunManifest, RunRequest, ToolHealth, discover_ffuf_wordlists,
 )
 from nullbound_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
 from nullbound_projects.picker import LocalDirectoryPicker
@@ -172,10 +179,27 @@ class DashboardUI:
         self.target_modes = {module.id: "direct" for module in modules}
         self.direct_targets = {module.id: "" for module in modules}
         self.selected_profiles = {module.id: module.default_profile.name for module in modules}
+        self.ffuf_wordlists = discover_ffuf_wordlists()
+        default_ffuf_wordlist = str(self.ffuf_wordlists[0]) if self.ffuf_wordlists else ""
         self.module_config_values = {
             module.id: {field.id: "" for field in module.config_fields} for module in modules
         }
+        for module in modules:
+            if module.adapter == "ffuf" and "wordlist" in self.module_config_values[module.id]:
+                self.module_config_values[module.id]["wordlist"] = default_ffuf_wordlist
         self.selected_target_sets: dict[str, str] = {}
+        self.selected_discovery_scope_ids: tuple[str, ...] = ()
+        self.web_discovery_timeout = ""
+        self.web_discovery_running = False
+        self._discovery_scope_project_id: str | None = None
+        self.selected_enumeration_chain_id = "quick"
+        self.selected_enumeration_scope_id: str | None = None
+        self.web_enumeration_wordlist = default_ffuf_wordlist
+        self.web_enumeration_depth = "2"
+        self.web_enumeration_timeout = ""
+        self.web_enumeration_running = False
+        self._enumeration_scope_project_id: str | None = None
+        self._ffuf_wordlist_project_id: str | None = None
         self.search_query = ""
         self.console_minimized = False
         self.console_fullscreen = False
@@ -193,7 +217,15 @@ class DashboardUI:
         self.run_timeout_values = {module.id: "" for module in modules}
         self._pending_project: tuple[str, Path] | None = None
         self.execution_manager = execution_manager or ExecutionManager()
+        self.web_discovery_module = WebDiscoveryModule(
+            self.execution_manager, self.module_catalog
+        )
+        self.web_enumeration_module = WebEnumerationModule(
+            self.execution_manager, self.module_catalog
+        )
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
+        self._reset_ffuf_wordlist_defaults()
+        self._ffuf_wordlist_project_id = self.active_project_id
         self.evidence_stores: dict[Path, EvidenceStore] = {}
         self.evidence_scope_versions: dict[Path, tuple[int, int] | None] = {}
         for project in self.project_workspace.open_projects:
@@ -213,6 +245,12 @@ class DashboardUI:
         self._workspace_unsubscribe = None
         self._last_evidence_refresh: tuple[str, str] | None = None
         self._pending_run_output: list[str] = []
+        self._running_module_runs = {
+            run.id: run.module_id
+            for run in self.execution_manager.list_runs(tuple(project.path for project in self.projects))
+            if not run.state.terminal
+        }
+        self.module_state_labels: dict[str, object] = {}
         self._client = None
 
     # Resolve the selected ID through the module catalog instead of duplicating data.
@@ -700,7 +738,76 @@ class DashboardUI:
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
+
+    def workspace_breadcrumb_text(self) -> str:
+        page = self.active_view.upper()
+        selection = ""
+        if self.active_view == "launchpad":
+            selection = (
+                "WEB DISCOVERY"
+                if self.selected_module_id == WEB_DISCOVERY_ID
+                else "WEB ENUMERATION"
+                if self.selected_module_id == WEB_ENUMERATION_ID
+                else self.selected_module.description.upper()
+            )
+        elif self.active_view == "findings":
+            record = next(
+                (item for item in self.filtered_finding_records()
+                 if item["id"] == self.selected_finding_id),
+                None,
+            )
+            selection = str(record["title"]).upper() if record else ""
+        elif self.active_view == "assets":
+            record = next(
+                (item for item in self.filtered_asset_records()
+                 if item["id"] == self.selected_asset_id),
+                None,
+            )
+            selection = str(record["name"]).upper() if record else ""
+        elif self.active_view == "evidence":
+            if self.selected_evidence_id:
+                try:
+                    selection = str(
+                        self.evidence_node_record(self.selected_evidence_id)["identifier"]
+                    ).upper()
+                except KeyError:
+                    selection = ""
+            if not selection:
+                record = next(
+                    (item for item in self.evidence_anchor_records()
+                     if item["id"] == self.selected_evidence_anchor_id),
+                    None,
+                )
+                selection = str(record["label"]).upper() if record else ""
+        elif self.active_view == "scope":
+            record = next(
+                (item for item in self.scope_records()
+                 if item["id"] == self.selected_scope_id),
+                None,
+            )
+            selection = str(record["target"]).upper() if record else ""
+        elif self.active_view == "runs":
+            record = next(
+                (item for item in self.filtered_run_records()
+                 if item["id"] == self.selected_run_id),
+                None,
+            )
+            selection = (
+                f"{record['module']} / {record['id']}" if record else ""
+            )
+        return f"/ {page}" + (f" / {selection}" if selection else "")
+
+    def render_workspace_breadcrumb(self) -> None:
+        self.workspace_breadcrumb = ui.label(
+            self.workspace_breadcrumb_text()
+        ).classes("section-kicker workspace-breadcrumb")
+
+    def update_workspace_breadcrumb(self) -> None:
+        breadcrumb = getattr(self, "workspace_breadcrumb", None)
+        if breadcrumb is not None:
+            breadcrumb.set_text(self.workspace_breadcrumb_text())
 
     def _update_selected_row(
         self,
@@ -1005,6 +1112,7 @@ class DashboardUI:
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
 
     def select_module(self, module_id: str) -> None:
@@ -1016,6 +1124,22 @@ class DashboardUI:
         self.module_config_values.setdefault(
             module.id, {field.id: "" for field in module.config_fields}
         )
+        if self.inspector_collapsed:
+            self.inspector_collapsed = False
+            self.update_inspector_layout()
+        self.render_workspace()
+        self.render_inspector()
+
+    def select_web_discovery_module(self) -> None:
+        self.selected_module_id = WEB_DISCOVERY_ID
+        if self.inspector_collapsed:
+            self.inspector_collapsed = False
+            self.update_inspector_layout()
+        self.render_workspace()
+        self.render_inspector()
+
+    def select_web_enumeration_module(self) -> None:
+        self.selected_module_id = WEB_ENUMERATION_ID
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
@@ -1046,6 +1170,79 @@ class DashboardUI:
 
     def set_run_timeout(self, module_id: str, event: events.ValueChangeEventArguments) -> None:
         self.run_timeout_values[module_id] = str(event.value or "").strip()
+
+    def set_web_discovery_scope_items(
+        self, event: events.ValueChangeEventArguments
+    ) -> None:
+        values = event.value if isinstance(event.value, (list, tuple, set)) else (event.value,)
+        self.selected_discovery_scope_ids = tuple(
+            str(value) for value in values if value not in (None, "")
+        )
+        self.render_inspector()
+
+    def set_web_discovery_timeout(self, event: events.ValueChangeEventArguments) -> None:
+        self.web_discovery_timeout = str(event.value or "").strip()
+
+    def set_web_enumeration_chain(self, event: events.ValueChangeEventArguments) -> None:
+        self.selected_enumeration_chain_id = str(event.value or "")
+        self.render_inspector()
+
+    def set_web_enumeration_scope_item(
+        self, event: events.ValueChangeEventArguments
+    ) -> None:
+        self.selected_enumeration_scope_id = str(event.value or "") or None
+        self.render_inspector()
+
+    def set_web_enumeration_wordlist(self, event: events.ValueChangeEventArguments) -> None:
+        self.web_enumeration_wordlist = str(event.value or "").strip()
+        self.render_inspector()
+
+    def set_web_enumeration_depth(self, event: events.ValueChangeEventArguments) -> None:
+        self.web_enumeration_depth = str(event.value or "").strip()
+        self.render_inspector()
+
+    def set_web_enumeration_timeout(self, event: events.ValueChangeEventArguments) -> None:
+        self.web_enumeration_timeout = str(event.value or "").strip()
+
+    def ffuf_wordlist_options(self, current: str = "") -> dict[str, str]:
+        options: dict[str, str] = {}
+        project = self.active_project
+        project_wordlists = (
+            discover_ffuf_wordlists(project.wordlists_path, all_files=True)
+            if project is not None else ()
+        )
+        for path in (*self.ffuf_wordlists, *project_wordlists):
+            try:
+                label = path.relative_to(SECLISTS_WEB_CONTENT_ROOT).as_posix()
+            except ValueError:
+                label = f"PROJECT / {path.relative_to(project.wordlists_path).as_posix()}"
+            options[str(path)] = label
+        if current and current not in options:
+            options[current] = f"CUSTOM / {current}"
+        return options
+
+    def _reset_ffuf_wordlist_defaults(self) -> None:
+        project = self.active_project
+        project_wordlists = (
+            discover_ffuf_wordlists(project.wordlists_path, all_files=True)
+            if project is not None else ()
+        )
+        available = (*self.ffuf_wordlists, *project_wordlists)
+        default = str(available[0]) if available else ""
+        self.web_enumeration_wordlist = default
+        for module in self.module_catalog.modules:
+            if module.adapter == "ffuf" and "wordlist" in self.module_config_values[module.id]:
+                self.module_config_values[module.id]["wordlist"] = default
+
+    @staticmethod
+    def _enumeration_scope_label(rule: dict[str, object]) -> str:
+        target = str(rule["original_target"])
+        kind = str(rule["target_kind"]).upper()
+        if kind == "DOMAIN":
+            kind = "WILDCARD DOMAIN" if target.startswith("*.") else "EXACT DOMAIN"
+        elif kind == "URL" and "*." in target:
+            kind = "WILDCARD URL"
+        return f"{target} / {kind}"
 
     def set_search_query(self, event: events.ValueChangeEventArguments) -> None:
         self.search_query = str(event.value or "")
@@ -1154,6 +1351,10 @@ class DashboardUI:
             ui.notify(str(error), type="negative")
             return
 
+        self._activate_run(run)
+        ui.notify(f"Started {run.id}", type="positive")
+
+    def _activate_run(self, run: RunManifest) -> None:
         if self._run_unsubscribe:
             self._run_unsubscribe()
         self.active_run_id = run.id
@@ -1162,7 +1363,141 @@ class DashboardUI:
         self.console_minimized = False
         self.update_console_layout()
         self.render_console()
-        ui.notify(f"Started {run.id}", type="positive")
+
+    def _activate_discovery_stage(
+        self, stage_number: int, stage_count: int, run: RunManifest
+    ) -> None:
+        self._activate_run(run)
+        ui.notify(
+            f"Web Discovery {stage_number}/{stage_count}: started {run.module_bin}",
+            type="positive",
+        )
+
+    def _activate_enumeration_stage(
+        self, stage_number: int, stage_count: int, run: RunManifest
+    ) -> None:
+        self._activate_run(run)
+        ui.notify(
+            f"Web Enumeration {stage_number}/{stage_count}: started {run.module_bin}",
+            type="positive",
+        )
+
+    async def launch_web_discovery(self) -> None:
+        if self.web_discovery_running:
+            ui.notify("Web Discovery is already running", type="warning")
+            return
+        project = self.active_project
+        if project is None:
+            ui.notify("Open a project before launching Web Discovery", type="negative")
+            return
+        try:
+            document = ScopeStore(project.path).load()
+            seeds = self.web_discovery_module.scope_seeds(
+                document.rules, self.selected_discovery_scope_ids
+            )
+            timeout_text = self.web_discovery_timeout.strip()
+            timeout_seconds = int(timeout_text) if timeout_text else None
+            if timeout_seconds is not None and timeout_seconds < 1:
+                raise ValueError("per-stage timeout must be a positive number of seconds")
+        except (ScopeValidationError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+
+        self.web_discovery_running = True
+        launch_button = getattr(self, "web_discovery_launch_button", None)
+        if launch_button is not None:
+            launch_button.disable()
+        try:
+            result = await self.web_discovery_module.run(
+                seeds,
+                project_id=project.id,
+                project_name=project.name,
+                project_path=project.path,
+                scope_rules=document.rules,
+                scope_enforced=self.scope_enforced,
+                timeout_seconds=timeout_seconds,
+                on_stage_started=self._activate_discovery_stage,
+            )
+        except (ExecutionError, OSError, ScopeValidationError, KeyError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        finally:
+            self.web_discovery_running = False
+            if self.active_view == "launchpad" and self.selected_module_id == WEB_DISCOVERY_ID:
+                self.render_inspector()
+
+        ui.notify(
+            "Web Discovery completed: "
+            f"{result.discovered_domains} discovered, "
+            f"{result.resolved_hosts} resolved, "
+            f"{result.live_web_services} live web services"
+            + (f", {result.excluded_targets} excluded by scope" if result.excluded_targets else ""),
+            type="positive",
+        )
+
+    async def launch_web_enumeration(self) -> None:
+        if self.web_enumeration_running:
+            ui.notify("Web Enumeration is already running", type="warning")
+            return
+        project = self.active_project
+        store = self.active_evidence_store()
+        scope_id = self.selected_enumeration_scope_id
+        if project is None or store is None:
+            ui.notify("Open a project before launching Web Enumeration", type="negative")
+            return
+        if not scope_id:
+            ui.notify("Select a scope item before launching Web Enumeration", type="negative")
+            return
+        try:
+            timeout_text = self.web_enumeration_timeout.strip()
+            timeout_seconds = int(timeout_text) if timeout_text else None
+            if timeout_seconds is not None and timeout_seconds < 1:
+                raise ValueError("per-stage timeout must be a positive number of seconds")
+            chain = self.web_enumeration_module.get_chain(
+                self.selected_enumeration_chain_id
+            )
+            uses_ffuf = any(stage.module_id == "07" for stage in chain.stages)
+            recursion_depth = int(self.web_enumeration_depth or "2") if uses_ffuf else 2
+            if uses_ffuf and not 1 <= recursion_depth <= 10:
+                raise ValueError("ffuf recursion depth must be from 1 to 10")
+            scope_rules = ScopeStore(project.path).load().rules
+        except (ScopeValidationError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+
+        self.web_enumeration_running = True
+        launch_button = getattr(self, "web_enumeration_launch_button", None)
+        if launch_button is not None:
+            launch_button.disable()
+        try:
+            result = await self.web_enumeration_module.run(
+                store,
+                scope_id,
+                self.selected_enumeration_chain_id,
+                project_id=project.id,
+                project_name=project.name,
+                project_path=project.path,
+                scope_rules=scope_rules,
+                scope_enforced=self.scope_enforced,
+                timeout_seconds=timeout_seconds,
+                wordlist=self.web_enumeration_wordlist,
+                recursion_depth=recursion_depth,
+                on_stage_started=self._activate_enumeration_stage,
+            )
+        except (ExecutionError, OSError, ScopeValidationError, KeyError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        finally:
+            self.web_enumeration_running = False
+            if self.active_view == "launchpad" and self.selected_module_id == WEB_ENUMERATION_ID:
+                self.render_inspector()
+
+        ui.notify(
+            f"Web Enumeration completed: {result.target_count} assets across "
+            f"{len(result.runs)} runs"
+            + (f", {result.omitted_count} excluded by scope" if result.omitted_count else ""),
+            type="positive",
+        )
 
     def handle_run_event(self, event: RunEvent) -> None:
         """Route a background run event through the owning page context."""
@@ -1178,6 +1513,14 @@ class DashboardUI:
         if event.text is not None:
             return
 
+        module_id = getattr(event.run, "module_id", "")
+        state = getattr(getattr(event.run, "state", None), "value", "")
+        if module_id:
+            if state in {"completed", "failed", "cancelled"}:
+                self._running_module_runs.pop(event.run.id, None)
+            elif state:
+                self._running_module_runs[event.run.id] = module_id
+
         evidence_marker = None
         if (
             event.run.project_id == self.active_project_id
@@ -1187,20 +1530,32 @@ class DashboardUI:
             if evidence_marker == self._last_evidence_refresh:
                 evidence_marker = None
 
-        if self.active_view != "runs" and evidence_marker is None:
+        launchpad_module_id = module_id if self.active_view == "launchpad" else ""
+        if self.active_view != "runs" and evidence_marker is None and not launchpad_module_id:
             return
         if self._client is not None:
             self._client.safe_invoke(
-                lambda: self._apply_workspace_refresh(evidence_marker)
+                lambda: self._apply_workspace_refresh(evidence_marker, launchpad_module_id)
             )
             return
-        self._apply_workspace_refresh(evidence_marker)
+        self._apply_workspace_refresh(evidence_marker, launchpad_module_id)
 
     def _apply_workspace_refresh(
         self,
         evidence_marker: tuple[str, str] | None,
+        launchpad_module_id: str = "",
     ) -> None:
         """Refresh only the active table host after a run metadata event."""
+        if launchpad_module_id:
+            label = self.module_state_labels.get(launchpad_module_id)
+            if label is not None:
+                state = self.single_tool_run_state(launchpad_module_id)
+                label.set_text(state)
+                label.classes(
+                    add="interactive" if state == "RUNNING" else "muted",
+                    remove="muted" if state == "RUNNING" else "interactive",
+                )
+
         if self.active_view == "runs" and hasattr(self, "runs_result_host"):
             self.refresh_run_results()
             self.render_inspector()
@@ -1381,8 +1736,17 @@ class DashboardUI:
             self.selected_asset_ids.clear()
             self.selected_asset_id = None
             self._asset_selection_project_id = self.active_project_id
+        if self._discovery_scope_project_id != self.active_project_id:
+            self.selected_discovery_scope_ids = ()
+            self._discovery_scope_project_id = self.active_project_id
+        if self._enumeration_scope_project_id != self.active_project_id:
+            self.selected_enumeration_scope_id = None
+            self._enumeration_scope_project_id = self.active_project_id
+        if self._ffuf_wordlist_project_id != self.active_project_id:
+            self._reset_ffuf_wordlist_defaults()
+            self._ffuf_wordlist_project_id = self.active_project_id
         self.render_topbar()
-        if self.active_view in {"findings", "assets", "evidence", "scope", "runs"}:
+        if self.active_view in FUNCTIONAL_VIEWS:
             self.render_workspace()
             self.render_inspector()
         if self.settings_open and self.settings_section == "projects":
@@ -1578,17 +1942,10 @@ class DashboardUI:
     # === START: LAUNCHPAD VIEW ===
     def render_launchpad(self) -> None:
         """Render the module selection workspace."""
-        ui.label("OPERATIONS / LAUNCHPAD").classes("section-kicker")
+        self.module_state_labels = {}
+        self.render_workspace_breadcrumb()
         with ui.element("div").classes("title-row"):
             ui.label("Recon modules").classes("page-title")
-            ui.label(f"VIEW 01 / {len(self.module_catalog):02d} MODULES").classes("view-index")
-
-        with ui.element("div").classes("module-heading"):
-            with ui.element("div").classes("filters"):
-                ui.label("ALL").classes("filter-active")
-                ui.label("DISCOVERY")
-                ui.label("WEB")
-                ui.label("NETWORK")
 
         query = self.search_query.strip().casefold()
         visible_modules = tuple(
@@ -1597,11 +1954,32 @@ class DashboardUI:
             if not query
             or query in " ".join((module.description, module.bin, module.eyebrow)).casefold()
         )
-        with ui.element("section").classes("module-grid"):
-            for module in visible_modules:
-                self.render_module_card(module)
-        if not visible_modules:
-            ui.label("NO MODULES MATCH THE CURRENT SEARCH").classes("module-empty")
+        discovery_visible = not query or query in (
+            "web discovery multi-step subfinder dnsx httpx domain dns live services"
+        )
+        enumeration_visible = not query or query in (
+            "web enumeration multi-step httpx tlsx assets scope fingerprint tls"
+        )
+        with ui.element("div").classes("module-group-heading"):
+            ui.label("MULTI-STEP MODULES").classes("module-group-title")
+        if discovery_visible or enumeration_visible:
+            with ui.element("section").classes("module-grid task-module-grid"):
+                if discovery_visible:
+                    self.render_web_discovery_card()
+                if enumeration_visible:
+                    self.render_web_enumeration_card()
+        else:
+            ui.label("NO MULTI-STEP MODULES MATCH").classes("module-empty")
+
+        with ui.element("div").classes("module-separator"):
+            ui.label("SINGLE-TOOL LAUNCHERS").classes("module-group-title")
+            ui.label("DIRECT / INDEPENDENT").classes("module-group-note")
+        if visible_modules:
+            with ui.element("section").classes("module-grid"):
+                for module in visible_modules:
+                    self.render_module_card(module)
+        else:
+            ui.label("NO SINGLE-TOOL LAUNCHERS MATCH").classes("module-empty")
 
     # === END: LAUNCHPAD VIEW ===
 
@@ -1680,7 +2058,7 @@ class DashboardUI:
             self.selected_finding_id = findings[0]["id"]
         elif not findings:
             self.selected_finding_id = None
-        ui.label("ASSESSMENT / FINDINGS").classes("section-kicker")
+        self.render_workspace_breadcrumb()
         with ui.element("div").classes("title-row"):
             ui.label("Findings").classes("page-title")
             self.findings_index_label = ui.label().classes("view-index")
@@ -1709,6 +2087,7 @@ class DashboardUI:
         finding_ids = {finding["id"] for finding in page}
         if self.selected_finding_id not in finding_ids:
             self.selected_finding_id = page[0]["id"] if page else None
+        self.update_workspace_breadcrumb()
         if hasattr(self, "findings_index_label"):
             end = start + len(page)
             self.findings_index_label.set_text(
@@ -1770,7 +2149,7 @@ class DashboardUI:
     # === START: PROJECT RECORD VIEWS ===
     def render_assets_workspace(self) -> None:
         records = self.filtered_asset_records()
-        ui.label("INVENTORY / ASSETS").classes("section-kicker")
+        self.render_workspace_breadcrumb()
         with ui.element("div").classes("title-row"):
             ui.label("Assets").classes("page-title")
             self.assets_index_label = ui.label("").classes("view-index")
@@ -1806,6 +2185,7 @@ class DashboardUI:
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
 
     def toggle_asset_selection(
@@ -1892,6 +2272,7 @@ class DashboardUI:
         visible_ids = {record["id"] for record in visible_records}
         if self.selected_asset_id not in visible_ids:
             self.selected_asset_id = visible_records[0]["id"] if visible_records else None
+        self.update_workspace_breadcrumb()
         if hasattr(self, "assets_index_label"):
             end = start + len(visible_records)
             self.assets_index_label.set_text(
@@ -1984,7 +2365,7 @@ class DashboardUI:
 
     def render_evidence_workspace(self) -> None:
         records = self.evidence_anchor_records()
-        ui.label("PROVENANCE / EVIDENCE").classes("section-kicker")
+        self.render_workspace_breadcrumb()
         with ui.element("div").classes("title-row"):
             ui.label("Evidence").classes("page-title")
             self.evidence_index_label = ui.label("").classes("view-index")
@@ -2011,6 +2392,7 @@ class DashboardUI:
             self.expanded_evidence_anchor_id = None
             self.expanded_evidence_bucket = None
             self.expanded_evidence_asset_id = None
+        self.update_workspace_breadcrumb()
 
         page, page_index, page_count, start = self._record_page(
             records, self.record_page_indexes["evidence"]
@@ -2086,6 +2468,7 @@ class DashboardUI:
         self.selected_evidence_anchor_id = anchor_id
         self.selected_evidence_id = None
         self.refresh_evidence_results()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
 
     def toggle_evidence_bucket(self, anchor_id: str, category: str) -> None:
@@ -2107,6 +2490,7 @@ class DashboardUI:
         if self.inspector_collapsed:
             self.inspector_collapsed = False
             self.update_inspector_layout()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
 
     def toggle_evidence_asset_links(self, asset_id: str) -> None:
@@ -2115,6 +2499,7 @@ class DashboardUI:
             None if self.expanded_evidence_asset_id == asset_id else asset_id
         )
         self.refresh_evidence_results()
+        self.update_workspace_breadcrumb()
         self.render_inspector()
 
     def _render_evidence_anchor_children(self, record: dict[str, object]) -> None:
@@ -2240,7 +2625,7 @@ class DashboardUI:
         if records and self.selected_scope_id not in {item["id"] for item in records}:
             self.selected_scope_id = records[0]["id"]
         self.render_record_workspace(
-            view_id="scope", kicker="AUTHORIZATION / SCOPE", title="Scope",
+            view_id="scope", title="Scope",
             index=f"{len(records):02d} RULES",
             filters=("ALL", "ALLOWED", "DENIED", "REVIEW REQUIRED"), records=records,
             columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
@@ -2255,7 +2640,7 @@ class DashboardUI:
         elif not records:
             self.selected_run_id = None
         self.render_record_workspace(
-            view_id="runs", kicker="EXECUTION / RUNS", title="Runs", index=f"{len(records):02d} RECORDS",
+            view_id="runs", title="Runs", index=f"{len(records):02d} RECORDS",
             filters=("ALL", "ACTIVE", "COMPLETED", "FAILED", "QUEUED", "CANCELLED"), records=records,
             columns=(("state", "STATE"), ("module", "MODULE"), ("target", "TARGET"),
                      ("scope", "SCOPE"), ("duration", "DURATION"), ("started", "STARTED")),
@@ -2287,7 +2672,6 @@ class DashboardUI:
         self,
         *,
         view_id: str,
-        kicker: str,
         title: str,
         index: str,
         filters: tuple[str, ...],
@@ -2298,7 +2682,7 @@ class DashboardUI:
         interactive_filters: bool = False,
     ) -> None:
         """Render one of the project-aware record lists with a shared dense pattern."""
-        ui.label(kicker).classes("section-kicker")
+        self.render_workspace_breadcrumb()
         with ui.element("div").classes("title-row"):
             ui.label(title).classes("page-title")
             index_label = ui.label(index).classes("view-index")
@@ -2389,6 +2773,7 @@ class DashboardUI:
             attribute = f"selected_{view_id.rstrip('s')}_id"
             if hasattr(self, attribute):
                 setattr(self, attribute, selected_id or None)
+        self.update_workspace_breadcrumb()
 
         noun = index.rsplit(" ", 1)[-1]
         if index_label is not None:
@@ -2434,6 +2819,9 @@ class DashboardUI:
 
     # === START: MODULE CARD ===
     # One reusable card renderer handles every data-driven recon module.
+    def single_tool_run_state(self, module_id: str) -> str:
+        return "RUNNING" if module_id in self._running_module_runs.values() else "READY"
+
     def render_module_card(self, module: ModuleDefinition) -> None:
         selected = module.id == self.selected_module_id
         classes = "module-card selected" if selected else "module-card"
@@ -2442,14 +2830,81 @@ class DashboardUI:
         ).on("click", partial(self.select_module, module.id)):
             with ui.element("div").classes("card-head"):
                 with ui.element("div").classes("card-copy"):
-                    ui.label(module.display_eyebrow).classes("card-eyebrow")
-                    ui.label(module.description).classes("module-name")
-                    ui.label(module.bin.upper()).classes("module-tool")
+                    ui.label(f"/ LAUNCHPAD / {module.bin.upper()}").classes("card-eyebrow")
+                    ui.label(module.bin.upper()).classes("module-name")
+                    ui.label(module.summary or module.description).classes("module-tool")
                 icon(module.icon, "module-icon")
             with ui.element("div").classes("card-footer"):
-                ui.label(module.target_summary).classes("target-count")
-                health = self.module_health.get(module.id)
-                state = health.state if health else "UNCHECKED"
+                ui.label("MANUAL / SCOPE").classes("target-count")
+                state = self.single_tool_run_state(module.id)
+                label = ui.label(state).classes(
+                    f"state {'interactive' if state == 'RUNNING' else 'muted'}"
+                )
+                self.module_state_labels[module.id] = label
+
+    def web_discovery_health_state(self) -> str:
+        states = tuple(
+            self.module_health.get(module_id).state
+            if self.module_health.get(module_id) is not None else "UNCHECKED"
+            for module_id in ("01", "02", "04")
+        )
+        if all(state == "AVAILABLE" for state in states):
+            return "AVAILABLE"
+        if any(state in {"MISSING", "INCOMPATIBLE"} for state in states):
+            return "BLOCKED"
+        return "UNCHECKED"
+
+    def render_web_discovery_card(self) -> None:
+        selected = self.selected_module_id == WEB_DISCOVERY_ID
+        classes = "module-card task-module-card selected" if selected else "module-card task-module-card"
+        with ui.element("button").classes(classes).props(
+            'type=button aria-label="Configure Web Discovery"'
+        ).on("click", self.select_web_discovery_module):
+            with ui.element("div").classes("card-head"):
+                with ui.element("div").classes("card-copy"):
+                    ui.label("DISCOVERY / MULTI-STEP").classes("card-eyebrow")
+                    ui.label("Web Discovery").classes("module-name")
+                    ui.label("SUBFINDER > DNSX > HTTPX").classes("module-tool")
+                icon("account_tree", "module-icon")
+            with ui.element("div").classes("card-footer"):
+                ui.label("PROJECT SCOPE").classes("target-count")
+                state = self.web_discovery_health_state()
+                tone = "interactive" if state == "AVAILABLE" else "muted"
+                ui.label(state).classes(f"state {tone}")
+
+    def web_enumeration_health_state(self) -> str:
+        try:
+            chain = self.web_enumeration_module.get_chain(
+                self.selected_enumeration_chain_id
+            )
+        except ScopeValidationError:
+            return "BLOCKED"
+        states = tuple(
+            self.module_health.get(stage.module_id).state
+            if self.module_health.get(stage.module_id) is not None else "UNCHECKED"
+            for stage in chain.stages
+        )
+        if all(state == "AVAILABLE" for state in states):
+            return "AVAILABLE"
+        if any(state in {"MISSING", "INCOMPATIBLE"} for state in states):
+            return "BLOCKED"
+        return "UNCHECKED"
+
+    def render_web_enumeration_card(self) -> None:
+        selected = self.selected_module_id == WEB_ENUMERATION_ID
+        classes = "module-card task-module-card selected" if selected else "module-card task-module-card"
+        with ui.element("button").classes(classes).props(
+            'type=button aria-label="Configure Web Enumeration"'
+        ).on("click", self.select_web_enumeration_module):
+            with ui.element("div").classes("card-head"):
+                with ui.element("div").classes("card-copy"):
+                    ui.label("ENUMERATION / MULTI-STEP").classes("card-eyebrow")
+                    ui.label("Web Enumeration").classes("module-name")
+                    ui.label("GAU / HTTPX / TLSX / FFUF").classes("module-tool")
+                icon("manage_search", "module-icon")
+            with ui.element("div").classes("card-footer"):
+                ui.label("PROJECT ASSETS").classes("target-count")
+                state = self.web_enumeration_health_state()
                 tone = "interactive" if state == "AVAILABLE" else "muted"
                 ui.label(state).classes(f"state {tone}")
 
@@ -2461,7 +2916,7 @@ class DashboardUI:
         view_name = VIEW_NAMES[self.active_view]
         with ui.element("section").classes("nyi-view"):
             with ui.element("div").classes("nyi-frame"):
-                ui.label(f"VIEW / {self.active_view.upper()}").classes("section-kicker")
+                ui.label(f"/ {self.active_view.upper()}").classes("section-kicker")
                 ui.label(view_name).classes("nyi-title")
                 ui.label("NOT YET IMPLEMENTED").classes("nyi-status")
                 ui.label("Launchpad is the current development focus.").classes("nyi-copy")
@@ -2581,6 +3036,15 @@ class DashboardUI:
         if self.active_view != "launchpad":
             return
 
+        if self.selected_module_id == WEB_DISCOVERY_ID:
+            with self.inspector:
+                self.render_web_discovery_inspector()
+            return
+        if self.selected_module_id == WEB_ENUMERATION_ID:
+            with self.inspector:
+                self.render_web_enumeration_inspector()
+            return
+
         module = self.selected_module
         profile = self._selected_profile(module)
         target_mode = self.target_modes[module.id]
@@ -2662,13 +3126,28 @@ class DashboardUI:
                         ui.label("MODULE OPTIONS").classes("field-label")
                         for config_field in module.config_fields:
                             ui.label(config_field.label).classes("field-label")
-                            ui.input(
-                                value=self.module_config_values[module.id].get(config_field.id, ""),
-                                placeholder=config_field.placeholder,
-                                on_change=partial(
-                                    self.set_module_config, module.id, config_field.id
-                                ),
-                            ).props("dense outlined clearable").classes("config-control")
+                            value = self.module_config_values[module.id].get(config_field.id, "")
+                            if module.adapter == "ffuf" and config_field.id == "wordlist" and not value:
+                                self._reset_ffuf_wordlist_defaults()
+                                value = self.module_config_values[module.id][config_field.id]
+                            on_change = partial(
+                                self.set_module_config, module.id, config_field.id
+                            )
+                            if module.adapter == "ffuf" and config_field.id == "wordlist":
+                                ui.select(
+                                    self.ffuf_wordlist_options(value),
+                                    value=value or None,
+                                    on_change=on_change,
+                                    with_input=True,
+                                    new_value_mode="add-unique",
+                                    clearable=True,
+                                ).props("dense outlined options-dense").classes("config-control")
+                            else:
+                                ui.input(
+                                    value=value,
+                                    placeholder=config_field.placeholder,
+                                    on_change=on_change,
+                                ).props("dense outlined clearable").classes("config-control")
 
                 with ui.element("div").classes("field"):
                     ui.label("RUN TIMEOUT / SECONDS").classes("field-label")
@@ -2720,6 +3199,313 @@ class DashboardUI:
                     icon="play_arrow",
                     on_click=self.launch_selected_module,
                 ).props("unelevated no-caps").classes("launch-button")
+
+    def render_web_discovery_inspector(self) -> None:
+        with ui.element("div").classes("inspector-header"):
+            with ui.element("button").classes("inspector-toggle").props(
+                f'type=button aria-label="{"Expand module configuration" if self.inspector_collapsed else "Collapse module configuration"}"'
+            ).on("click", self.toggle_inspector_collapsed):
+                icon("chevron_left" if self.inspector_collapsed else "chevron_right")
+            with ui.element("div").classes("inspector-header-copy"):
+                ui.label("CONFIG / WEB DISCOVERY").classes("panel-number")
+                ui.label("Web Discovery").classes("panel-title")
+                ui.label(
+                    f"MULTI-STEP / {self.web_discovery_health_state()}"
+                ).classes("panel-tool")
+
+        if self.inspector_collapsed:
+            return
+
+        project = self.active_project
+        rules = ScopeStore(project.path).load().rules if project else ()
+        compatible_rules = tuple(
+            rule for rule in rules if self.web_discovery_module.supports_scope_rule(rule)
+        )
+        compatible_ids = {rule.id for rule in compatible_rules}
+        selected_ids = tuple(
+            rule_id for rule_id in self.selected_discovery_scope_ids
+            if rule_id in compatible_ids
+        )
+        if selected_ids != self.selected_discovery_scope_ids:
+            self.selected_discovery_scope_ids = selected_ids
+
+        with ui.element("div").classes("inspector-body"):
+            with ui.element("div").classes("field"):
+                ui.label("SCOPE SEEDS").classes("field-label")
+                options = {
+                    rule.id: f"{rule.target.value} / {rule.target.kind.value.upper()}"
+                    for rule in compatible_rules
+                }
+                ui.select(
+                    options,
+                    value=list(selected_ids),
+                    on_change=self.set_web_discovery_scope_items,
+                    multiple=True,
+                ).props("dense outlined options-dense use-chips").classes("config-control")
+                if project is None:
+                    ui.label("OPEN A PROJECT TO SELECT SCOPE ITEMS").classes("field-help")
+                elif not compatible_rules:
+                    ui.label(
+                        "ADD AN ALLOWED DOMAIN OR HTTP/S URL TO SCOPE"
+                    ).classes("field-help")
+                else:
+                    ui.label(
+                        "WILDCARD DOMAINS USE THEIR BASE DOMAIN AS THE DISCOVERY SEED"
+                    ).classes("field-help")
+
+            with ui.element("div").classes("field"):
+                ui.label("STAGES").classes("field-label")
+                for index, (tool, purpose) in enumerate((
+                    ("SUBFINDER", "PASSIVE SUBDOMAIN DISCOVERY"),
+                    ("DNSX", "DNS RESOLUTION"),
+                    ("HTTPX", "LIVE WEB VALIDATION"),
+                ), start=1):
+                    with ui.element("div").classes("workflow-stage"):
+                        ui.label(f"{index:02d}").classes("workflow-stage-number")
+                        with ui.element("div"):
+                            ui.label(tool).classes("workflow-stage-tool")
+                            ui.label(purpose).classes("workflow-stage-purpose")
+
+            with ui.element("div").classes("field"):
+                ui.label("PER-STAGE TIMEOUT / SECONDS").classes("field-label")
+                ui.input(
+                    value=self.web_discovery_timeout,
+                    placeholder="optional / no limit",
+                    on_change=self.set_web_discovery_timeout,
+                ).props("dense outlined clearable type=number min=1").classes("config-control")
+
+            seeds: tuple[Target, ...] = ()
+            seed_error = ""
+            if project is not None and selected_ids:
+                try:
+                    seeds = self.web_discovery_module.scope_seeds(rules, selected_ids)
+                except ScopeValidationError as error:
+                    seed_error = str(error)
+
+            with ui.element("div").classes("field"):
+                ui.label("COMMAND PREVIEW").classes("field-label")
+                ui.label(
+                    "DOWNSTREAM TARGET FILES ARE POPULATED FROM THE PREVIOUS STAGE"
+                ).classes("field-help")
+                with ui.element("div").classes("workflow-command-list"):
+                    if project is not None and seeds:
+                        try:
+                            previews = self.web_discovery_module.preview(
+                                seeds,
+                                project_id=project.id,
+                                project_name=project.name,
+                                scope_enforced=self.scope_enforced,
+                            )
+                            for stage_name, command in previews:
+                                with ui.element("div").classes("workflow-command"):
+                                    ui.label(stage_name.upper()).classes("workflow-command-stage")
+                                    ui.label(shlex.join(command.argv)).classes("workflow-command-text")
+                        except (ExecutionError, KeyError, ValueError) as error:
+                            ui.label(str(error)).classes("field-help")
+                    else:
+                        ui.label(seed_error or "SELECT SCOPE ITEMS TO PREVIEW").classes("field-help")
+
+            with ui.element("div").classes("run-context"):
+                ui.label("SEED COUNT")
+                ui.label(f"{len(seeds):02d} / PROJECT SCOPE").classes("run-context-value")
+
+            self.web_discovery_launch_button = ui.button(
+                "LAUNCH WEB DISCOVERY",
+                icon="play_arrow",
+                on_click=self.launch_web_discovery,
+            ).props("unelevated no-caps").classes("launch-button")
+            if self.web_discovery_running or project is None or not seeds:
+                self.web_discovery_launch_button.disable()
+
+    def render_web_enumeration_inspector(self) -> None:
+        with ui.element("div").classes("inspector-header"):
+            with ui.element("button").classes("inspector-toggle").props(
+                f'type=button aria-label="{"Expand module configuration" if self.inspector_collapsed else "Collapse module configuration"}"'
+            ).on("click", self.toggle_inspector_collapsed):
+                icon("chevron_left" if self.inspector_collapsed else "chevron_right")
+            with ui.element("div").classes("inspector-header-copy"):
+                ui.label("CONFIG / WEB ENUMERATION").classes("panel-number")
+                ui.label("Web Enumeration").classes("panel-title")
+                ui.label(
+                    f"MULTI-STEP / {self.web_enumeration_health_state()}"
+                ).classes("panel-tool")
+
+        if self.inspector_collapsed:
+            return
+
+        project = self.active_project
+        store = self.active_evidence_store()
+        chains = self.web_enumeration_module.chains
+        chain_ids = {chain.id for chain in chains}
+        if self.selected_enumeration_chain_id not in chain_ids:
+            self.selected_enumeration_chain_id = chains[0].id
+        chain = self.web_enumeration_module.get_chain(
+            self.selected_enumeration_chain_id
+        )
+        scope_items = tuple(
+            rule for rule in store.list_scope_rules()
+            if str(rule["scope_status"]) != "denied"
+        ) if store is not None else ()
+        scope_ids = {str(rule["id"]) for rule in scope_items}
+        if self.selected_enumeration_scope_id not in scope_ids:
+            self.selected_enumeration_scope_id = (
+                str(scope_items[0]["id"]) if scope_items else None
+            )
+
+        summary = None
+        summary_error = ""
+        if store is not None and self.selected_enumeration_scope_id:
+            try:
+                summary = self.web_enumeration_module.summarize(
+                    store,
+                    self.selected_enumeration_scope_id,
+                    chain.id,
+                )
+            except (KeyError, ScopeValidationError, ValueError) as error:
+                summary_error = str(error)
+
+        with ui.element("div").classes("inspector-body"):
+            with ui.element("div").classes("field"):
+                ui.label("TOOL CHAIN").classes("field-label")
+                ui.select(
+                    {item.id: item.name for item in chains},
+                    value=chain.id,
+                    on_change=self.set_web_enumeration_chain,
+                ).props("dense outlined options-dense").classes("config-control")
+                ui.label(chain.description.upper()).classes("field-help")
+
+            with ui.element("div").classes("field"):
+                ui.label("SCOPE ITEM").classes("field-label")
+                ui.select(
+                    {
+                        str(rule["id"]): self._enumeration_scope_label(rule)
+                        for rule in scope_items
+                    },
+                    value=self.selected_enumeration_scope_id,
+                    on_change=self.set_web_enumeration_scope_item,
+                ).props("dense outlined options-dense").classes("config-control")
+                if project is None:
+                    ui.label("OPEN A PROJECT TO SELECT SCOPE ITEMS").classes("field-help")
+                elif not scope_items:
+                    ui.label("ADD SCOPE AND RUN WEB DISCOVERY FIRST").classes("field-help")
+                else:
+                    ui.label(
+                        "EXACT RULES EXCLUDE SUBDOMAINS; WILDCARDS INCLUDE THEM"
+                    ).classes("field-help")
+
+            with ui.element("div").classes("field"):
+                ui.label("TARGET SNAPSHOT").classes("field-label")
+                if summary is None:
+                    ui.label(summary_error or "SELECT A SCOPE ITEM").classes("field-help")
+                else:
+                    ui.label(
+                        f"{summary.compatible_count:,} COMPATIBLE / "
+                        f"{summary.omitted_count:,} INCOMPATIBLE OMITTED"
+                    ).classes("field-help")
+                    for item in summary.preview:
+                        ui.label(
+                            f"{item.kind.value.upper()} / {item.target.normalized}"
+                        ).classes("workflow-command-text")
+                    if summary.compatible_count > len(summary.preview):
+                        ui.label(
+                            f"+ {summary.compatible_count - len(summary.preview):,} MORE"
+                        ).classes("field-help")
+
+            with ui.element("div").classes("field"):
+                ui.label("STAGES").classes("field-label")
+                for index, stage in enumerate(chain.stages, start=1):
+                    module = self.module_catalog.get(stage.module_id)
+                    with ui.element("div").classes("workflow-stage"):
+                        ui.label(f"{index:02d}").classes("workflow-stage-number")
+                        with ui.element("div"):
+                            ui.label(module.bin.upper()).classes("workflow-stage-tool")
+                            ui.label(stage.purpose).classes("workflow-stage-purpose")
+
+            if any(stage.module_id == "07" for stage in chain.stages):
+                if not self.web_enumeration_wordlist:
+                    self._reset_ffuf_wordlist_defaults()
+                with ui.element("div").classes("field"):
+                    ui.label("FFUF WORDLIST").classes("field-label")
+                    ui.select(
+                        self.ffuf_wordlist_options(self.web_enumeration_wordlist),
+                        value=self.web_enumeration_wordlist or None,
+                        on_change=self.set_web_enumeration_wordlist,
+                        with_input=True,
+                        new_value_mode="add-unique",
+                        clearable=True,
+                    ).props("dense outlined options-dense").classes("config-control")
+                    ui.label(
+                        "SECLISTS OR PROJECT WORDLISTS / CUSTOM ABSOLUTE PATHS ACCEPTED"
+                    ).classes("field-help")
+                    ui.label("ONE FFUF RUN IS CREATED PER INDEXED WEB URL").classes("field-help")
+                with ui.element("div").classes("field"):
+                    ui.label("RECURSION DEPTH").classes("field-label")
+                    ui.input(
+                        value=self.web_enumeration_depth,
+                        on_change=self.set_web_enumeration_depth,
+                    ).props("dense outlined type=number min=1 max=10").classes("config-control")
+                    ui.label("DEFAULT RECURSION FOLLOWS DISCOVERED DIRECTORIES ONLY").classes("field-help")
+
+            with ui.element("div").classes("field"):
+                ui.label("PER-STAGE TIMEOUT / SECONDS").classes("field-label")
+                ui.input(
+                    value=self.web_enumeration_timeout,
+                    placeholder="optional / no limit",
+                    on_change=self.set_web_enumeration_timeout,
+                ).props("dense outlined clearable type=number min=1").classes("config-control")
+
+            with ui.element("div").classes("field"):
+                ui.label("COMMAND PREVIEW").classes("field-label")
+                ui.label(
+                    "TARGET FILES CONTAIN THE COMPLETE LAUNCH-TIME ASSET SNAPSHOT"
+                ).classes("field-help")
+                with ui.element("div").classes("workflow-command-list"):
+                    if project is not None and summary is not None and summary.preview:
+                        try:
+                            previews = self.web_enumeration_module.preview(
+                                summary,
+                                project_id=project.id,
+                                project_name=project.name,
+                                scope_enforced=self.scope_enforced,
+                                wordlist=self.web_enumeration_wordlist,
+                                recursion_depth=(
+                                    int(self.web_enumeration_depth or "2")
+                                    if any(stage.module_id == "07" for stage in chain.stages)
+                                    else 2
+                                ),
+                            )
+                            for stage, command in previews:
+                                module = self.module_catalog.get(stage.module_id)
+                                with ui.element("div").classes("workflow-command"):
+                                    ui.label(module.bin.upper()).classes("workflow-command-stage")
+                                    ui.label(shlex.join(command.argv)).classes("workflow-command-text")
+                        except (ExecutionError, KeyError, ValueError) as error:
+                            ui.label(str(error)).classes("field-help")
+                    else:
+                        ui.label(summary_error or "NO COMPATIBLE ASSETS TO PREVIEW").classes("field-help")
+
+            with ui.element("div").classes("run-context"):
+                ui.label("TARGET COUNT")
+                ui.label(
+                    f"{summary.compatible_count if summary else 0:,} / PROJECT SCOPE"
+                ).classes("run-context-value")
+
+            self.web_enumeration_launch_button = ui.button(
+                "LAUNCH WEB ENUMERATION",
+                icon="play_arrow",
+                on_click=self.launch_web_enumeration,
+            ).props("unelevated no-caps").classes("launch-button")
+            if (
+                self.web_enumeration_running
+                or project is None
+                or summary is None
+                or summary.compatible_count == 0
+                or (
+                    any(stage.module_id == "07" for stage in chain.stages)
+                    and not self.web_enumeration_wordlist
+                )
+            ):
+                self.web_enumeration_launch_button.disable()
 
     def render_finding_inspector(self, finding: dict[str, str]) -> None:
         """Render details for the selected finding in the shared right inspector."""

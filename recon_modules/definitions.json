@@ -6,6 +6,7 @@
       "eyebrow": "discovery",
       "icon": "travel_explore",
       "description": "Subdomain Intel",
+      "summary": "Enumerate subdomains from passive sources",
       "bin": "subfinder",
       "path": "subfinder",
       "adapter": "subfinder",
@@ -43,6 +44,7 @@
       "eyebrow": "dns",
       "icon": "dns",
       "description": "Resolve Records",
+      "summary": "Resolve hosts and enumerate DNS records",
       "bin": "dnsx",
       "path": "dnsx",
       "adapter": "dnsx",
@@ -84,6 +86,7 @@
       "eyebrow": "network",
       "icon": "radar",
       "description": "Port Discovery",
+      "summary": "Scan ports and fingerprint exposed services",
       "bin": "nmap",
       "path": "nmap",
       "adapter": "nmap",
@@ -117,6 +120,7 @@
       "eyebrow": "http",
       "icon": "http",
       "description": "Web Probe",
+      "summary": "Probe HTTP services and fingerprint web stacks",
       "bin": "httpx",
       "path": "httpx",
       "adapter": "httpx",
@@ -159,6 +163,7 @@
       "eyebrow": "archive",
       "icon": "history",
       "description": "Known URLs",
+      "summary": "Lookup known URLs",
       "bin": "gau",
       "path": "gau",
       "adapter": "gau",
@@ -193,6 +198,7 @@
       "eyebrow": "tls",
       "icon": "verified_user",
       "description": "TLS Inspect",
+      "summary": "Enumerate TLS certificates and supported ciphers",
       "bin": "tlsx",
       "path": "tlsx",
       "adapter": "tlsx",
@@ -226,6 +232,45 @@
           "name": "Full TLS metadata",
           "arguments": ["-u", "{target}", "-san", "-cn", "-so", "-tls-version", "-cipher", "-hash", "sha256", "-serial", "-cert", "-tls-chain"],
           "output_format": "jsonl"
+        }
+      ]
+    },
+    {
+      "id": "07",
+      "eyebrow": "content",
+      "icon": "folder_open",
+      "description": "Directory Brute",
+      "summary": "Brute directories and files with ffuf",
+      "bin": "ffuf",
+      "path": "ffuf",
+      "adapter": "ffuf",
+      "config_fields": [
+        {
+          "id": "wordlist",
+          "label": "WORDLIST",
+          "argument": "-w",
+          "placeholder": "absolute path to wordlist"
+        },
+        {
+          "id": "recursion_depth",
+          "label": "RECURSION DEPTH",
+          "argument": "-recursion-depth",
+          "placeholder": "1-10"
+        }
+      ],
+      "target_summary": "ADD TARGET",
+      "target_placeholder": "HTTP/S URL",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Directory discovery",
+          "arguments": ["-u", "{target}", "-ac"],
+          "output_format": "json"
+        },
+        {
+          "name": "Recursive directory discovery",
+          "arguments": ["-u", "{target}", "-ac", "-recursion", "-recursion-strategy", "default"],
+          "output_format": "json"
         }
       ]
     }

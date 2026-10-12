@@ -10,8 +10,38 @@ import re
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit, urlunsplit
+
+from nullbound_scope import TargetKind
 
 from .models import CommandSpec, ExecutionError, RunRequest
+
+
+SECLISTS_WEB_CONTENT_ROOT = Path("/usr/share/seclists/Discovery/Web-Content")
+DEFAULT_FFUF_WORDLIST = "raft-medium-directories.txt"
+
+
+def discover_ffuf_wordlists(
+    root: Path = SECLISTS_WEB_CONTENT_ROOT,
+    *,
+    all_files: bool = False,
+) -> tuple[Path, ...]:
+    """Return readable FFUF wordlist candidates with the preferred list first."""
+    try:
+        if not root.is_dir():
+            return ()
+        wordlists = tuple(
+            path for path in root.rglob("*" if all_files else "*.txt") if path.is_file()
+        )
+    except OSError:
+        return ()
+    return tuple(sorted(
+        wordlists,
+        key=lambda path: (
+            path.name.casefold() != DEFAULT_FFUF_WORDLIST.casefold(),
+            path.relative_to(root).as_posix().casefold(),
+        ),
+    ))
 
 
 def expand_argument_template(
@@ -276,6 +306,47 @@ class GauAdapter(ArtifactAdapter):
         return ("--version",)
 
 
+class FfufAdapter(ArtifactAdapter):
+    key = "ffuf"
+    version_required = True
+    artifact_name = "ffuf.json"
+    artifact_arguments = ("-noninteractive", "-of", "json", "-o", "{artifact}")
+    artifact_format = "json"
+
+    def version_arguments(self) -> tuple[str, ...]:
+        return ("-V",)
+
+    def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
+        targets = request.context.selection.targets
+        if len(targets) != 1 or targets[0].kind is not TargetKind.URL:
+            raise ExecutionError("ffuf directory discovery requires exactly one HTTP/S URL")
+        options = dict(request.options)
+        wordlist_text = options.get("wordlist", "").strip()
+        if not wordlist_text:
+            raise ExecutionError("ffuf directory discovery requires a wordlist")
+        wordlist = Path(wordlist_text).expanduser().resolve()
+        if not wordlist.is_file():
+            raise ExecutionError(f"ffuf wordlist does not exist: {wordlist}")
+        if depth_text := options.get("recursion_depth", "").strip():
+            try:
+                depth = int(depth_text)
+            except ValueError as error:
+                raise ExecutionError("ffuf recursion depth must be a whole number from 1 to 10") from error
+            if not 1 <= depth <= 10:
+                raise ExecutionError("ffuf recursion depth must be a whole number from 1 to 10")
+
+        command = super().build_command(request, run_path, executable)
+        arguments = list(command.arguments)
+        url_index = arguments.index("-u") + 1
+        parsed = urlsplit(targets[0].normalized)
+        arguments[url_index] = urlunsplit((
+            parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/FUZZ", "", "",
+        ))
+        wordlist_index = arguments.index("-w") + 1
+        arguments[wordlist_index] = str(wordlist)
+        return CommandSpec(command.executable, tuple(arguments), command.output_format)
+
+
 class TlsxAdapter(ProjectDiscoveryAdapter):
     key = "tlsx"
 
@@ -291,7 +362,7 @@ class AdapterRegistry:
     def __init__(self, adapters: tuple[ToolAdapter, ...] | None = None) -> None:
         installed = adapters or (
             DeclarativeAdapter(), SubfinderAdapter(), DnsxAdapter(), NmapAdapter(),
-            HttpxAdapter(), GauAdapter(), TlsxAdapter(),
+            HttpxAdapter(), GauAdapter(), FfufAdapter(), TlsxAdapter(),
         )
         self._adapters = {adapter.key: adapter for adapter in installed}
 

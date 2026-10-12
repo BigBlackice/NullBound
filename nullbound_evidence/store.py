@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import sqlite3
+from typing import Iterator
 from uuid import uuid4
 
 from nullbound_scope import ScopeDocument, Target, TargetKind, evaluate_target
@@ -653,6 +654,94 @@ class EvidenceStore:
         if group is None:
             raise KeyError(anchor_id)
         return tuple(str(rule["id"]) for rule in group["rules"])
+
+    def _enumeration_asset_query(
+        self,
+        rule_id: str,
+        kinds: tuple[AssetKind, ...],
+    ) -> tuple[str, list[object]]:
+        """Select scope-tagged assets and their directed evidence descendants."""
+        if not any(str(rule["id"]) == rule_id for rule in self.list_scope_rules()):
+            raise KeyError(rule_id)
+        values: list[object] = [rule_id]
+        kind_filter = ""
+        if kinds:
+            kind_placeholders = ", ".join("?" for _ in kinds)
+            kind_filter = f" AND a.kind IN ({kind_placeholders})"
+            values.extend(kind.value for kind in kinds)
+        query = f"""WITH RECURSIVE anchor_assets(id) AS (
+                SELECT id FROM assets
+                WHERE matched_rule_id = ?
+                  AND scope_disposition != 'denied'
+            ), candidate_assets(id) AS (
+                SELECT id FROM anchor_assets
+                UNION
+                SELECT CASE
+                    WHEN r.relation IN ('hosted_by', 'runs_on')
+                    THEN r.source_id
+                    ELSE r.target_id
+                END
+                FROM relationships r
+                JOIN candidate_assets parent
+                  ON (r.relation IN ('hosted_by', 'runs_on')
+                      AND r.target_id = parent.id)
+                  OR (r.relation NOT IN ('hosted_by', 'runs_on')
+                      AND r.source_id = parent.id)
+                WHERE r.source_type = 'asset' AND r.target_type = 'asset'
+                  AND r.relation IN (
+                      'resolves_to', 'exposes_service', 'uses_technology',
+                      'hosted_by', 'runs_on'
+                  )
+            )
+            SELECT DISTINCT a.* FROM assets a
+            JOIN candidate_assets candidate ON candidate.id = a.id
+            WHERE a.scope_disposition != 'denied'{kind_filter}"""
+        return query, values
+
+    def count_enumeration_assets(
+        self,
+        rule_id: str,
+        kinds: tuple[AssetKind, ...] = (),
+    ) -> int:
+        query, values = self._enumeration_asset_query(rule_id, kinds)
+        with self.database.read() as connection:
+            return int(connection.execute(
+                f"SELECT COUNT(*) FROM ({query})", values
+            ).fetchone()[0])
+
+    def preview_enumeration_assets(
+        self,
+        rule_id: str,
+        kinds: tuple[AssetKind, ...],
+        *,
+        limit: int = 8,
+    ) -> tuple[AssetRecord, ...]:
+        query, values = self._enumeration_asset_query(rule_id, kinds)
+        limit = min(max(int(limit), 1), 25)
+        with self.database.read() as connection:
+            rows = connection.execute(
+                query + " ORDER BY a.display_name COLLATE NOCASE, a.id LIMIT ?",
+                (*values, limit),
+            ).fetchall()
+        return tuple(self._asset(row) for row in rows)
+
+    def iter_enumeration_assets(
+        self,
+        rule_id: str,
+        kinds: tuple[AssetKind, ...],
+        *,
+        batch_size: int = 500,
+    ) -> Iterator[AssetRecord]:
+        """Stream a complete launch snapshot without mounting it in the UI."""
+        query, values = self._enumeration_asset_query(rule_id, kinds)
+        batch_size = min(max(int(batch_size), 1), 2_000)
+        with self.database.read() as connection:
+            cursor = connection.execute(
+                query + " ORDER BY a.display_name COLLATE NOCASE, a.id", values
+            )
+            while rows := cursor.fetchmany(batch_size):
+                for row in rows:
+                    yield self._asset(row)
 
     def list_evidence_anchor_assets(
         self,

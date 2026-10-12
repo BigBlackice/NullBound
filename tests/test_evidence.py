@@ -15,6 +15,7 @@ from nullbound_evidence import (
     DnsxJsonlParser,
     EvidencePipeline,
     EvidenceStore,
+    FfufJsonParser,
     FindingSeverity,
     GauJsonlParser,
     HttpxJsonlParser,
@@ -366,6 +367,19 @@ class EvidenceFrameworkTests(unittest.TestCase):
         service = next(record for record in records if record.kind is AssetKind.SERVICE)
         self.assertIn("uses_technology", {item.relation for item in service.related})
 
+    def test_ffuf_json_parser_indexes_discovered_urls(self) -> None:
+        path = self.project_path / "ffuf.json"
+        path.write_text(json.dumps({"results": [{
+            "url": "https://api.example.com/admin/", "status": 200,
+            "length": 421, "content-type": "text/html",
+        }]}), encoding="utf-8")
+
+        record = FfufJsonParser().parse(path, run_id="RUN-FFUF")[0]
+
+        self.assertEqual(record.kind, AssetKind.URL)
+        self.assertEqual(record.value, "https://api.example.com/admin/")
+        self.assertEqual(record.metadata["status"], 200)
+
     def test_subfinder_parser_preserves_provider_provenance(self) -> None:
         path = self.project_path / "subfinder.jsonl"
         path.write_text(json.dumps({
@@ -382,6 +396,8 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual(
             records[0].metadata["sources"], ("crtsh", "hackertarget")
         )
+        self.assertEqual(records[0].related[0].value, "example.com")
+        self.assertEqual(records[0].related[0].relation, "discovered_from")
 
     def test_amass_parser_is_not_registered_in_the_active_pipeline(self) -> None:
         with self.assertRaisesRegex(KeyError, "unknown evidence parser"):
@@ -434,6 +450,12 @@ class EvidenceFrameworkTests(unittest.TestCase):
             "gau": (
                 "gau.jsonl",
                 json.dumps({"url": "https://archive.example.com/old", "source": "wayback"}) + "\n",
+            ),
+            "ffuf": (
+                "ffuf.json",
+                json.dumps({"results": [{
+                    "url": "https://web.example.com/admin", "status": 200,
+                }]}) + "\n",
             ),
             "tlsx": (
                 "tlsx.jsonl",

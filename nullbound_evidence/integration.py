@@ -26,6 +26,7 @@ class ProjectRunIngestor:
         "nmap": "nmap.xml",
         "httpx": "httpx.jsonl",
         "gau": "gau.jsonl",
+        "ffuf": "ffuf.json",
         "tlsx": "tlsx.jsonl",
     }
 

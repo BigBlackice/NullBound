@@ -30,6 +30,7 @@ from .normalization import normalize_record, normalize_value
 from .parsers import (
     DnsxJsonlParser,
     EvidenceParser,
+    FfufJsonParser,
     GauJsonlParser,
     HttpxJsonlParser,
     JsonLinesEnvelopeParser,
@@ -47,6 +48,7 @@ __all__ = [
     "CorrelationRule", "DATABASE_NAME", "DATABASE_SCHEMA_VERSION", "DatabaseVersionError",
     "DnsxJsonlParser", "EvidenceAnchorSummary", "EvidenceAssetLink", "EvidenceAssetSummary",
     "EvidenceKind", "EvidenceParser", "EvidencePipeline", "EvidenceRecord", "EvidenceStore",
+    "FfufJsonParser",
     "FindingRecord", "FindingSeverity", "FindingState", "IngestionResult",
     "GauJsonlParser", "HttpxJsonlParser", "JsonLinesEnvelopeParser", "NORMALIZATION_VERSION",
     "NmapXmlParser", "NormalizedRecord", "ParsedFinding", "ParsedRecord", "ParserRegistry",

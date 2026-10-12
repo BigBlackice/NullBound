@@ -107,6 +107,7 @@ class ModuleDefinition:
     description: str
     bin: str
     path: str
+    summary: str = ""
     adapter: str = "declarative"
     target_summary: str = "ADD TARGET"
     target_placeholder: str = ""
@@ -139,6 +140,7 @@ class ModuleDefinition:
             description=required["description"],
             bin=required["bin"],
             path=required["path"],
+            summary=str(data.get("summary", "")).strip(),
             adapter=str(data.get("adapter", "declarative")).strip() or "declarative",
             target_summary=str(data.get("target_summary", "ADD TARGET")),
             # Read the old key as a migration fallback, but never submit it as a value.
@@ -172,6 +174,7 @@ class ModuleDefinition:
             "description": self.description,
             "bin": self.bin,
             "path": self.path,
+            "summary": self.summary,
             "adapter": self.adapter,
             "target_summary": self.target_summary,
             "target_placeholder": self.target_placeholder,

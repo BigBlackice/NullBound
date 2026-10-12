@@ -134,10 +134,18 @@ class SubfinderJsonlParser:
             metadata = _json_metadata(data, ("input", "timestamp"))
             if sources:
                 metadata["sources"] = sources
+            input_domain = str(data.get("input") or "").strip()
+            related = (
+                (AssetReference(
+                    _host_kind(input_domain), input_domain, "discovered_from"
+                ),)
+                if input_domain and input_domain.casefold().rstrip(".") != host.casefold().rstrip(".")
+                else ()
+            )
             records.append(ParsedRecord(
                 _host_kind(host), host, self.key, run_id=run_id,
                 artifact_path=_artifact_name(artifact),
-                observed_at=data.get("timestamp"), metadata=metadata,
+                observed_at=data.get("timestamp"), metadata=metadata, related=related,
             ))
         return tuple(records)
 
@@ -233,6 +241,36 @@ class GauJsonlParser:
                 artifact_path=_artifact_name(artifact),
                 observed_at=data.get("timestamp") or data.get("date"),
                 metadata=_json_metadata(data, ("source", "status", "mime", "method")),
+            ))
+        return tuple(records)
+
+
+class FfufJsonParser:
+    key = "ffuf"
+
+    def parse(self, path: Path, *, run_id: str | None = None) -> tuple[ParsedRecord, ...]:
+        artifact = Path(path)
+        try:
+            data = json.loads(artifact.read_text(encoding="utf-8", errors="replace"))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid ffuf JSON: {artifact}") from error
+        results = data.get("results") if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            raise ValueError("ffuf JSON has no results array")
+        records: list[ParsedRecord] = []
+        for index, result in enumerate(results, start=1):
+            if not isinstance(result, dict):
+                raise ValueError(f"ffuf result {index} is not an object")
+            url = str(result.get("url") or "").strip()
+            if not url:
+                raise ValueError(f"ffuf result {index} has no URL")
+            records.append(ParsedRecord(
+                AssetKind.URL, url, self.key, run_id=run_id,
+                artifact_path=_artifact_name(artifact),
+                metadata=_json_metadata(result, (
+                    "status", "length", "words", "lines", "content-type",
+                    "redirectlocation", "duration",
+                )),
             ))
         return tuple(records)
 
@@ -351,7 +389,7 @@ class ParserRegistry:
     def native(cls) -> "ParserRegistry":
         return cls((
             SubfinderJsonlParser(), DnsxJsonlParser(), NmapXmlParser(),
-            HttpxJsonlParser(), GauJsonlParser(), TlsxJsonlParser(),
+            HttpxJsonlParser(), GauJsonlParser(), FfufJsonParser(), TlsxJsonlParser(),
         ))
 
     def register(self, parser: EvidenceParser) -> None:

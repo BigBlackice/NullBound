@@ -112,6 +112,11 @@ class Project:
         return self.path / "runs"
 
     @property
+    def wordlists_path(self) -> Path:
+        """Operator-supplied wordlists stored with this project."""
+        return self.path / "wordlists"
+
+    @property
     def scope_path(self) -> Path:
         """Optional versioned target/scope data stored beside project metadata."""
         return self.path / "scope.json"

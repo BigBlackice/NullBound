@@ -51,12 +51,13 @@ PACKAGES_DIR="$TOOLS_ROOT/packages"
 DOWNLOADS_DIR="$TOOLS_ROOT/downloads"
 NMAP_PREFIX="$TOOLS_ROOT/nmap"
 
-TOOLS=(subfinder dnsx nmap httpx gau tlsx)
+TOOLS=(subfinder dnsx nmap httpx gau ffuf tlsx)
 declare -A GO_PACKAGES=(
     [subfinder]='github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest'
     [dnsx]='github.com/projectdiscovery/dnsx/cmd/dnsx@latest'
     [httpx]='github.com/projectdiscovery/httpx/cmd/httpx@latest'
     [gau]='github.com/lc/gau/v2/cmd/gau@latest'
+    [ffuf]='github.com/ffuf/ffuf/v2@latest'
     [tlsx]='github.com/projectdiscovery/tlsx/cmd/tlsx@latest'
 )
 declare -A GITHUB_REPOSITORIES=(
@@ -64,6 +65,7 @@ declare -A GITHUB_REPOSITORIES=(
     [dnsx]='projectdiscovery/dnsx'
     [httpx]='projectdiscovery/httpx'
     [gau]='lc/gau'
+    [ffuf]='ffuf/ffuf'
     [tlsx]='projectdiscovery/tlsx'
 )
 declare -A CONFIGURED_PATHS=()
@@ -100,6 +102,7 @@ fi
 version_arguments() {
     case "$1" in
         nmap|gau) printf '%s\n' '--version' ;;
+        ffuf) printf '%s\n' '-V' ;;
         *) printf '%s\n' '-version' ;;
     esac
 }
@@ -111,6 +114,7 @@ version_pattern() {
         dnsx) printf '%s\n' 'dnsx' ;;
         httpx) printf '%s\n' 'httpx' ;;
         gau) printf '%s\n' '(gau|v[0-9]+\.)' ;;
+        ffuf) printf '%s\n' 'ffuf' ;;
         tlsx) printf '%s\n' 'tlsx' ;;
     esac
 }

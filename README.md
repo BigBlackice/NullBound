@@ -17,6 +17,12 @@ requiring a paid proxy or hosted service.
   project scope.
 - Filter Runs, Assets, and Findings by in-scope or out-of-scope state.
 - Create and edit tool launchers and scan profiles from the application.
+- Run the project-only Web Discovery module to pass reviewed scope seeds through
+  Subfinder, dnsx, and httpx while retaining each tool as a separate auditable run.
+- Run Web Enumeration against every compatible asset beneath one selected scope
+  item, using either a quick httpx/tlsx chain or GAU followed by deeper HTTP/TLS
+  collection. A third chain probes HTTP services and runs bounded recursive FFUF
+  directory discovery from an operator-selected wordlist.
 - Reopen project tabs automatically after restarting NullBound. Projects you close
   stay closed.
 
@@ -32,6 +38,7 @@ when you enable scope enforcement.
 | Nmap | Port and service discovery |
 | httpx | HTTP probing and web metadata |
 | gau | Known URL collection from public archives |
+| ffuf | Directory and file discovery |
 | tlsx | TLS and certificate inspection |
 
 These tools are separate programs. NullBound can detect existing installations or
@@ -119,6 +126,26 @@ NullBound session. When you create a project, NullBound can attach completed
 session runs to it or permanently delete them. Active session runs must finish or
 be cancelled first.
 
+For multi-step discovery, open a project, add an allowed domain or HTTP/S URL on
+the **Scope** page, then select **Web Discovery** below the divider on Launchpad.
+Review the scope seeds and three command previews before launching it.
+
+Web Enumeration selects one specific scope rule. An exact domain such as
+`example.com` does not include its subdomains; use `*.example.com` when discovered
+subdomains should be enumerated. The recursive directory chain also requires a
+local FFUF wordlist and an explicit depth from 1 to 10. On Kali, NullBound reads
+`/usr/share/seclists/Discovery/Web-Content`, defaults to
+`raft-medium-directories.txt`, and exposes the other text lists in the FFUF
+wordlist dropdown. Every project also has a recursive `wordlists/` folder for
+operator-supplied directory, password, or other lists. Those files are offered
+after SecLists and become FFUF's fallback when SecLists is unavailable. A custom
+absolute path can still be entered.
+
+After discovery has populated **Assets**, select **Web Enumeration** on Launchpad.
+Choose one scope item and a tool chain. NullBound expands that scope root through
+recorded Evidence relationships, previews a bounded target sample, and snapshots
+the complete target set into each ordinary tool run when launched.
+
 ## Projects and saved data
 
 Projects keep an engagement's scope, run history, raw artifacts, and normalized
@@ -129,6 +156,7 @@ records together. By default they are created under:
   project.json
   project.db
   scope.json
+  wordlists/
   runs/
     RUN-YYYYMMDD-HHMMSS-XXXXXX/
       run.json
@@ -194,7 +222,7 @@ Run the test suite with:
 ```bash
 python -m unittest discover -s tests -v
 ```
-Scope and Proxy enforcement not yet implemented.
+Proxy enforcement is not yet implemented.
 
 Planned features and longer-term performance work are tracked in
 [`todo.md`](todo.md).

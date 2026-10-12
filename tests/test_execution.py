@@ -16,14 +16,17 @@ from nullbound_execution import (
     AdapterRegistry,
     CommandSpec,
     CompanionProcessSpec,
+    DEFAULT_FFUF_WORDLIST,
     DeclarativeAdapter,
     ExecutionError,
     ExecutionManager,
+    FfufAdapter,
     RunRequest,
     RunState,
     RunStore,
     ToolAdapter,
     HttpxAdapter,
+    discover_ffuf_wordlists,
     expand_argument_template,
 )
 from nullbound_scope import ExecutionContext, Target, TargetSelection
@@ -59,6 +62,32 @@ def request_for(script: str) -> RunRequest:
 
 
 class AdapterTests(unittest.TestCase):
+    def test_seclists_discovery_prefers_raft_medium_and_includes_nested_lists(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            preferred = root / DEFAULT_FFUF_WORDLIST
+            preferred.write_text("admin\n", encoding="utf-8")
+            nested = root / "CMS" / "wordpress.txt"
+            nested.parent.mkdir()
+            nested.write_text("wp-admin\n", encoding="utf-8")
+            (root / "README.md").write_text("docs", encoding="utf-8")
+
+            wordlists = discover_ffuf_wordlists(root)
+
+        self.assertEqual(wordlists, (preferred, nested))
+
+    def test_ffuf_wordlist_discovery_can_include_any_project_file(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            extensionless = root / "passwords"
+            extensionless.write_text("secret\n", encoding="utf-8")
+            binary_named = root / "content.lst"
+            binary_named.write_text("admin\n", encoding="utf-8")
+
+            wordlists = discover_ffuf_wordlists(root, all_files=True)
+
+        self.assertEqual(wordlists, (binary_named, extensionless))
+
     def test_httpx_catalog_has_an_executable_argv_profile(self) -> None:
         module = load_default_catalog().get("04")
         self.assertEqual(module.adapter, "httpx")
@@ -87,10 +116,11 @@ class AdapterTests(unittest.TestCase):
         target_values = {
             "01": "example.com", "02": "api.example.com", "03": "192.0.2.10",
             "04": "https://example.com", "05": "example.com", "06": "example.com",
+            "07": "https://example.com",
         }
         artifact_flags = {
             "01": "-o", "02": "-o", "03": "-oX",
-            "04": "-o", "05": "--o", "06": "-o",
+            "04": "-o", "05": "--o", "06": "-o", "07": "-o",
         }
         registry = AdapterRegistry()
 
@@ -99,12 +129,18 @@ class AdapterTests(unittest.TestCase):
             for module in catalog:
                 for profile in module.profiles:
                     with self.subTest(module=module.bin, profile=profile.name):
+                        options = (
+                            (("wordlist", str(root / "words.txt")),)
+                            if module.id == "07" else ()
+                        )
+                        (root / "words.txt").write_text("admin\n", encoding="utf-8")
                         request = RunRequest(
                             module=module,
                             profile=profile,
                             context=ExecutionContext(
                                 selection=TargetSelection.direct((Target.parse(target_values[module.id]),))
                             ),
+                            options=options,
                         )
                         run_path = root / module.bin
                         command = registry.get(module.adapter).build_command(
@@ -113,7 +149,7 @@ class AdapterTests(unittest.TestCase):
                         self.assertEqual(command.executable, module.bin)
                         self.assertIn(artifact_flags[module.id], command.arguments)
                         self.assertNotIn(";", command.arguments)
-                        self.assertIn(command.output_format, {"jsonl", "xml"})
+                        self.assertIn(command.output_format, {"json", "jsonl", "xml"})
 
             dns_targets = root / "dnsx" / "inputs" / "targets.txt"
             self.assertEqual(dns_targets.read_text(encoding="utf-8"), "api.example.com\n")
@@ -198,6 +234,33 @@ class AdapterTests(unittest.TestCase):
         resolver_index = command.arguments.index("-r")
         self.assertEqual(command.arguments[resolver_index + 1], "udp:10.64.0.1:53")
 
+    def test_ffuf_builds_a_bounded_recursive_directory_command(self) -> None:
+        module = load_default_catalog().get("07")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            wordlist = root / "words.txt"
+            wordlist.write_text("admin\n", encoding="utf-8")
+            request = RunRequest(
+                module=module,
+                profile=module.profiles[1],
+                context=ExecutionContext(
+                    selection=TargetSelection.direct((Target.parse("https://example.com/app?x=1"),))
+                ),
+                options=(("wordlist", str(wordlist)), ("recursion_depth", "3")),
+            )
+
+            command = FfufAdapter().build_command(request, root / "run", "ffuf")
+
+            self.assertIn("https://example.com/app/FUZZ", command.arguments)
+            self.assertIn("-recursion", command.arguments)
+            self.assertEqual(
+                command.arguments[command.arguments.index("-recursion-depth") + 1], "3"
+            )
+            self.assertEqual(command.arguments[-5:], (
+                "-noninteractive", "-of", "json", "-o",
+                str(root / "run" / "artifacts" / "ffuf.json"),
+            ))
+
     def test_preview_uses_real_artifact_command_with_placeholder_run_path(self) -> None:
         module = load_default_catalog().get("04")
         request = RunRequest(
@@ -241,12 +304,17 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionError, "unknown module adapter"):
             AdapterRegistry().get("amass")
 
-    def test_windows_setup_bootstraps_subfinder_and_not_amass(self) -> None:
+    def test_setup_scripts_bootstrap_ffuf_and_not_amass(self) -> None:
         setup_script = (
             Path(__file__).parents[1] / "scripts" / "setup-tools.ps1"
         ).read_text(encoding="utf-8")
+        linux_setup = (
+            Path(__file__).parents[1] / "scripts" / "setup-tools.sh"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("projectdiscovery/subfinder", setup_script)
+        self.assertIn("ffuf/ffuf", setup_script)
+        self.assertIn("github.com/ffuf/ffuf/v2@latest", linux_setup)
         self.assertNotIn("owasp-amass/amass", setup_script)
 
 

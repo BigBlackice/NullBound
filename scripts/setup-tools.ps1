@@ -30,6 +30,7 @@ $GitHubTools = [ordered]@{
     dnsx  = @{ Repository = 'projectdiscovery/dnsx'; VersionArguments = @('-version'); VersionPattern = '(?i)dnsx' }
     httpx = @{ Repository = 'projectdiscovery/httpx'; VersionArguments = @('-version'); VersionPattern = '(?i)httpx' }
     gau   = @{ Repository = 'lc/gau'; VersionArguments = @('--version'); VersionPattern = '(?i)(gau|v\d+\.)' }
+    ffuf  = @{ Repository = 'ffuf/ffuf'; VersionArguments = @('-V'); VersionPattern = '(?i)ffuf' }
     tlsx  = @{ Repository = 'projectdiscovery/tlsx'; VersionArguments = @('-version'); VersionPattern = '(?i)tlsx' }
 }
 
@@ -39,6 +40,7 @@ $VersionChecks = @{
     nmap  = @{ Arguments = @('--version'); Pattern = '(?i)nmap version' }
     httpx = @{ Arguments = @('-version'); Pattern = '(?i)httpx' }
     gau   = @{ Arguments = @('--version'); Pattern = '(?i)(gau|v\d+\.)' }
+    ffuf  = @{ Arguments = @('-V'); Pattern = '(?i)ffuf' }
     tlsx  = @{ Arguments = @('-version'); Pattern = '(?i)tlsx' }
 }
 

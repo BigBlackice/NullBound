@@ -44,6 +44,7 @@ class OwnershipConfidence(StrEnum):
 class TargetSource(StrEnum):
     DIRECT = "direct"
     TARGET_SET = "target_set"
+    SCOPE_ANCHOR = "scope_anchor"
 
 
 def _enum_value(enum_type: type[StrEnum], value: object, field_name: str) -> Any:
@@ -330,6 +331,10 @@ class TargetSelection:
             target_set_name=target_set.name,
         )
 
+    @classmethod
+    def scope_anchor(cls, targets: Iterable[Target]) -> TargetSelection:
+        return cls(source=TargetSource.SCOPE_ANCHOR, targets=tuple(targets))
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionContext:
@@ -345,3 +350,5 @@ class ExecutionContext:
             raise ScopeValidationError("project id and name must either both be set or both be absent")
         if self.selection.source is TargetSource.TARGET_SET and self.project_id is None:
             raise ScopeValidationError("saved project target sets require a project context")
+        if self.selection.source is TargetSource.SCOPE_ANCHOR and self.project_id is None:
+            raise ScopeValidationError("scope-anchor targets require a project context")

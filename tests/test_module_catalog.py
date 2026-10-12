@@ -4,10 +4,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from recon_modules import ModuleCatalog, ScanProfile
+from recon_modules import ModuleCatalog, ScanProfile, load_default_catalog
 
 
 class ModuleCatalogTests(unittest.TestCase):
+    def test_default_modules_have_card_summaries(self) -> None:
+        for module in load_default_catalog():
+            with self.subTest(module=module.bin):
+                self.assertTrue(module.summary)
+
     def test_create_edit_delete_and_reload(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "definitions.json"

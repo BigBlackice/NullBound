@@ -321,6 +321,111 @@ behavior and evidence guarantees while implementing them.
   of run directories. Preserve portable self-contained run manifests as the source
   of truth; the index must remain rebuildable and must not introduce stale history.
 
+## Web-centric discovery, enumeration, and attack modules
+
+Make this the next capability focus before the generic saved-workflow system.
+Provide three task-oriented module groups: **Discovery modules** populate the
+project inventory from scope seeds, **Enumeration modules** perform deeper work
+against the discovered inventory, and **Attack modules** validate server-side
+weaknesses that can provide an initial foothold. Every handoff is operator-reviewed;
+no stage silently launches the next one.
+
+- [ ] Keep one Launchpad page, but divide it into four clearly separated groups:
+  **Single-tool launchers**, **Discovery modules**, **Enumeration modules**, and
+  **Attack modules**. Do not hide or replace the underlying single-tool launchers.
+- [x] Add an initial **Web discovery** module that accepts one or more project
+  scope items as seeds and reuses the existing Subfinder, dnsx, and httpx
+  capabilities to discover subdomains, resolve them, identify IPs, and confirm
+  live web services. Each underlying tool remains directly launchable.
+- [x] Add an initial **Web enumeration** module for the resulting live web assets.
+  The first chains provide quick httpx/tlsx enumeration and GAU -> httpx -> tlsx
+  archive/deep enumeration. Chain and stage definitions are data-driven so more
+  built-in chains can reuse the same runner and inspector.
+- [x] Add a Web Enumeration chain for `ffuf` directory discovery with an
+  operator-selected wordlist, conservative recursion, and a bounded depth.
+- [ ] Add HTTP/S screenshot capture with Playwright as a later Web Enumeration
+  chain. Define screenshot retention controls first. Do not inherit Cygor's RDP,
+  VNC, or X11 scope.
+- [ ] Make **Discovery -> Enumeration** a first-class reviewed handoff. When a
+  discovery module finishes, offer the matching enumeration module with the scope
+  item and discovered target count already selected, but require the operator to
+  inspect the targets and explicitly launch it.
+- [x] Keep this first pair as fixed built-in, task-oriented modules; do not require
+  a generic workflow editor, arbitrary workflow definitions, or automatic chaining.
+  Preserve each underlying stage as an ordinary run with its own command, state,
+  logs, artifacts, and provenance.
+- [x] Let an enumeration module target one explicit project **scope rule** from
+  its configuration. Exact domain rules exclude subdomains; wildcard rules such
+  as `*.google.com` include directly matched subdomains and their infrastructure
+  descendants. Do not merge exact and wildcard rules for launches.
+- [x] Reuse the Evidence workspace's existing scope-anchor and relationship
+  resolution for standard, wildcard, and regex scope entries. Do not build a
+  second asset hierarchy or infer registrable-domain ownership beyond recorded
+  scope matches and evidenced relationships.
+- [x] Before launch, show the number of compatible targets plus a bounded sample,
+  deduplicate normalized values, and clearly report assets omitted because their
+  type is incompatible. A scope item with no compatible indexed assets must fail
+  with an actionable message.
+- [x] Apply the normal launch-time scope evaluation to the expanded target set so
+  explicit exclusions and the operator's enforcement choice retain their current
+  meaning. Capture the final target snapshot in the run manifest so later scope or
+  asset changes cannot alter what the enumeration run actually covered.
+- [x] Keep large scope anchors responsive: resolve complete target sets with
+  paged or streamed SQL reads, bound only the on-screen preview, never mount every
+  descendant as a UI element, and use the existing target-file execution path
+  where supported.
+- [x] Preserve the ordinary run contract for enumeration modules: exact command or
+  operation preview, health state, timeout and cancellation, live output, raw
+  artifacts, normalization, evidence provenance, and project-filtered history.
+- [x] Require an active project only for scope-driven Discovery, Enumeration, and
+  Attack modules. Preserve direct, no-project execution for every compatible
+  single-tool launcher.
+
+### Server-side attack validation
+
+Keep the initial Attack module focused on web penetration testing and proving
+server-side footholds. Defer browser/user-targeted bug-bounty coverage such as XSS,
+DOM analysis, CORS, clickjacking, and client-side OAuth abuse to a later release.
+
+- [ ] Make **Enumeration -> Attack** a reviewed handoff. Resolve only compatible
+  assets, services, endpoints, and parameters under the selected scope item; show
+  the target count and a bounded sample, then require an explicit launch.
+- [ ] Add an **Exposure validation** profile for databases, caches, queues,
+  management panels, debug services, storage, backups, configuration files, and
+  secrets. Enumeration reports exposure; Attack confirms anonymous or known-default
+  access with the least invasive read-only operation available.
+- [ ] Add an **Injection validation** profile covering SQL, NoSQL, command,
+  server-side template, LDAP, and XPath injection. Use ZAP for broad targeted
+  checks and sqlmap in detection-only mode for SQL injection confirmation; disable
+  data dumping, filesystem access, shells, takeover, and other side-effecting
+  capabilities.
+- [ ] Add an **SSRF and parser validation** profile covering SSRF, blind SSRF,
+  XXE, and remote-file inclusion. Use Interactsh or a replaceable self-hosted OAST
+  provider for callback evidence; do not probe cloud metadata or pivot through
+  unrestricted internal address ranges by default.
+- [ ] Add a **Known vulnerability validation** profile using Nuclei templates
+  selected from evidenced products and versions. Pin and record the template set,
+  template IDs, versions or hashes, and matching evidence; exclude destructive,
+  denial-of-service, file-write, and unreviewed fuzzing templates by default.
+- [ ] Add authentication and server-side authorization validation after NullBound
+  can safely model credentials, redacted sessions, attempt limits, account-lockout
+  risk, and two-identity request comparison. Cover authentication bypass, limited
+  credential testing, IDOR/BOLA, privilege boundaries, cross-tenant access, and
+  unsafe administrative API operations without exposing secrets in commands,
+  logs, manifests, or evidence.
+- [ ] Classify Attack profiles as **safe**, **stateful**, or **intrusive** and show
+  the classification, request/concurrency limits, authentication context, scope
+  decision, and immutable target snapshot before launch. Stateful or intrusive
+  profiles require explicit confirmation even when scope enforcement is advisory.
+- [ ] Promote a candidate to a validated finding only when the run preserves a
+  reproducible proof such as a redacted request/response, read-only service result,
+  tool match, or correlated OAST callback. Preserve raw artifacts and complete
+  provenance alongside normalized findings.
+- [ ] Keep shell creation, bulk data extraction, persistent writes, destructive
+  queries, denial of service, unrestricted internal SSRF pivoting, request
+  smuggling, cache poisoning, race conditions, and complex business-logic abuse
+  outside the initial automated Attack module.
+
 ## v0.3 — Workflows and integrations
 
 - [ ] Split the Launchpad catalog into distinct **Single tools** and **Workflows**
@@ -386,6 +491,8 @@ stateful systems, and internal libraries for reusable behavior.
   JavaScript references without silently expanding beyond scope.
 - [ ] Add `ffuf` for content, virtual-host, and parameter fuzzing with rate,
   concurrency, recursion, matcher, and filter controls visible in its profiles.
+  Recursive content discovery is implemented first; the remaining fuzz modes and
+  controls stay here for a later iteration.
 - [ ] Add Arjun as a focused hidden-parameter discovery adapter. Keep it separate
   from `ffuf` because its request model and output semantics differ.
 - [ ] Add Nuclei with pinned template metadata, template/version capture, severity

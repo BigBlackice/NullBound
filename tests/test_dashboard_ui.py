@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -84,6 +85,101 @@ class LiveRunConsoleTests(TestCase):
 
 
 class AssetWorkspaceLogicTests(TestCase):
+    def test_project_wordlists_are_ffuf_fallback_options(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "P-0001"
+            wordlists_path = project_path / "wordlists" / "passwords"
+            wordlists_path.mkdir(parents=True)
+            local_list = wordlists_path / "common.lst"
+            local_list.write_text("admin\n", encoding="utf-8")
+            project = SimpleNamespace(
+                id="P-0001", path=project_path, wordlists_path=project_path / "wordlists"
+            )
+            dashboard = DashboardUI.__new__(DashboardUI)
+            dashboard.project_workspace = SimpleNamespace(
+                open_projects=[project], active_project_id=project.id
+            )
+            dashboard.ffuf_wordlists = ()
+            dashboard.module_catalog = SimpleNamespace(
+                modules=(SimpleNamespace(id="07", adapter="ffuf"),)
+            )
+            dashboard.module_config_values = {"07": {"wordlist": ""}}
+            dashboard.web_enumeration_wordlist = ""
+
+            dashboard._reset_ffuf_wordlist_defaults()
+            options = dashboard.ffuf_wordlist_options()
+
+        self.assertEqual(dashboard.web_enumeration_wordlist, str(local_list))
+        self.assertEqual(dashboard.module_config_values["07"]["wordlist"], str(local_list))
+        self.assertEqual(options[str(local_list)], "PROJECT / passwords/common.lst")
+
+    def test_workspace_breadcrumbs_include_the_current_selection(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        dashboard.module_catalog = SimpleNamespace(
+            get=lambda _module_id: SimpleNamespace(description="Web Probe")
+        )
+        dashboard.selected_module_id = "04"
+        dashboard.active_view = "launchpad"
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ LAUNCHPAD / WEB PROBE")
+
+        dashboard.selected_module_id = "web-discovery"
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ LAUNCHPAD / WEB DISCOVERY")
+
+        dashboard.selected_module_id = "web-enumeration"
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ LAUNCHPAD / WEB ENUMERATION")
+
+        dashboard.active_view = "findings"
+        dashboard.selected_finding_id = "FN-1"
+        dashboard.filtered_finding_records = lambda: ({"id": "FN-1", "title": "SQL injection"},)
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ FINDINGS / SQL INJECTION")
+
+        dashboard.active_view = "assets"
+        dashboard.selected_asset_id = "AS-1"
+        dashboard.filtered_asset_records = lambda: ({"id": "AS-1", "name": "api.example.com"},)
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ ASSETS / API.EXAMPLE.COM")
+
+        dashboard.active_view = "evidence"
+        dashboard.selected_evidence_id = None
+        dashboard.selected_evidence_anchor_id = "SC-1"
+        dashboard.evidence_anchor_records = lambda: ({"id": "SC-1", "label": "example.com"},)
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ EVIDENCE / EXAMPLE.COM")
+
+        dashboard.active_view = "scope"
+        dashboard.selected_scope_id = "SC-1"
+        dashboard.scope_records = lambda: ({"id": "SC-1", "target": "*.example.com"},)
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ SCOPE / *.EXAMPLE.COM")
+
+        dashboard.active_view = "runs"
+        dashboard.selected_run_id = "RUN-1"
+        dashboard.filtered_run_records = lambda: ({
+            "id": "RUN-1", "module": "HTTPX",
+        },)
+        self.assertEqual(dashboard.workspace_breadcrumb_text(), "/ RUNS / HTTPX / RUN-1")
+
+    def test_launchpad_omits_the_decorative_counter_and_filter_template(self) -> None:
+        source = inspect.getsource(DashboardUI.render_launchpad)
+
+        self.assertNotIn("VIEW 01", source)
+        self.assertNotIn("module-heading", source)
+        self.assertNotIn('ui.label("ALL")', source)
+
+    def test_single_tool_cards_use_tool_focused_labels(self) -> None:
+        source = inspect.getsource(DashboardUI.render_module_card)
+
+        self.assertIn('/ LAUNCHPAD / {module.bin.upper()}', source)
+        self.assertIn('ui.label(module.bin.upper()).classes("module-name")', source)
+        self.assertIn('module.summary or module.description', source)
+        self.assertIn('ui.label("MANUAL / SCOPE")', source)
+        self.assertNotIn("module.target_summary", source)
+        self.assertNotIn("module_health", source)
+
+    def test_launchpad_exposes_discovery_and_enumeration_modules(self) -> None:
+        source = inspect.getsource(DashboardUI.render_launchpad)
+
+        self.assertIn("render_web_discovery_card", source)
+        self.assertIn("render_web_enumeration_card", source)
+        self.assertIn("web enumeration multi-step", source)
+
     def test_asset_page_is_bounded_and_clamps_an_out_of_range_index(self) -> None:
         records = tuple(
             {"id": f"AS-{index:04d}"}
@@ -285,6 +381,32 @@ class AssetWorkspaceLogicTests(TestCase):
 
         self.assertEqual(refreshes, ["runs", "inspector"])
 
+    def test_launchpad_card_tracks_running_and_ready_states(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        dashboard.project_workspace = SimpleNamespace(active_project_id="P-0001")
+        dashboard.active_view = "launchpad"
+        dashboard._client = _SafeClient()
+        dashboard._last_evidence_refresh = None
+        dashboard._running_module_runs = {}
+        states: list[str] = []
+        tones: list[dict[str, str]] = []
+        dashboard.module_state_labels = {
+            "05": SimpleNamespace(set_text=states.append, classes=lambda **value: tones.append(value))
+        }
+
+        for state in ("running", "completed"):
+            dashboard.handle_workspace_event(SimpleNamespace(
+                text=None,
+                run=SimpleNamespace(
+                    id="RUN-GAU", module_id="05", project_id="P-0001",
+                    evidence_state="pending", state=SimpleNamespace(value=state),
+                ),
+            ))
+
+        self.assertEqual(states, ["RUNNING", "READY"])
+        self.assertEqual(tones[0], {"add": "interactive", "remove": "muted"})
+        self.assertEqual(tones[1], {"add": "muted", "remove": "interactive"})
+
 
 class ConsoleTailTests(TestCase):
     def test_log_tail_is_limited_by_lines(self) -> None:
@@ -315,6 +437,16 @@ class ConsoleTailTests(TestCase):
 
 
 class LayoutStylesTests(TestCase):
+    def test_multi_step_modules_are_visually_separated_from_single_tools(self) -> None:
+        stylesheet = (Path(__file__).parents[1] / "styles.css").read_text(encoding="utf-8")
+        separator = re.search(
+            r"^\.module-separator\s*\{(?P<body>.*?)\n\}", stylesheet,
+            re.DOTALL | re.MULTILINE,
+        )
+
+        self.assertIsNotNone(separator)
+        self.assertIn("border-top: 1px solid var(--structure)", separator.group("body"))
+
     def test_workspace_scrollbar_is_overflow_driven_and_theme_matched(self) -> None:
         stylesheet = (Path(__file__).parents[1] / "styles.css").read_text(encoding="utf-8")
         workspace = re.search(

@@ -37,6 +37,7 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(project.id, "P-0001")
         self.assertEqual(project.name, "Nightfall / ACME")
         self.assertTrue(project.runs_path.is_dir())
+        self.assertTrue(project.wordlists_path.is_dir())
         self.assertTrue(project.database_path.is_file())
         payload = json.loads(project.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["kind"], PROJECT_KIND)
@@ -78,6 +79,14 @@ class ProjectStoreTests(unittest.TestCase):
         reopened = self.store.open_project(project.id)
 
         self.assertTrue(reopened.runs_path.is_dir())
+
+    def test_missing_wordlists_directory_is_restored_when_opened(self) -> None:
+        project = self.store.create_project("Incomplete wordlists")
+        project.wordlists_path.rmdir()
+
+        reopened = self.store.open_project(project.id)
+
+        self.assertTrue(reopened.wordlists_path.is_dir())
 
     def test_invalid_names_are_rejected_before_creating_a_directory(self) -> None:
         for invalid_name in ("", "   ", "bad\nname"):

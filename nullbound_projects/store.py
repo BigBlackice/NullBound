@@ -24,6 +24,7 @@ from .models import (
 
 PROJECT_MANIFEST_NAME: Final = "project.json"
 PROJECT_RUNS_DIRECTORY: Final = "runs"
+PROJECT_WORDLISTS_DIRECTORY: Final = "wordlists"
 
 
 def default_projects_root(home: Path | None = None) -> Path:
@@ -73,7 +74,7 @@ class ProjectStore:
         return tuple(projects), tuple(issues)
 
     def create_project(self, name: str) -> Project:
-        """Atomically create a project manifest and its initial run directory."""
+        """Atomically create a project manifest and its initial directories."""
         root = self.ensure_root()
         normalized_name = validate_project_name(name)
         project_id = self._next_project_id()
@@ -90,6 +91,7 @@ class ProjectStore:
         try:
             staging.mkdir()
             (staging / PROJECT_RUNS_DIRECTORY).mkdir()
+            (staging / PROJECT_WORDLISTS_DIRECTORY).mkdir()
             self._write_manifest(staging / PROJECT_MANIFEST_NAME, manifest)
             ProjectDatabase(staging).initialize()
             staging.replace(destination)
@@ -125,13 +127,16 @@ class ProjectStore:
             raise ProjectValidationError("project manifest must contain a JSON object")
         manifest = ProjectManifest.from_mapping(payload)
 
-        runs_path = project_path / PROJECT_RUNS_DIRECTORY
-        try:
-            runs_path.mkdir(exist_ok=True)
-        except OSError as error:
-            raise ProjectValidationError(f"cannot create runs directory: {runs_path}") from error
-        if not runs_path.is_dir():
-            raise ProjectValidationError(f"runs path is not a directory: {runs_path}")
+        for name in (PROJECT_RUNS_DIRECTORY, PROJECT_WORDLISTS_DIRECTORY):
+            directory = project_path / name
+            try:
+                directory.mkdir(exist_ok=True)
+            except OSError as error:
+                raise ProjectValidationError(
+                    f"cannot create {name} directory: {directory}"
+                ) from error
+            if not directory.is_dir():
+                raise ProjectValidationError(f"{name} path is not a directory: {directory}")
         try:
             ProjectDatabase(project_path).initialize()
         except (OSError, DatabaseVersionError) as error:
