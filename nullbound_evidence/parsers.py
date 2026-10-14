@@ -5,11 +5,14 @@ from __future__ import annotations
 from ipaddress import ip_address
 import json
 from pathlib import Path
+import re
 from typing import Iterable, Iterator, Mapping, Protocol
 from urllib.parse import urlsplit
 import xml.etree.ElementTree as ElementTree
 
-from .models import AssetKind, AssetReference, ParsedRecord
+from .models import (
+    AssetKind, AssetReference, FindingSeverity, FindingState, ParsedFinding, ParsedRecord,
+)
 
 
 class EvidenceParser(Protocol):
@@ -311,6 +314,169 @@ class TlsxJsonlParser:
         return tuple(records)
 
 
+class NucleiJsonlParser:
+    key = "nuclei"
+
+    def _items(self, path: Path) -> Iterator[Mapping[str, object]]:
+        return (item for _, item in _json_lines(path))
+
+    @staticmethod
+    def _url(data: Mapping[str, object]) -> str:
+        for value in (data.get("matched-at"), data.get("url"), data.get("host")):
+            candidate = str(value or "").strip()
+            if urlsplit(candidate).scheme.casefold() in {"http", "https"}:
+                return candidate
+        return ""
+
+    def parse(self, path: Path, *, run_id: str | None = None) -> tuple[ParsedRecord, ...]:
+        artifact = Path(path)
+        records = []
+        for data in self._items(artifact):
+            url = self._url(data)
+            if url:
+                records.append(ParsedRecord(
+                    AssetKind.URL, url, self.key, run_id=run_id,
+                    artifact_path=_artifact_name(artifact),
+                    observed_at=data.get("timestamp"),
+                    metadata=_json_metadata(data, ("template-id", "matcher-name", "type")),
+                ))
+        return tuple(records)
+
+    def parse_findings(
+        self, path: Path, *, run_id: str | None = None
+    ) -> tuple[ParsedFinding, ...]:
+        artifact = Path(path)
+        severity_map = {item.value: item for item in FindingSeverity}
+        findings = []
+        for data in self._items(artifact):
+            url = self._url(data)
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            template_id = str(data.get("template-id") or "nuclei-match")
+            title = str(info.get("name") or template_id)
+            severity = severity_map.get(str(info.get("severity") or "info").casefold(), FindingSeverity.INFO)
+            metadata = _json_metadata(data, ("template-id", "template-url", "matcher-name", "type"))
+            if info.get("tags"):
+                metadata["tags"] = info["tags"]
+            findings.append(ParsedFinding(
+                title=title, severity=severity, source=self.key,
+                asset=AssetReference(AssetKind.URL, url) if url else None,
+                location=url, description=str(info.get("description") or ""),
+                evidence=str(data.get("matcher-name") or data.get("extracted-results") or "Template matched"),
+                recommendation=str(info.get("remediation") or ""), confidence="observed",
+                state=FindingState.CANDIDATE, run_id=run_id,
+                fingerprint=f"{template_id}:{url}:{data.get('matcher-name', '')}",
+                observed_at=data.get("timestamp"), metadata=metadata,
+            ))
+        return tuple(findings)
+
+
+class BrutepywebJsonlParser:
+    key = "brutepyweb"
+
+    def parse(self, path: Path, *, run_id: str | None = None) -> tuple[ParsedRecord, ...]:
+        artifact = Path(path)
+        records = []
+        for _, data in _json_lines(artifact):
+            url = str(data.get("url") or "").strip()
+            identity = str(data.get("identity") or "").strip()
+            if not url:
+                continue
+            related = (
+                (AssetReference(AssetKind.URL, url, "credential_for"),)
+                if identity else ()
+            )
+            records.append(ParsedRecord(
+                AssetKind.USERNAME if identity else AssetKind.URL,
+                identity or url, self.key, run_id=run_id,
+                artifact_path=_artifact_name(artifact), related=related,
+                metadata=_json_metadata(data, (
+                    "password", "status", "length", "password_length", "classification",
+                    "signals", "wordlist_name", "wordlist_line",
+                )),
+            ))
+        return tuple(records)
+
+    def parse_findings(
+        self, path: Path, *, run_id: str | None = None
+    ) -> tuple[ParsedFinding, ...]:
+        findings = []
+        for _, data in _json_lines(Path(path)):
+            url = str(data.get("url") or "").strip()
+            identity = str(data.get("identity") or "").strip()
+            if not url:
+                continue
+            asset = AssetReference(
+                AssetKind.USERNAME if identity else AssetKind.URL, identity or url
+            )
+            validated = str(data.get("classification") or "").casefold() == "validated"
+            reference = ""
+            if data.get("wordlist_name") and data.get("wordlist_line"):
+                reference = f"; candidate at {data['wordlist_name']}:{data['wordlist_line']}"
+            findings.append(ParsedFinding(
+                title=("Validated password response" if validated else "Possible valid password response"),
+                severity=FindingSeverity.HIGH,
+                source=self.key, asset=asset, location=url,
+                description=(
+                    "Brutepyweb repeated the differential response in fresh sessions while an invalid control remained rejected."
+                    if validated else
+                    "Brutepyweb observed a response difference that did not pass controlled confirmation."
+                ),
+                evidence=(
+                    f"HTTP {data.get('status', 'unknown')}; response length "
+                    f"{data.get('length', 'unknown')}{reference}"
+                ),
+                recommendation=(
+                    "Verify the authenticated access and follow the engagement's credential-handling requirements."
+                    if validated else
+                    "Manually validate the candidate response before reporting or reuse."
+                ),
+                confidence="high" if validated else "low",
+                state=FindingState.VALIDATED if validated else FindingState.CANDIDATE,
+                run_id=run_id,
+                metadata=_json_metadata(data, (
+                    "password", "status", "length", "password_length", "classification",
+                    "signals", "wordlist_name", "wordlist_line",
+                )),
+            ))
+        return tuple(findings)
+
+
+class SqlmapTextParser:
+    key = "sqlmap"
+
+    def __init__(self, target: str = "") -> None:
+        self.target = target
+
+    def parse(self, path: Path, *, run_id: str | None = None) -> tuple[ParsedRecord, ...]:
+        return (
+            (ParsedRecord(AssetKind.URL, self.target, self.key, run_id=run_id,
+                          artifact_path=_artifact_name(Path(path))),)
+            if self.target else ()
+        )
+
+    def parse_findings(
+        self, path: Path, *, run_id: str | None = None
+    ) -> tuple[ParsedFinding, ...]:
+        matched = False
+        with Path(path).open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if re.search(r"(?i)^parameter:\s|appears to be .*injectable", line):
+                    matched = True
+                    break
+        if not matched:
+            return ()
+        return (ParsedFinding(
+            title="Possible SQL injection", severity=FindingSeverity.HIGH,
+            source=self.key,
+            asset=AssetReference(AssetKind.URL, self.target) if self.target else None,
+            location=self.target,
+            description="sqlmap reported an injectable parameter during low-impact detection.",
+            evidence="See the run output and sqlmap session artifact for the tested parameter.",
+            recommendation="Manually validate impact before reporting or attempting extraction.",
+            confidence="observed", state=FindingState.CANDIDATE, run_id=run_id,
+        ),)
+
+
 class NmapXmlParser:
     key = "nmap"
 
@@ -390,6 +556,7 @@ class ParserRegistry:
         return cls((
             SubfinderJsonlParser(), DnsxJsonlParser(), NmapXmlParser(),
             HttpxJsonlParser(), GauJsonlParser(), FfufJsonParser(), TlsxJsonlParser(),
+            NucleiJsonlParser(), BrutepywebJsonlParser(),
         ))
 
     def register(self, parser: EvidenceParser) -> None:

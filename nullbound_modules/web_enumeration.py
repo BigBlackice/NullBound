@@ -12,6 +12,7 @@ from nullbound_execution import (
     CommandSpec,
     ExecutionError,
     ExecutionManager,
+    ProxyConfig,
     RunManifest,
     RunRequest,
     RunState,
@@ -319,6 +320,7 @@ class WebEnumerationModule:
         timeout_seconds: int | None = None,
         wordlist: str = "",
         recursion_depth: int = 2,
+        proxy: ProxyConfig | None = None,
     ) -> tuple[tuple[EnumerationStage, CommandSpec], ...]:
         previews: list[tuple[EnumerationStage, CommandSpec]] = []
         for stage in summary.chain.stages:
@@ -340,9 +342,12 @@ class WebEnumerationModule:
                 include_subdomains=summary.include_subdomains,
                 wordlist=wordlist,
                 recursion_depth=recursion_depth,
+                proxy=proxy,
             )
-            adapter = self.execution_manager.adapters.get(request.module.adapter)
-            previews.append((stage, adapter.preview_command(request, request.module.path)))
+            previews.append((
+                stage,
+                self.execution_manager.preview_command(request, request.module.path),
+            ))
         return tuple(previews)
 
     async def run(
@@ -359,6 +364,7 @@ class WebEnumerationModule:
         timeout_seconds: int | None = None,
         wordlist: str = "",
         recursion_depth: int = 2,
+        proxy: ProxyConfig | None = None,
         on_stage_started: StageStarted | None = None,
     ) -> WebEnumerationResult:
         chain = self.get_chain(chain_id)
@@ -400,6 +406,7 @@ class WebEnumerationModule:
                 include_subdomains=summary.include_subdomains,
                 wordlist=wordlist,
                 recursion_depth=recursion_depth,
+                proxy=proxy,
             )
             for stage in chain.stages
             if stage.target_source == "anchor" or self._stage_targets(targets, stage)
@@ -450,6 +457,7 @@ class WebEnumerationModule:
                     include_subdomains=summary.include_subdomains,
                     wordlist=wordlist,
                     recursion_depth=recursion_depth,
+                    proxy=proxy,
                 )
                 run = await self.execution_manager.start(request, project_path)
                 if on_stage_started is not None:
@@ -480,6 +488,7 @@ class WebEnumerationModule:
         include_subdomains: bool,
         wordlist: str,
         recursion_depth: int,
+        proxy: ProxyConfig | None,
     ) -> RunRequest:
         module = self.module_catalog.get(stage.module_id)
         profile = stage.profile
@@ -504,4 +513,5 @@ class WebEnumerationModule:
             ),
             options=options,
             timeout_seconds=timeout_seconds,
+            proxy=proxy,
         )

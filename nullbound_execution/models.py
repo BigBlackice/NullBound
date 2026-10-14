@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlunsplit
 
 from nullbound_scope import ExecutionContext
 from recon_modules import ModuleDefinition, ScanProfile
@@ -22,6 +23,40 @@ def utc_now() -> str:
 
 class ExecutionError(RuntimeError):
     """Raised for an invalid or unavailable execution request."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyConfig:
+    protocol: str
+    host: str
+    port: int
+    ca_certificate: str = ""
+
+    def __post_init__(self) -> None:
+        protocol = self.protocol.strip().casefold()
+        host = self.host.strip().strip("[]")
+        if protocol not in {"http", "socks5"}:
+            raise ExecutionError("proxy protocol must be HTTP or SOCKS5")
+        if (
+            not host
+            or any(character.isspace() for character in host)
+            or any(character in host for character in "/\\@")
+        ):
+            raise ExecutionError("proxy host must be a hostname or IP address")
+        if not 1 <= int(self.port) <= 65535:
+            raise ExecutionError("proxy port must be between 1 and 65535")
+        certificate = self.ca_certificate.strip()
+        if certificate and not Path(certificate).expanduser().is_file():
+            raise ExecutionError(f"proxy CA certificate does not exist: {certificate}")
+        object.__setattr__(self, "protocol", protocol)
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "port", int(self.port))
+        object.__setattr__(self, "ca_certificate", certificate)
+
+    @property
+    def url(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return urlunsplit((self.protocol, f"{host}:{self.port}", "", "", ""))
 
 
 class RunState(StrEnum):
@@ -44,6 +79,7 @@ class RunRequest:
     context: ExecutionContext
     options: tuple[tuple[str, str], ...] = ()
     timeout_seconds: int | None = None
+    proxy: ProxyConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +155,7 @@ class RunManifest:
     executable: str
     arguments: tuple[str, ...]
     created_at: str
+    proxy_url: str | None = None
     timeout_seconds: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -155,6 +192,7 @@ class RunManifest:
             timeout_seconds=(
                 int(data["timeout_seconds"]) if data.get("timeout_seconds") is not None else None
             ),
+            proxy_url=data.get("proxy_url"),
             created_at=str(data["created_at"]), started_at=data.get("started_at"),
             finished_at=data.get("finished_at"), exit_code=data.get("exit_code"),
             duration_seconds=data.get("duration_seconds"),
@@ -185,6 +223,7 @@ class RunManifest:
             "project_id": self.project_id,
             "project_name": self.project_name, "scope_enforced": self.scope_enforced,
             "executable": self.executable, "arguments": list(self.arguments),
+            "proxy_url": self.proxy_url,
             "timeout_seconds": self.timeout_seconds,
             "created_at": self.created_at, "started_at": self.started_at,
             "finished_at": self.finished_at, "exit_code": self.exit_code,

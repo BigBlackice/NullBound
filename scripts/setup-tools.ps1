@@ -32,6 +32,7 @@ $GitHubTools = [ordered]@{
     gau   = @{ Repository = 'lc/gau'; VersionArguments = @('--version'); VersionPattern = '(?i)(gau|v\d+\.)' }
     ffuf  = @{ Repository = 'ffuf/ffuf'; VersionArguments = @('-V'); VersionPattern = '(?i)ffuf' }
     tlsx  = @{ Repository = 'projectdiscovery/tlsx'; VersionArguments = @('-version'); VersionPattern = '(?i)tlsx' }
+    nuclei = @{ Repository = 'projectdiscovery/nuclei'; VersionArguments = @('-version'); VersionPattern = '(?i)nuclei' }
 }
 
 $VersionChecks = @{
@@ -42,6 +43,12 @@ $VersionChecks = @{
     gau   = @{ Arguments = @('--version'); Pattern = '(?i)(gau|v\d+\.)' }
     ffuf  = @{ Arguments = @('-V'); Pattern = '(?i)ffuf' }
     tlsx  = @{ Arguments = @('-version'); Pattern = '(?i)tlsx' }
+    nuclei = @{ Arguments = @('-version'); Pattern = '(?i)nuclei' }
+}
+
+$PythonTools = @{
+    sqlmap = @{ Repository = 'sqlmapproject/sqlmap'; Branch = 'master'; Script = 'sqlmap.py'; Arguments = @('--version'); Pattern = '(?i)sqlmap' }
+    brutepyweb = @{ Bundled = 'recon_modules\brutepyweb\webbruterv1.py'; Arguments = @('-h'); Pattern = '(?i)password-file' }
 }
 
 function Write-Step {
@@ -132,6 +139,59 @@ function Find-ToolExecutable {
         return $command.Source
     }
     return $null
+}
+
+function Find-PythonTool {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $definition = $PythonTools[$Name]
+    $script = if ($definition.ContainsKey('Bundled')) {
+        Join-Path $ProjectRoot $definition.Bundled
+    } else {
+        Join-Path (Join-Path $PackagesPath $Name) $definition.Script
+    }
+    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) { return $null }
+    $projectPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    $pathPython = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    $python = if (Test-Path -LiteralPath $projectPython -PathType Leaf) {
+        $projectPython
+    } elseif ($pathPython) {
+        $pathPython.Source
+    } else {
+        $null
+    }
+    if (-not $python) { return $null }
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $python $script @($definition.Arguments) 2>&1 | Out-String)
+        if ($LASTEXITCODE -eq 0 -and $output -match $definition.Pattern) { return $script }
+    }
+    catch { return $null }
+    finally { $ErrorActionPreference = $previousErrorPreference }
+    return $null
+}
+
+function Install-PythonTool {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $definition = $PythonTools[$Name]
+    Write-Step "Installing $Name from $($definition.Repository)"
+    $archive = Join-Path $DownloadsPath "$Name.zip"
+    $staging = Join-Path $PackagesPath "$Name.staging"
+    $destination = Join-Path $PackagesPath $Name
+    Remove-LocalItem -Path $staging
+    Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$($definition.Repository)/archive/refs/heads/$($definition.Branch).zip" -OutFile $archive
+    Expand-Archive -LiteralPath $archive -DestinationPath $staging -Force
+    $script = Get-ChildItem -LiteralPath $staging -Filter $definition.Script -File -Recurse |
+        Select-Object -First 1
+    if (-not $script) { throw "$Name archive did not contain $($definition.Script)." }
+    $source = $script.Directory.FullName
+    Remove-LocalItem -Path $destination
+    Move-Item -LiteralPath $source -Destination $destination
+    Remove-LocalItem -Path $staging
+    Remove-LocalItem -Path $archive
+    if (-not (Find-PythonTool -Name $Name)) { throw "$Name failed its Python health check." }
+    return Join-Path $destination $definition.Script
 }
 
 function Get-WindowsAssetRegex {
@@ -367,7 +427,11 @@ $status = [ordered]@{}
 Write-Step 'Checking NullBound module executables'
 foreach ($module in $requiredModules) {
     $name = [string]$module.bin
-    $found = Find-ToolExecutable -Name $name -ConfiguredPath ([string]$module.path)
+    $found = if ($PythonTools.ContainsKey($name)) {
+        Find-PythonTool -Name $name
+    } else {
+        Find-ToolExecutable -Name $name -ConfiguredPath ([string]$module.path)
+    }
     $status[$name] = $found
     if ($found) {
         Write-Host ("[FOUND]   {0,-8} {1}" -f $name, $found) -ForegroundColor Green
@@ -408,6 +472,14 @@ foreach ($module in $installModules) {
             $status[$name] = Install-Nmap
             continue
         }
+        if ($PythonTools.ContainsKey($name)) {
+            $status[$name] = if ($PythonTools[$name].ContainsKey('Bundled')) {
+                Find-PythonTool -Name $name
+            } else {
+                Install-PythonTool -Name $name
+            }
+            continue
+        }
         if (-not $GitHubTools.Contains($name)) {
             Write-Warning "No bootstrap source is configured for $name; leaving it unchanged."
             continue
@@ -432,7 +504,11 @@ Write-Step 'Final tool status'
 $failed = @()
 foreach ($module in $requiredModules) {
     $name = [string]$module.bin
-    $found = Find-ToolExecutable -Name $name -ConfiguredPath ([string]$module.path)
+    $found = if ($PythonTools.ContainsKey($name)) {
+        Find-PythonTool -Name $name
+    } else {
+        Find-ToolExecutable -Name $name -ConfiguredPath ([string]$module.path)
+    }
     if ($found) {
         Write-Host ("[READY]   {0,-8} {1}" -f $name, $found) -ForegroundColor Green
     }

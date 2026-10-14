@@ -930,6 +930,40 @@ class EvidenceStore:
             ).fetchall()
         return tuple(self._finding(row) for row in rows)
 
+    def list_asset_findings(
+        self,
+        asset_id: str,
+        *,
+        limit: int = 25,
+    ) -> tuple[FindingRecord, ...]:
+        """Load a bounded set of findings for one Evidence node."""
+        limit = min(max(int(limit), 1), 25)
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT f.*, COALESCE(a.display_name, '') AS asset_name
+                   FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
+                   WHERE f.asset_id = ?
+                   ORDER BY f.last_seen_at DESC, f.id LIMIT ?""",
+                (asset_id, limit),
+            ).fetchall()
+        return tuple(self._finding(row) for row in rows)
+
+    def set_finding_state(
+        self,
+        finding_id: str,
+        state: FindingState | str,
+    ) -> FindingState:
+        """Apply an operator lifecycle decision without changing finding evidence."""
+        lifecycle = state if isinstance(state, FindingState) else FindingState(str(state))
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE findings SET lifecycle_state = ? WHERE id = ?",
+                (lifecycle.value, finding_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(finding_id)
+        return lifecycle
+
     def list_evidence(
         self,
         *,

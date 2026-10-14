@@ -117,6 +117,14 @@ class Project:
         return self.path / "wordlists"
 
     @property
+    def web_wordlists_path(self) -> Path:
+        return self.wordlists_path / "web-content"
+
+    @property
+    def password_wordlists_path(self) -> Path:
+        return self.wordlists_path / "passwords"
+
+    @property
     def scope_path(self) -> Path:
         """Optional versioned target/scope data stored beside project metadata."""
         return self.path / "scope.json"

@@ -25,6 +25,8 @@ from .models import (
 PROJECT_MANIFEST_NAME: Final = "project.json"
 PROJECT_RUNS_DIRECTORY: Final = "runs"
 PROJECT_WORDLISTS_DIRECTORY: Final = "wordlists"
+PROJECT_WEB_WORDLISTS_DIRECTORY: Final = "web-content"
+PROJECT_PASSWORD_WORDLISTS_DIRECTORY: Final = "passwords"
 
 
 def default_projects_root(home: Path | None = None) -> Path:
@@ -91,7 +93,10 @@ class ProjectStore:
         try:
             staging.mkdir()
             (staging / PROJECT_RUNS_DIRECTORY).mkdir()
-            (staging / PROJECT_WORDLISTS_DIRECTORY).mkdir()
+            wordlists = staging / PROJECT_WORDLISTS_DIRECTORY
+            wordlists.mkdir()
+            (wordlists / PROJECT_WEB_WORDLISTS_DIRECTORY).mkdir()
+            (wordlists / PROJECT_PASSWORD_WORDLISTS_DIRECTORY).mkdir()
             self._write_manifest(staging / PROJECT_MANIFEST_NAME, manifest)
             ProjectDatabase(staging).initialize()
             staging.replace(destination)
@@ -137,6 +142,16 @@ class ProjectStore:
                 ) from error
             if not directory.is_dir():
                 raise ProjectValidationError(f"{name} path is not a directory: {directory}")
+        for name in (PROJECT_WEB_WORDLISTS_DIRECTORY, PROJECT_PASSWORD_WORDLISTS_DIRECTORY):
+            directory = project_path / PROJECT_WORDLISTS_DIRECTORY / name
+            try:
+                directory.mkdir(exist_ok=True)
+            except OSError as error:
+                raise ProjectValidationError(
+                    f"cannot create wordlist directory: {directory}"
+                ) from error
+            if not directory.is_dir():
+                raise ProjectValidationError(f"wordlist path is not a directory: {directory}")
         try:
             ProjectDatabase(project_path).initialize()
         except (OSError, DatabaseVersionError) as error:

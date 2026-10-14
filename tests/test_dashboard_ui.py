@@ -10,7 +10,9 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
-from dashboard_ui import ASSET_PAGE_SIZE, RECORD_PAGE_SIZE, DashboardUI
+from dashboard_ui import ASSET_PAGE_SIZE, ESCAPE_KEY_BEHAVIOR, RECORD_PAGE_SIZE, DashboardUI
+from nullbound_evidence import FindingState
+from operator_settings import OperatorSettingsStore
 from nullbound_execution import ExecutionManager, RunStore
 from nullbound_scope import ScopeRule, ScopeStatus, ScopeValidationError, Target, TargetKind
 
@@ -44,6 +46,28 @@ class LiveRunConsoleTests(TestCase):
         script = run_javascript.call_args.args[0]
         self.assertIn("first\\nsecond\\n", script)
         self.assertEqual(dashboard._pending_run_output, [])
+
+    def test_finding_password_copy_uses_the_unmasked_value(self) -> None:
+        with (
+            patch("dashboard_ui.ui.clipboard.write") as clipboard_write,
+            patch("dashboard_ui.ui.notify"),
+        ):
+            DashboardUI.copy_finding_password("swordfish")
+
+        clipboard_write.assert_called_once_with("swordfish")
+
+    def test_finding_password_control_is_masked_with_reveal_and_copy(self) -> None:
+        source = inspect.getsource(DashboardUI.render_finding_password)
+
+        self.assertIn("password=True", source)
+        self.assertIn("password_toggle_button=True", source)
+        self.assertIn("copy_finding_password", source)
+
+    def test_evidence_inspector_exposes_finding_lifecycle_control(self) -> None:
+        source = inspect.getsource(DashboardUI.render_evidence_inspector)
+
+        self.assertIn("set_finding_state", source)
+        self.assertIn("render_finding_password", source)
 
     def test_page_callback_failure_does_not_detach_live_run_listener(self) -> None:
         dashboard = DashboardUI.__new__(DashboardUI)
@@ -85,10 +109,119 @@ class LiveRunConsoleTests(TestCase):
 
 
 class AssetWorkspaceLogicTests(TestCase):
+    def test_scope_decision_filter_limits_rows_and_refreshes_in_place(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        dashboard.scope_records = lambda: (
+            {"id": "S-ALLOW", "decision": "ALLOWED"},
+            {"id": "S-REVIEW", "decision": "REVIEW REQUIRED"},
+        )
+        dashboard.scope_decision_filter = "REVIEW REQUIRED"
+        dashboard.record_page_indexes = {"scope": 2}
+        refreshed = []
+        dashboard.refresh_scope_results = lambda: refreshed.append("rows")
+        dashboard.render_inspector = lambda: refreshed.append("inspector")
+
+        self.assertEqual(
+            tuple(record["id"] for record in dashboard.filtered_scope_records()),
+            ("S-REVIEW",),
+        )
+        dashboard.set_scope_decision_filter("ALLOWED")
+
+        self.assertEqual(dashboard.record_page_indexes["scope"], 0)
+        self.assertEqual(refreshed, ["rows", "inspector"])
+
+    def test_topbar_shortcuts_and_fullscreen_control_have_handlers(self) -> None:
+        source = inspect.getsource(DashboardUI.render_topbar)
+
+        self.assertIn("requestFullscreen", source)
+        self.assertIn("js_handler", source)
+        self.assertNotIn("Notifications", source)
+        self.assertIn("event.key.toLowerCase() === 'k'", ESCAPE_KEY_BEHAVIOR)
+
+    def test_evidence_artifact_path_is_project_bounded(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "project"
+            artifact = project_path / "runs" / "RUN-1" / "artifacts" / "result.txt"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("evidence", encoding="utf-8")
+            project = SimpleNamespace(id="P-1", path=project_path)
+            dashboard = DashboardUI.__new__(DashboardUI)
+            dashboard.project_workspace = SimpleNamespace(
+                active_project_id=project.id, open_projects=[project]
+            )
+            previews = []
+            dashboard._show_artifact_preview = previews.append
+
+            dashboard.open_evidence_artifact("runs/RUN-1/artifacts/result.txt")
+            with patch("dashboard_ui.ui.notify") as notify:
+                dashboard.open_evidence_artifact("../outside.txt")
+
+        self.assertEqual(previews, [artifact.resolve()])
+        notify.assert_called_once()
+
+    def test_evidence_inspector_buttons_have_navigation_handlers(self) -> None:
+        source = inspect.getsource(DashboardUI.render_evidence_inspector)
+
+        self.assertIn("select_evidence_asset", source)
+        self.assertIn("open_evidence_artifact", source)
+
+    def test_finding_severity_filter_limits_rows_and_can_show_all(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        dashboard.finding_records = lambda: (
+            {"id": "F-HIGH", "severity": "high", "scope": "ALLOWED"},
+            {"id": "F-LOW", "severity": "low", "scope": "ALLOWED"},
+        )
+        dashboard.record_scope_filters = {"findings": False}
+        dashboard.search_query = ""
+        dashboard.finding_severity_filter = "high"
+
+        self.assertEqual(
+            tuple(record["id"] for record in dashboard.filtered_finding_records()),
+            ("F-HIGH",),
+        )
+        self.assertEqual(len(dashboard.filtered_finding_records("all")), 2)
+
+    def test_finding_severity_action_resets_page_and_refreshes_results(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        dashboard.record_page_indexes = {"findings": 3}
+        refreshed = []
+        dashboard.refresh_finding_results = lambda: refreshed.append("rows")
+        dashboard.render_inspector = lambda: refreshed.append("inspector")
+
+        dashboard.set_finding_severity_filter("critical")
+
+        self.assertEqual(dashboard.finding_severity_filter, "critical")
+        self.assertEqual(dashboard.record_page_indexes["findings"], 0)
+        self.assertEqual(refreshed, ["rows", "inspector"])
+
+    def test_finding_lifecycle_action_updates_store_and_invalidates_rows(self) -> None:
+        dashboard = DashboardUI.__new__(DashboardUI)
+        calls = []
+        store = SimpleNamespace(
+            set_finding_state=lambda finding_id, state: (
+                calls.append((finding_id, state)) or FindingState.FALSE_POSITIVE
+            )
+        )
+        dashboard.active_evidence_store = lambda: store
+        dashboard.active_view = "assets"
+        dashboard._project_record_cache = {"findings": ((), ())}
+        dashboard.render_inspector = lambda: None
+
+        with patch("dashboard_ui.ui.notify") as notify:
+            dashboard.set_finding_state(
+                "F-0001", SimpleNamespace(value="false_positive")
+            )
+
+        self.assertEqual(calls, [("F-0001", "false_positive")])
+        self.assertNotIn("findings", dashboard._project_record_cache)
+        notify.assert_called_once_with(
+            "Finding marked false positive", type="positive"
+        )
+
     def test_project_wordlists_are_ffuf_fallback_options(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             project_path = Path(temporary_directory) / "P-0001"
-            wordlists_path = project_path / "wordlists" / "passwords"
+            wordlists_path = project_path / "wordlists" / "web-content"
             wordlists_path.mkdir(parents=True)
             local_list = wordlists_path / "common.lst"
             local_list.write_text("admin\n", encoding="utf-8")
@@ -100,6 +233,9 @@ class AssetWorkspaceLogicTests(TestCase):
                 open_projects=[project], active_project_id=project.id
             )
             dashboard.ffuf_wordlists = ()
+            dashboard.settings_store = OperatorSettingsStore(
+                project_path / "operator-settings.json"
+            )
             dashboard.module_catalog = SimpleNamespace(
                 modules=(SimpleNamespace(id="07", adapter="ffuf"),)
             )
@@ -111,7 +247,36 @@ class AssetWorkspaceLogicTests(TestCase):
 
         self.assertEqual(dashboard.web_enumeration_wordlist, str(local_list))
         self.assertEqual(dashboard.module_config_values["07"]["wordlist"], str(local_list))
-        self.assertEqual(options[str(local_list)], "PROJECT / passwords/common.lst")
+        self.assertEqual(options[str(local_list)], "PROJECT / common.lst")
+
+    def test_password_wordlists_use_their_own_configured_project_directory(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "P-0001"
+            settings = OperatorSettingsStore(project_path / "settings.json")
+            settings.update(password_wordlist_directory="lists/passwords")
+            password_root = project_path / "lists" / "passwords"
+            password_root.mkdir(parents=True)
+            password_list = password_root / "top.txt"
+            password_list.write_text("secret\n", encoding="utf-8")
+            project = SimpleNamespace(id="P-0001", path=project_path)
+            dashboard = DashboardUI.__new__(DashboardUI)
+            dashboard.settings_store = settings
+            dashboard.project_workspace = SimpleNamespace(
+                open_projects=[project], active_project_id=project.id
+            )
+            dashboard.password_wordlists = ()
+            dashboard.module_catalog = SimpleNamespace(
+                modules=(SimpleNamespace(id="10", adapter="brutepyweb"),)
+            )
+            dashboard.module_config_values = {"10": {"password_file": ""}}
+
+            dashboard._reset_password_wordlist_defaults()
+            options = dashboard.password_wordlist_options()
+
+        self.assertEqual(
+            dashboard.module_config_values["10"]["password_file"], str(password_list)
+        )
+        self.assertEqual(options[str(password_list)], "PROJECT / top.txt")
 
     def test_workspace_breadcrumbs_include_the_current_selection(self) -> None:
         dashboard = DashboardUI.__new__(DashboardUI)

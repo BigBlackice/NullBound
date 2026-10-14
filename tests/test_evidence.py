@@ -17,10 +17,14 @@ from nullbound_evidence import (
     EvidenceStore,
     FfufJsonParser,
     FindingSeverity,
+    FindingState,
     GauJsonlParser,
     HttpxJsonlParser,
     JsonLinesEnvelopeParser,
     NmapXmlParser,
+    NucleiJsonlParser,
+    BrutepywebJsonlParser,
+    SqlmapTextParser,
     ParserRegistry,
     ParsedFinding,
     ParsedRecord,
@@ -163,6 +167,22 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual(self.store.list_relationships()[0].relation, "affects")
         finding = self.store.list_findings()[0]
         self.assertEqual(self.store.list_finding_scopes()[finding.id], "allowed")
+
+    def test_operator_can_change_finding_lifecycle_without_losing_evidence(self) -> None:
+        self.pipeline.ingest((), findings=(ParsedFinding(
+            title="Review me", severity=FindingSeverity.MEDIUM, source="fixture",
+            evidence="original proof",
+        ),), scope=self.scope, source="fixture")
+        finding = self.store.list_findings()[0]
+
+        state = self.store.set_finding_state(finding.id, FindingState.FALSE_POSITIVE)
+        updated = self.store.list_findings()[0]
+
+        self.assertEqual(state, FindingState.FALSE_POSITIVE)
+        self.assertEqual(updated.state, FindingState.FALSE_POSITIVE)
+        self.assertEqual(updated.evidence, "original proof")
+        with self.assertRaises(KeyError):
+            self.store.set_finding_state("F-NOT-FOUND", FindingState.VALIDATED)
 
     def test_unchanged_scope_sync_skips_asset_reevaluation(self) -> None:
         self.store.sync_scope(self.scope)
@@ -380,6 +400,73 @@ class EvidenceFrameworkTests(unittest.TestCase):
         self.assertEqual(record.value, "https://api.example.com/admin/")
         self.assertEqual(record.metadata["status"], 200)
 
+    def test_attack_parsers_create_candidate_findings_and_relationships(self) -> None:
+        nuclei_path = self.project_path / "nuclei.jsonl"
+        nuclei_path.write_text(json.dumps({
+            "template-id": "exposed-panel", "matched-at": "https://api.example.com/admin",
+            "info": {"name": "Exposed panel", "severity": "medium"},
+        }) + "\n", encoding="utf-8")
+        brute_path = self.project_path / "brutepyweb.jsonl"
+        brute_path.write_text(json.dumps({
+            "url": "https://api.example.com/login", "identity": "operator",
+            "status": 302, "length": 12, "password_length": 8,
+            "classification": "candidate", "password": "swordfish",
+        }) + "\n", encoding="utf-8")
+
+        nuclei = NucleiJsonlParser()
+        brute = BrutepywebJsonlParser()
+        self.pipeline.ingest(
+            nuclei.parse(nuclei_path, run_id="RUN-NUCLEI"),
+            findings=nuclei.parse_findings(nuclei_path, run_id="RUN-NUCLEI"),
+            scope=self.scope, source="nuclei",
+        )
+        self.pipeline.ingest(
+            brute.parse(brute_path, run_id="RUN-BRUTE"),
+            findings=brute.parse_findings(brute_path, run_id="RUN-BRUTE"),
+            scope=self.scope, source="brutepyweb",
+        )
+
+        findings = self.store.list_findings()
+        self.assertEqual({item.source for item in findings}, {"nuclei", "brutepyweb"})
+        self.assertTrue(all(item.state.value == "candidate" for item in findings))
+        self.assertIn(AssetKind.USERNAME, {item.kind for item in self.store.list_assets()})
+        self.assertIn("credential_for", {item.relation for item in self.store.list_relationships()})
+        brute_finding = next(item for item in findings if item.source == "brutepyweb")
+        self.assertEqual(brute_finding.metadata["password"], "swordfish")
+        linked_findings = self.store.list_asset_findings(brute_finding.asset_id)
+        self.assertEqual(linked_findings, (brute_finding,))
+
+    def test_brutepyweb_validated_result_is_high_confidence(self) -> None:
+        path = self.project_path / "brutepyweb.jsonl"
+        path.write_text(json.dumps({
+            "url": "https://api.example.com/login", "identity": "operator",
+            "status": 200, "length": 512, "password_length": 8,
+            "classification": "validated", "signals": ["length", "final-url"],
+            "password": "swordfish",
+        }) + "\n", encoding="utf-8")
+
+        finding = BrutepywebJsonlParser().parse_findings(path, run_id="RUN-BRUTE")[0]
+
+        self.assertEqual(finding.state.value, "validated")
+        self.assertEqual(finding.confidence, "high")
+        self.assertEqual(finding.metadata["signals"], ["length", "final-url"])
+        self.assertEqual(finding.metadata["password"], "swordfish")
+
+    def test_sqlmap_parser_only_emits_a_finding_for_injection_output(self) -> None:
+        path = self.project_path / "console.log"
+        path.write_text(
+            "Parameter: id (GET)\n    Type: boolean-based blind\n",
+            encoding="utf-8",
+        )
+        parser = SqlmapTextParser("https://api.example.com/?id=1")
+
+        records = parser.parse(path, run_id="RUN-SQLMAP")
+        findings = parser.parse_findings(path, run_id="RUN-SQLMAP")
+
+        self.assertEqual(records[0].kind, AssetKind.URL)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].source, "sqlmap")
+
     def test_subfinder_parser_preserves_provider_provenance(self) -> None:
         path = self.project_path / "subfinder.jsonl"
         path.write_text(json.dumps({
@@ -461,6 +548,21 @@ class EvidenceFrameworkTests(unittest.TestCase):
                 "tlsx.jsonl",
                 json.dumps({"host": "tls.example.com", "port": "443", "tls_version": "tls13"}) + "\n",
             ),
+            "nuclei": (
+                "nuclei.jsonl",
+                json.dumps({
+                    "template-id": "panel", "matched-at": "https://web.example.com/admin",
+                    "info": {"name": "Panel", "severity": "medium"},
+                }) + "\n",
+            ),
+            "brutepyweb": (
+                "brutepyweb.jsonl",
+                json.dumps({
+                    "url": "https://web.example.com/login", "identity": "operator",
+                    "status": 302, "length": 12, "password_length": 8,
+                    "classification": "candidate",
+                }) + "\n",
+            ),
         }
         run_ids: set[str] = set()
         for module_key, (artifact_name, content) in fixtures.items():
@@ -493,6 +595,27 @@ class EvidenceFrameworkTests(unittest.TestCase):
             record.run_id for record in EvidenceStore(self.project_path).list_evidence()
         }
         self.assertTrue(run_ids.issubset(indexed_run_ids))
+
+    def test_sqlmap_console_output_is_ingested_as_a_candidate_finding(self) -> None:
+        run_path = self.project_path / "runs" / "RUN-SQLMAP"
+        run_path.mkdir(parents=True)
+        console = run_path / "console.log"
+        console.write_text("Parameter: id (GET)\nType: boolean-based blind\n", encoding="utf-8")
+        manifest = SimpleNamespace(
+            id="RUN-SQLMAP", project_id="P-0001", module_bin="sqlmap",
+            run_path=run_path, artifacts=(), target_source="direct",
+            targets=({
+                "kind": "url", "value": "https://api.example.com/?id=1",
+                "normalized": "https://api.example.com/?id=1",
+            },),
+        )
+
+        summary = ProjectRunIngestor()(manifest)
+        findings = EvidenceStore(self.project_path).list_findings()
+
+        self.assertEqual(summary["findings_created"], 1)
+        self.assertEqual(findings[0].source, "sqlmap")
+        self.assertEqual(findings[0].state.value, "candidate")
 
     def test_subfinder_run_indexes_the_submitted_domain_as_a_seed_without_results(self) -> None:
         run_path = self.project_path / "runs" / "RUN-SEED"

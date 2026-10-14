@@ -273,6 +273,130 @@
           "output_format": "json"
         }
       ]
+    },
+    {
+      "id": "08",
+      "eyebrow": "attack",
+      "icon": "security",
+      "description": "Known Vulnerabilities",
+      "summary": "Match safe Nuclei templates against web targets",
+      "bin": "nuclei",
+      "path": "nuclei",
+      "adapter": "nuclei",
+      "target_summary": "ADD TARGET",
+      "target_placeholder": "HTTP/S URL or host",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Safe known vulnerabilities",
+          "options": [
+            {"label": "Classification", "value": "SAFE"},
+            {"label": "Excluded", "value": "INTRUSIVE / DOS / FUZZ / BRUTE"},
+            {"label": "Rate", "value": "10 REQ/S"}
+          ],
+          "arguments": ["-l", "{target_file}", "-pt", "http", "-etags", "intrusive,dos,fuzz,brute", "-rl", "10", "-c", "5", "-bs", "5", "-duc", "-or"],
+          "output_format": "jsonl"
+        },
+        {
+          "name": "Exposure and misconfiguration",
+          "options": [
+            {"label": "Classification", "value": "SAFE"},
+            {"label": "Templates", "value": "EXPOSURE / MISCONFIG"}
+          ],
+          "arguments": ["-l", "{target_file}", "-pt", "http", "-tags", "exposure,misconfig", "-etags", "intrusive,dos,fuzz,brute", "-rl", "10", "-c", "5", "-bs", "5", "-duc", "-or"],
+          "output_format": "jsonl"
+        }
+      ]
+    },
+    {
+      "id": "09",
+      "eyebrow": "attack",
+      "icon": "data_object",
+      "description": "SQL Injection",
+      "summary": "Detect SQL injection without extraction or takeover",
+      "bin": "sqlmap",
+      "path": ".nullbound-tools/packages/sqlmap/sqlmap.py",
+      "adapter": "sqlmap",
+      "config_fields": [
+        {
+          "id": "parameter",
+          "label": "PARAMETER (OPTIONAL)",
+          "argument": "-p",
+          "placeholder": "query or body parameter"
+        }
+      ],
+      "target_summary": "ADD TARGET",
+      "target_placeholder": "HTTP/S URL with parameters",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Low-impact detection",
+          "options": [
+            {"label": "Classification", "value": "STATEFUL"},
+            {"label": "Risk / level", "value": "1 / 1"},
+            {"label": "Extraction", "value": "DISABLED"}
+          ],
+          "arguments": ["-u", "{target}", "--batch", "--level", "1", "--risk", "1", "--technique", "BE", "--threads", "1", "--disable-coloring"],
+          "output_format": "text"
+        }
+      ]
+    },
+    {
+      "id": "10",
+      "eyebrow": "attack",
+      "icon": "password",
+      "description": "Password Validation",
+      "summary": "Test capped password candidates with CSRF handling",
+      "bin": "brutepyweb",
+      "path": "recon_modules/brutepyweb/webbruterv1.py",
+      "adapter": "brutepyweb",
+      "config_fields": [
+        {
+          "id": "password_file",
+          "label": "PASSWORD WORDLIST",
+          "argument": "-p",
+          "placeholder": "absolute path to password wordlist"
+        },
+        {
+          "id": "identity",
+          "label": "USERNAME / IDENTITY",
+          "argument": "--identity",
+          "placeholder": "optional evidence identity"
+        },
+        {
+          "id": "threads",
+          "label": "THREADS",
+          "argument": "--threads",
+          "placeholder": "default 5 / max 20"
+        },
+        {
+          "id": "delay",
+          "label": "DELAY / SECONDS",
+          "argument": "--delay",
+          "placeholder": "default 0.5"
+        },
+        {
+          "id": "max_requests",
+          "label": "MAX REQUESTS",
+          "argument": "--max-requests",
+          "placeholder": "default 100 / max 10000"
+        }
+      ],
+      "target_summary": "ADD TARGET",
+      "target_placeholder": "HTTP/S login URL",
+      "state": "READY",
+      "profiles": [
+        {
+          "name": "Capped CSRF-aware password test",
+          "options": [
+            {"label": "Classification", "value": "INTRUSIVE"},
+            {"label": "CSRF token", "value": "AUTO"},
+            {"label": "Candidates", "value": "CAPPED"}
+          ],
+          "arguments": ["{target}"],
+          "output_format": "jsonl"
+        }
+      ]
     }
   ]
 }

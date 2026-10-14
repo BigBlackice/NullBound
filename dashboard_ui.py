@@ -11,16 +11,19 @@ import shlex
 
 from nicegui import events, ui
 from app_config import AppConfig
-from nullbound_evidence import EvidenceStore
+from operator_settings import OperatorSettingsStore
+from nullbound_evidence import EvidenceStore, FindingState
 from nullbound_modules import (
+    WEB_DISCOVERY_PROFILES,
     WEB_DISCOVERY_ID,
     WEB_ENUMERATION_ID,
     WebDiscoveryModule,
     WebEnumerationModule,
 )
 from nullbound_execution import (
-    SECLISTS_WEB_CONTENT_ROOT, ExecutionError, ExecutionManager, RunEvent,
-    RunManifest, RunRequest, ToolHealth, discover_ffuf_wordlists,
+    SECLISTS_PASSWORD_ROOT, SECLISTS_WEB_CONTENT_ROOT, ExecutionError,
+    ExecutionManager, ProxyConfig, RunEvent, RunManifest, RunRequest, ToolHealth,
+    discover_ffuf_wordlists, discover_password_wordlists,
 )
 from nullbound_projects import Project, ProjectStore, ProjectValidationError, ProjectWorkspace
 from nullbound_projects.picker import LocalDirectoryPicker
@@ -50,6 +53,12 @@ ESCAPE_KEY_BEHAVIOR = """
   if (window.__nullboundEscapeBlurInstalled) return;
   window.__nullboundEscapeBlurInstalled = true;
   document.addEventListener('keydown', event => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      document.querySelector('.command-search-input input')?.focus();
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if (event.key !== 'Escape') return;
     const active = document.activeElement;
     const writable = active?.matches(
@@ -135,8 +144,10 @@ class DashboardUI:
         app_config: AppConfig | None = None,
         execution_manager: ExecutionManager | None = None,
         module_catalog: ModuleCatalog | None = None,
+        settings_store: OperatorSettingsStore | None = None,
     ) -> None:
         self.app_config = app_config or AppConfig()
+        self.settings_store = settings_store or OperatorSettingsStore()
         self.active_view = "launchpad"
         # NiceGUI creates this controller for each page load. Re-reading the
         # catalog here makes a normal browser refresh the explicit reload point.
@@ -176,19 +187,28 @@ class DashboardUI:
             "findings": False,
             "runs": False,
         }
+        self.finding_severity_filter = "all"
+        self.scope_decision_filter = "ALL"
         self.target_modes = {module.id: "direct" for module in modules}
         self.direct_targets = {module.id: "" for module in modules}
         self.selected_profiles = {module.id: module.default_profile.name for module in modules}
         self.ffuf_wordlists = discover_ffuf_wordlists()
+        self.password_wordlists = discover_password_wordlists()
         default_ffuf_wordlist = str(self.ffuf_wordlists[0]) if self.ffuf_wordlists else ""
+        default_password_wordlist = (
+            str(self.password_wordlists[0]) if self.password_wordlists else ""
+        )
         self.module_config_values = {
             module.id: {field.id: "" for field in module.config_fields} for module in modules
         }
         for module in modules:
             if module.adapter == "ffuf" and "wordlist" in self.module_config_values[module.id]:
                 self.module_config_values[module.id]["wordlist"] = default_ffuf_wordlist
+            if module.adapter == "brutepyweb" and "password_file" in self.module_config_values[module.id]:
+                self.module_config_values[module.id]["password_file"] = default_password_wordlist
         self.selected_target_sets: dict[str, str] = {}
         self.selected_discovery_scope_ids: tuple[str, ...] = ()
+        self.selected_discovery_profile_id = "standard"
         self.web_discovery_timeout = ""
         self.web_discovery_running = False
         self._discovery_scope_project_id: str | None = None
@@ -200,12 +220,12 @@ class DashboardUI:
         self.web_enumeration_running = False
         self._enumeration_scope_project_id: str | None = None
         self._ffuf_wordlist_project_id: str | None = None
+        self._password_wordlist_project_id: str | None = None
         self.search_query = ""
         self.console_minimized = False
         self.console_fullscreen = False
         self.console_wrap = True
         self.inspector_collapsed = False
-        self.proxy_enabled = False
         self.scope_enforced = False
         self.settings_open = False
         self.settings_section = "general"
@@ -215,6 +235,9 @@ class DashboardUI:
         self.module_health: dict[str, ToolHealth] = {}
         self.run_state_filter = "ALL"
         self.run_timeout_values = {module.id: "" for module in modules}
+        self.attack_confirmations = {
+            module.id: False for module in modules if module.eyebrow == "attack"
+        }
         self._pending_project: tuple[str, Path] | None = None
         self.execution_manager = execution_manager or ExecutionManager()
         self.web_discovery_module = WebDiscoveryModule(
@@ -225,7 +248,9 @@ class DashboardUI:
         )
         self.project_workspace = ProjectWorkspace(project_store or ProjectStore())
         self._reset_ffuf_wordlist_defaults()
+        self._reset_password_wordlist_defaults()
         self._ffuf_wordlist_project_id = self.active_project_id
+        self._password_wordlist_project_id = self.active_project_id
         self.evidence_stores: dict[Path, EvidenceStore] = {}
         self.evidence_scope_versions: dict[Path, tuple[int, int] | None] = {}
         for project in self.project_workspace.open_projects:
@@ -272,6 +297,37 @@ class DashboardUI:
         return next(
             (project for project in self.projects if project.id == self.active_project_id), None
         )
+
+    @property
+    def proxy_enabled(self) -> bool:
+        return self.settings_store.settings.proxy_enabled
+
+    def proxy_config(self) -> ProxyConfig | None:
+        settings = self.settings_store.settings
+        if not settings.proxy_enabled:
+            return None
+        return ProxyConfig(
+            settings.proxy_protocol,
+            settings.proxy_host,
+            settings.proxy_port,
+            settings.proxy_ca_certificate,
+        )
+
+    def project_wordlist_root(self, purpose: str) -> Path | None:
+        project = self.active_project
+        if project is None:
+            return None
+        settings = self.settings_store.settings
+        relative = (
+            settings.password_wordlist_directory
+            if purpose == "password" else settings.web_wordlist_directory
+        )
+        root = (project.path / relative).resolve(strict=False)
+        project_root = project.path.resolve(strict=False)
+        if project_root not in root.parents:
+            raise ValueError("wordlist directory escapes the active project")
+        root.mkdir(parents=True, exist_ok=True)
+        return root
 
     def active_evidence_store(self) -> EvidenceStore | None:
         project = self.active_project
@@ -381,11 +437,15 @@ class DashboardUI:
                 "location": finding.location, "description": finding.description,
                 "evidence": finding.evidence, "recommendation": finding.recommendation,
                 "state": finding.state.value,
+                "password": str(finding.metadata.get("password", "")),
             } for finding in store.list_findings(include_denied=True))
 
         return self._cached_project_records("findings", store, load)  # type: ignore[return-value]
 
-    def filtered_finding_records(self) -> tuple[dict[str, str], ...]:
+    def filtered_finding_records(
+        self,
+        severity: str | None = None,
+    ) -> tuple[dict[str, str], ...]:
         records = self._filter_records_by_scope(
             self.finding_records(), self._scope_filter_state("findings")
         )
@@ -394,6 +454,15 @@ class DashboardUI:
             records = tuple(
                 record for record in records
                 if query in " ".join(record.values()).casefold()
+            )
+        selected_severity = (
+            getattr(self, "finding_severity_filter", "all")
+            if severity is None else severity
+        )
+        if selected_severity != "all":
+            records = tuple(
+                record for record in records
+                if record["severity"] == selected_severity
             )
         return records
 
@@ -483,12 +552,13 @@ class DashboardUI:
             raise KeyError(asset_id)
         asset = store.get_asset(asset_id)
         evidence = store.list_evidence(asset_id=asset.id, limit=EVIDENCE_LINK_LIMIT)
+        findings = store.list_asset_findings(asset.id, limit=EVIDENCE_LINK_LIMIT)
         links, relationship_count = store.list_evidence_asset_links(
             asset.id, limit=EVIDENCE_LINK_LIMIT
         )
-        identifiers = [(asset.kind.value.upper(), asset.normalized_key)]
+        identifiers = [(asset.id, asset.kind.value.upper(), asset.normalized_key)]
         identifiers.extend(
-            (link.asset.kind.value.upper(), link.asset.normalized_key)
+            (link.asset.id, link.asset.kind.value.upper(), link.asset.normalized_key)
             for link in links
         )
         return {
@@ -502,9 +572,15 @@ class DashboardUI:
             "identifiers": tuple(dict.fromkeys(identifiers)),
             "artifacts": tuple(
                 (item.kind.value.upper(), item.id, item.raw_value, item.source.upper(),
-                 item.integrity_status.upper())
+                 item.integrity_status.upper(), item.artifact_path or "")
                 for item in evidence
             ),
+            "findings": tuple({
+                "id": finding.id,
+                "title": finding.title,
+                "state": finding.state.value,
+                "password": str(finding.metadata.get("password", "")),
+            } for finding in findings),
         }
 
     def scope_records(self) -> tuple[dict[str, str], ...]:
@@ -527,6 +603,13 @@ class DashboardUI:
             return tuple(records)
 
         return self._cached_project_records("scope", store, load)  # type: ignore[return-value]
+
+    def filtered_scope_records(self) -> tuple[dict[str, str], ...]:
+        records = self.scope_records()
+        selected = getattr(self, "scope_decision_filter", "ALL")
+        if selected != "ALL":
+            records = tuple(record for record in records if record["decision"] == selected)
+        return records
 
     @staticmethod
     def _record(records: tuple[dict[str, str], ...], record_id: str) -> dict[str, str]:
@@ -587,11 +670,34 @@ class DashboardUI:
             path = self.execution_manager.store.resolve_artifact(
                 self.run_manifest(run_id), relative_path
             )
+        except (ExecutionError, OSError, StopIteration) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self._show_artifact_preview(path)
+
+    def open_evidence_artifact(self, relative_path: str) -> None:
+        project = self.active_project
+        if project is None:
+            ui.notify("Open a project before viewing evidence artifacts", type="warning")
+            return
+        try:
+            runs_root = (project.path / "runs").resolve()
+            path = (project.path / relative_path).resolve()
+            if path != runs_root and runs_root not in path.parents:
+                raise ExecutionError("evidence artifact path escapes the project runs directory")
+        except (OSError, ValueError, ExecutionError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self._show_artifact_preview(path)
+
+    @staticmethod
+    def _show_artifact_preview(path: Path) -> None:
+        try:
             size = path.stat().st_size
             if size > 2_000_000:
                 raise ExecutionError("artifact is too large to preview; use download")
             content = path.read_text(encoding="utf-8", errors="replace")
-        except (ExecutionError, OSError, StopIteration) as error:
+        except (ExecutionError, OSError) as error:
             ui.notify(str(error), type="negative")
             return
 
@@ -822,9 +928,6 @@ class DashboardUI:
             previous.classes(remove="selected")
         if selected is not None:
             selected.classes(add="selected")
-
-    def preview_evidence_filter(self, label: str) -> None:
-        ui.notify(f"{label.title()} evidence filtering is not connected yet")
 
     def open_settings(self) -> None:
         self.settings_open = True
@@ -1115,6 +1218,51 @@ class DashboardUI:
         self.update_workspace_breadcrumb()
         self.render_inspector()
 
+    def set_finding_state(
+        self,
+        finding_id: str,
+        event: events.ValueChangeEventArguments,
+    ) -> None:
+        store = self.active_evidence_store()
+        if store is None:
+            ui.notify("Open a project before updating a finding", type="warning")
+            return
+        try:
+            state = store.set_finding_state(finding_id, str(event.value))
+        except (KeyError, ValueError) as error:
+            ui.notify(f"Could not update finding: {error}", type="negative")
+            return
+        self._invalidate_project_record_cache("findings")
+        if self.active_view == "findings" and hasattr(self, "findings_result_host"):
+            self.refresh_finding_results()
+        self.render_inspector()
+        ui.notify(f"Finding marked {state.value.replace('_', ' ')}", type="positive")
+
+    @staticmethod
+    def copy_finding_password(password: str) -> None:
+        ui.clipboard.write(password)
+        ui.notify("Password copied", type="positive")
+
+    def render_finding_password(self, password: str) -> None:
+        """Render a masked local credential with explicit reveal and copy actions."""
+        with ui.element("section").classes("finding-detail-section"):
+            ui.label("PASSWORD").classes("field-label")
+            with ui.element("div").classes("finding-secret-row"):
+                ui.input(
+                    value=password,
+                    password=True,
+                    password_toggle_button=True,
+                ).props(
+                    'dense outlined readonly aria-label="Matched password"'
+                ).classes("config-control finding-secret-input")
+                ui.button(
+                    "COPY",
+                    icon="content_copy",
+                    on_click=partial(self.copy_finding_password, password),
+                ).props(
+                    'flat dense no-caps aria-label="Copy matched password"'
+                ).classes("settings-action finding-secret-copy")
+
     def select_module(self, module_id: str) -> None:
         self.selected_module_id = module_id
         module = self.selected_module
@@ -1180,6 +1328,10 @@ class DashboardUI:
         )
         self.render_inspector()
 
+    def set_web_discovery_profile(self, event: events.ValueChangeEventArguments) -> None:
+        self.selected_discovery_profile_id = str(event.value or "standard")
+        self.render_inspector()
+
     def set_web_discovery_timeout(self, event: events.ValueChangeEventArguments) -> None:
         self.web_discovery_timeout = str(event.value or "").strip()
 
@@ -1206,26 +1358,26 @@ class DashboardUI:
 
     def ffuf_wordlist_options(self, current: str = "") -> dict[str, str]:
         options: dict[str, str] = {}
-        project = self.active_project
+        project_root = self.project_wordlist_root("web")
         project_wordlists = (
-            discover_ffuf_wordlists(project.wordlists_path, all_files=True)
-            if project is not None else ()
+            discover_ffuf_wordlists(project_root, all_files=True)
+            if project_root is not None else ()
         )
         for path in (*self.ffuf_wordlists, *project_wordlists):
             try:
                 label = path.relative_to(SECLISTS_WEB_CONTENT_ROOT).as_posix()
             except ValueError:
-                label = f"PROJECT / {path.relative_to(project.wordlists_path).as_posix()}"
+                label = f"PROJECT / {path.relative_to(project_root).as_posix()}"
             options[str(path)] = label
         if current and current not in options:
             options[current] = f"CUSTOM / {current}"
         return options
 
     def _reset_ffuf_wordlist_defaults(self) -> None:
-        project = self.active_project
+        project_root = self.project_wordlist_root("web")
         project_wordlists = (
-            discover_ffuf_wordlists(project.wordlists_path, all_files=True)
-            if project is not None else ()
+            discover_ffuf_wordlists(project_root, all_files=True)
+            if project_root is not None else ()
         )
         available = (*self.ffuf_wordlists, *project_wordlists)
         default = str(available[0]) if available else ""
@@ -1233,6 +1385,35 @@ class DashboardUI:
         for module in self.module_catalog.modules:
             if module.adapter == "ffuf" and "wordlist" in self.module_config_values[module.id]:
                 self.module_config_values[module.id]["wordlist"] = default
+
+    def password_wordlist_options(self, current: str = "") -> dict[str, str]:
+        options: dict[str, str] = {}
+        project_root = self.project_wordlist_root("password")
+        project_wordlists = (
+            discover_password_wordlists(project_root, all_files=True)
+            if project_root is not None else ()
+        )
+        for path in (*self.password_wordlists, *project_wordlists):
+            try:
+                label = path.relative_to(SECLISTS_PASSWORD_ROOT).as_posix()
+            except ValueError:
+                label = f"PROJECT / {path.relative_to(project_root).as_posix()}"
+            options[str(path)] = label
+        if current and current not in options:
+            options[current] = f"CUSTOM / {current}"
+        return options
+
+    def _reset_password_wordlist_defaults(self) -> None:
+        project_root = self.project_wordlist_root("password")
+        project_wordlists = (
+            discover_password_wordlists(project_root, all_files=True)
+            if project_root is not None else ()
+        )
+        available = (*self.password_wordlists, *project_wordlists)
+        default = str(available[0]) if available else ""
+        for module in self.module_catalog.modules:
+            if module.adapter == "brutepyweb" and "password_file" in self.module_config_values[module.id]:
+                self.module_config_values[module.id]["password_file"] = default
 
     @staticmethod
     def _enumeration_scope_label(rule: dict[str, object]) -> str:
@@ -1259,6 +1440,27 @@ class DashboardUI:
         self.render_workspace()
         self.render_inspector()
 
+    def set_finding_severity_filter(self, severity: str) -> None:
+        if severity not in {"all", "critical", "high", "medium", "low", "info"}:
+            raise ValueError(f"unsupported finding severity: {severity}")
+        self.finding_severity_filter = severity
+        self.record_page_indexes["findings"] = 0
+        self.refresh_finding_results()
+        self.render_inspector()
+
+    def set_scope_decision_filter(self, decision: str) -> None:
+        if decision not in {"ALL", "ALLOWED", "DENIED", "REVIEW REQUIRED"}:
+            raise ValueError(f"unsupported scope decision: {decision}")
+        self.scope_decision_filter = decision
+        self.record_page_indexes["scope"] = 0
+        for label, button in getattr(self, "scope_filter_buttons", {}).items():
+            if label == decision:
+                button.classes(add="active")
+            else:
+                button.classes(remove="active")
+        self.refresh_scope_results()
+        self.render_inspector()
+
     def set_record_scope_filter(
         self,
         view_id: str,
@@ -1281,7 +1483,16 @@ class DashboardUI:
         self.render_inspector()
 
     def set_proxy_enabled(self, event: events.ValueChangeEventArguments) -> None:
-        self.proxy_enabled = bool(event.value)
+        try:
+            self.settings_store.update(proxy_enabled=bool(event.value))
+            self.proxy_config()
+        except (OSError, ValueError, ExecutionError) as error:
+            try:
+                self.settings_store.update(proxy_enabled=False)
+            except OSError:
+                pass
+            ui.notify(str(error), type="negative")
+        asyncio.create_task(self.refresh_module_health())
         if self.settings_open and self.settings_section == "proxy":
             self.render_settings_content()
 
@@ -1318,6 +1529,13 @@ class DashboardUI:
         module = self.selected_module
         project = self.active_project
         try:
+            if (
+                module.adapter in {"sqlmap", "brutepyweb"}
+                and not self.attack_confirmations.get(module.id)
+            ):
+                raise ScopeValidationError(
+                    "confirm authorization and the stateful attack before launching"
+                )
             selection = self._target_selection(module)
             rules = ScopeStore(project.path).load().rules if project else ()
             evaluations = evaluate_targets(selection.targets, rules, enforce=self.scope_enforced)
@@ -1345,6 +1563,7 @@ class DashboardUI:
                 context=context,
                 options=options,
                 timeout_seconds=timeout_seconds,
+                proxy=self.proxy_config(),
             )
             run = await self.execution_manager.start(request, project.path if project else None)
         except (ExecutionError, OSError, ScopeValidationError, KeyError, ValueError) as error:
@@ -1352,6 +1571,8 @@ class DashboardUI:
             return
 
         self._activate_run(run)
+        if module.id in self.attack_confirmations:
+            self.attack_confirmations[module.id] = False
         ui.notify(f"Started {run.id}", type="positive")
 
     def _activate_run(self, run: RunManifest) -> None:
@@ -1415,7 +1636,9 @@ class DashboardUI:
                 project_path=project.path,
                 scope_rules=document.rules,
                 scope_enforced=self.scope_enforced,
+                profile_id=self.selected_discovery_profile_id,
                 timeout_seconds=timeout_seconds,
+                proxy=self.proxy_config(),
                 on_stage_started=self._activate_discovery_stage,
             )
         except (ExecutionError, OSError, ScopeValidationError, KeyError, ValueError) as error:
@@ -1480,6 +1703,7 @@ class DashboardUI:
                 scope_rules=scope_rules,
                 scope_enforced=self.scope_enforced,
                 timeout_seconds=timeout_seconds,
+                proxy=self.proxy_config(),
                 wordlist=self.web_enumeration_wordlist,
                 recursion_depth=recursion_depth,
                 on_stage_started=self._activate_enumeration_stage,
@@ -1745,6 +1969,9 @@ class DashboardUI:
         if self._ffuf_wordlist_project_id != self.active_project_id:
             self._reset_ffuf_wordlist_defaults()
             self._ffuf_wordlist_project_id = self.active_project_id
+        if self._password_wordlist_project_id != self.active_project_id:
+            self._reset_password_wordlist_defaults()
+            self._password_wordlist_project_id = self.active_project_id
         self.render_topbar()
         if self.active_view in FUNCTIONAL_VIEWS:
             self.render_workspace()
@@ -1905,9 +2132,15 @@ class DashboardUI:
                     "command-search-input"
                 )
                 ui.label("CTRL K").classes("keycap")
-            with ui.element("button").classes("icon-button").props("type=button aria-label=Notifications"):
-                icon("notifications_none")
-            with ui.element("button").classes("icon-button").props("type=button aria-label=Fullscreen"):
+            with ui.element("button").classes("icon-button").props(
+                "type=button aria-label=Fullscreen"
+            ).on(
+                "click",
+                js_handler=(
+                    "() => document.fullscreenElement ? document.exitFullscreen() : "
+                    "document.documentElement.requestFullscreen()"
+                ),
+            ):
                 icon("fullscreen")
 
     # === END: TOP BAR ===
@@ -1971,12 +2204,24 @@ class DashboardUI:
         else:
             ui.label("NO MULTI-STEP MODULES MATCH").classes("module-empty")
 
+        attack_modules = tuple(module for module in visible_modules if module.eyebrow == "attack")
+        launcher_modules = tuple(module for module in visible_modules if module.eyebrow != "attack")
+        with ui.element("div").classes("module-separator"):
+            ui.label("ATTACK LAUNCHERS").classes("module-group-title")
+            ui.label("ONE TOOL / OPERATOR CONTROLLED").classes("module-group-note")
+        if attack_modules:
+            with ui.element("section").classes("module-grid"):
+                for module in attack_modules:
+                    self.render_module_card(module)
+        else:
+            ui.label("NO ATTACK LAUNCHERS MATCH").classes("module-empty")
+
         with ui.element("div").classes("module-separator"):
             ui.label("SINGLE-TOOL LAUNCHERS").classes("module-group-title")
             ui.label("DIRECT / INDEPENDENT").classes("module-group-note")
-        if visible_modules:
+        if launcher_modules:
             with ui.element("section").classes("module-grid"):
-                for module in visible_modules:
+                for module in launcher_modules:
                     self.render_module_card(module)
         else:
             ui.label("NO SINGLE-TOOL LAUNCHERS MATCH").classes("module-empty")
@@ -2041,14 +2286,7 @@ class DashboardUI:
         elif view_id == "runs":
             self.refresh_run_results()
         elif view_id == "scope":
-            records = self.scope_records()
-            self._refresh_record_results(
-                view_id="scope", index=f"{len(records):02d} RULES", records=records,
-                columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
-                         ("ownership", "OWNERSHIP"), ("source", "SOURCE"),
-                         ("updated", "UPDATED")),
-                selected_id=self.selected_scope_id or "", tone_key="decision",
-            )
+            self.refresh_scope_results()
         self.render_inspector()
 
     def render_findings_workspace(self) -> None:
@@ -2099,12 +2337,18 @@ class DashboardUI:
         row_elements: dict[str, object] = {}
         with self.findings_result_host:
             with ui.element("div").classes("finding-summary"):
-                ui.label("ALL").classes("filter-active")
-                for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+                available_findings = self.filtered_finding_records("all")
+                selected_severity = getattr(self, "finding_severity_filter", "all")
+                for severity in ("all", "critical", "high", "medium", "low", "info"):
                     count = sum(
-                        finding["severity"] == severity.lower() for finding in findings
+                        finding["severity"] == severity for finding in available_findings
                     )
-                    ui.label(f"{severity} {count:02d}")
+                    label = "ALL" if severity == "all" else f"{severity.upper()} {count:02d}"
+                    classes = "finding-filter active" if severity == selected_severity else "finding-filter"
+                    with ui.element("button").classes(classes).props(
+                        f'type=button aria-pressed="{str(severity == selected_severity).lower()}"'
+                    ).on("click", partial(self.set_finding_severity_filter, severity)):
+                        ui.label(label)
 
             with ui.element("section").classes("finding-table"):
                 with ui.element("div").classes("finding-row finding-header"):
@@ -2370,8 +2614,9 @@ class DashboardUI:
             ui.label("Evidence").classes("page-title")
             self.evidence_index_label = ui.label("").classes("view-index")
         with ui.element("div").classes("record-filters evidence-filters"):
-            ui.label("SCOPE-FIRST HIERARCHY").classes("filter-active")
-            ui.label("EXPAND ONE BRANCH AT A TIME")
+            ui.label("SCOPE-FIRST HIERARCHY / EXPAND ONE BRANCH AT A TIME").classes(
+                "record-filter-note"
+            )
             self.render_record_pagination("evidence")
         self.evidence_result_host = ui.element("section").classes("evidence-tree")
         self.refresh_evidence_results(records)
@@ -2621,9 +2866,11 @@ class DashboardUI:
                 )
 
     def render_scope_workspace(self) -> None:
-        records = self.scope_records()
+        records = self.filtered_scope_records()
         if records and self.selected_scope_id not in {item["id"] for item in records}:
             self.selected_scope_id = records[0]["id"]
+        elif not records:
+            self.selected_scope_id = None
         self.render_record_workspace(
             view_id="scope", title="Scope",
             index=f"{len(records):02d} RULES",
@@ -2631,6 +2878,22 @@ class DashboardUI:
             columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
                      ("ownership", "OWNERSHIP"), ("source", "SOURCE"), ("updated", "UPDATED")),
             selected_id=self.selected_scope_id, tone_key="decision",
+        )
+
+    def refresh_scope_results(self) -> None:
+        if not hasattr(self, "scope_result_host"):
+            return
+        records = self.filtered_scope_records()
+        if records and self.selected_scope_id not in {record["id"] for record in records}:
+            self.selected_scope_id = records[0]["id"]
+        elif not records:
+            self.selected_scope_id = None
+        self._refresh_record_results(
+            view_id="scope", index=f"{len(records):02d} RULES", records=records,
+            columns=(("decision", "DECISION"), ("target", "TARGET"), ("type", "TYPE"),
+                     ("ownership", "OWNERSHIP"), ("source", "SOURCE"),
+                     ("updated", "UPDATED")),
+            selected_id=self.selected_scope_id or "", tone_key="decision",
         )
 
     def render_runs_workspace(self) -> None:
@@ -2679,7 +2942,6 @@ class DashboardUI:
         columns: tuple[tuple[str, str], ...],
         selected_id: str,
         tone_key: str,
-        interactive_filters: bool = False,
     ) -> None:
         """Render one of the project-aware record lists with a shared dense pattern."""
         self.render_workspace_breadcrumb()
@@ -2695,7 +2957,8 @@ class DashboardUI:
                 ).props("flat dense no-caps").classes("record-filter-button scope-add-button")
                 if self.active_project is None:
                     add_scope_button.disable()
-            for filter_index, label in enumerate(filters):
+                self.scope_filter_buttons = {}
+            for label in filters:
                 if view_id == "runs":
                     ui.button(label, on_click=partial(self.set_run_state_filter, label)).props(
                         "flat dense no-caps"
@@ -2703,14 +2966,14 @@ class DashboardUI:
                         "record-filter-button active"
                         if label == self.run_state_filter else "record-filter-button"
                     )
-                elif interactive_filters:
-                    ui.button(label, on_click=partial(self.preview_evidence_filter, label)).props(
-                        "flat dense no-caps"
-                    ).classes(
-                        "record-filter-button active" if filter_index == 0 else "record-filter-button"
+                elif view_id == "scope":
+                    button = ui.button(
+                        label, on_click=partial(self.set_scope_decision_filter, label)
+                    ).props("flat dense no-caps").classes(
+                        "record-filter-button active"
+                        if label == self.scope_decision_filter else "record-filter-button"
                     )
-                else:
-                    ui.label(label).classes("filter-active" if filter_index == 0 else "")
+                    self.scope_filter_buttons[label] = button
             if view_id == "runs":
                 self.render_scope_state_filter("runs", "run-scope-filter")
             if view_id in {"evidence", "scope", "runs"}:
@@ -3130,6 +3393,9 @@ class DashboardUI:
                             if module.adapter == "ffuf" and config_field.id == "wordlist" and not value:
                                 self._reset_ffuf_wordlist_defaults()
                                 value = self.module_config_values[module.id][config_field.id]
+                            if module.adapter == "brutepyweb" and config_field.id == "password_file" and not value:
+                                self._reset_password_wordlist_defaults()
+                                value = self.module_config_values[module.id][config_field.id]
                             on_change = partial(
                                 self.set_module_config, module.id, config_field.id
                             )
@@ -3142,12 +3408,31 @@ class DashboardUI:
                                     new_value_mode="add-unique",
                                     clearable=True,
                                 ).props("dense outlined options-dense").classes("config-control")
+                            elif module.adapter == "brutepyweb" and config_field.id == "password_file":
+                                ui.select(
+                                    self.password_wordlist_options(value),
+                                    value=value or None,
+                                    on_change=on_change,
+                                    with_input=True,
+                                    new_value_mode="add-unique",
+                                    clearable=True,
+                                ).props("dense outlined options-dense").classes("config-control")
                             else:
                                 ui.input(
                                     value=value,
                                     placeholder=config_field.placeholder,
                                     on_change=on_change,
                                 ).props("dense outlined clearable").classes("config-control")
+
+                if module.adapter in {"sqlmap", "brutepyweb"}:
+                    with ui.element("div").classes("field"):
+                        ui.checkbox(
+                            "I confirm authorization for this stateful test",
+                            value=self.attack_confirmations.get(module.id, False),
+                            on_change=lambda event, module_id=module.id: self.attack_confirmations.__setitem__(
+                                module_id, bool(event.value)
+                            ),
+                        ).props("dense").classes("check-row")
 
                 with ui.element("div").classes("field"):
                     ui.label("RUN TIMEOUT / SECONDS").classes("field-label")
@@ -3175,10 +3460,11 @@ class DashboardUI:
                                     (field.id, self.module_config_values[module.id].get(field.id, ""))
                                     for field in module.config_fields
                                 ),
+                                proxy=self.proxy_config(),
                             )
                             adapter = self.execution_manager.adapters.get(module.adapter)
                             executable = adapter.resolve_executable(request)
-                            command = adapter.preview_command(request, executable)
+                            command = self.execution_manager.preview_command(request, executable)
                             ui.label(command.executable).classes("command-tool")
                             for argument in command.arguments:
                                 ui.label(f" {shlex.quote(argument)}").classes("command-argument")
@@ -3230,6 +3516,18 @@ class DashboardUI:
             self.selected_discovery_scope_ids = selected_ids
 
         with ui.element("div").classes("inspector-body"):
+            with ui.element("div").classes("field"):
+                ui.label("DISCOVERY PROFILE").classes("field-label")
+                ui.select(
+                    {profile.id: profile.name for profile in WEB_DISCOVERY_PROFILES},
+                    value=self.selected_discovery_profile_id,
+                    on_change=self.set_web_discovery_profile,
+                ).props("dense outlined options-dense").classes("config-control")
+                profile = self.web_discovery_module.get_profile(
+                    self.selected_discovery_profile_id
+                )
+                ui.label(profile.description.upper()).classes("field-help")
+
             with ui.element("div").classes("field"):
                 ui.label("SCOPE SEEDS").classes("field-label")
                 options = {
@@ -3295,6 +3593,8 @@ class DashboardUI:
                                 project_id=project.id,
                                 project_name=project.name,
                                 scope_enforced=self.scope_enforced,
+                                profile_id=self.selected_discovery_profile_id,
+                                proxy=self.proxy_config(),
                             )
                             for stage_name, command in previews:
                                 with ui.element("div").classes("workflow-command"):
@@ -3473,6 +3773,7 @@ class DashboardUI:
                                     if any(stage.module_id == "07" for stage in chain.stages)
                                     else 2
                                 ),
+                                proxy=self.proxy_config(),
                             )
                             for stage, command in previews:
                                 module = self.module_catalog.get(stage.module_id)
@@ -3531,12 +3832,25 @@ class DashboardUI:
                 ("LOCATION", finding["location"]),
                 ("SOURCE", finding["source"].upper()),
                 ("CONFIDENCE", finding["confidence"].upper()),
-                ("LIFECYCLE", finding["state"].replace("_", " ").upper()),
                 ("FIRST SEEN", finding["seen"]),
             ):
                 with ui.element("div").classes("finding-detail-row"):
                     ui.label(label).classes("finding-detail-label")
                     ui.label(value).classes("finding-detail-value")
+
+            ui.label("LIFECYCLE").classes("field-label")
+            ui.select(
+                {
+                    state.value: state.value.replace("_", " ").upper()
+                    for state in FindingState
+                },
+                value=finding["state"],
+                on_change=partial(self.set_finding_state, finding["id"]),
+            ).props("dense outlined options-dense").classes("config-control")
+
+            password = finding.get("password", "")
+            if password:
+                self.render_finding_password(password)
 
             for label, value in (
                 ("DESCRIPTION", finding["description"]),
@@ -3611,10 +3925,30 @@ class DashboardUI:
 
             ui.label(str(record["context"])).classes("evidence-context")
 
+            findings = record["findings"]
+            if findings:
+                ui.label("FINDINGS").classes("field-label evidence-subheading")
+                for finding in findings:
+                    with ui.element("section").classes("finding-detail-section evidence-finding"):
+                        ui.label(str(finding["title"])).classes("evidence-artifact-name")
+                        ui.select(
+                            {
+                                state.value: state.value.replace("_", " ").upper()
+                                for state in FindingState
+                            },
+                            value=finding["state"],
+                            on_change=partial(self.set_finding_state, finding["id"]),
+                        ).props("dense outlined options-dense").classes("config-control")
+                        password = str(finding["password"])
+                        if password:
+                            self.render_finding_password(password)
+
             ui.label("RELATED IDENTIFIERS").classes("field-label evidence-subheading")
             with ui.element("div").classes("evidence-identifiers"):
-                for identifier_type, value in record["identifiers"]:
-                    with ui.element("button").classes("evidence-identifier").props("type=button"):
+                for identifier_id, identifier_type, value in record["identifiers"]:
+                    with ui.element("button").classes("evidence-identifier").props(
+                        f'type=button aria-label="Open evidence node {identifier_id}"'
+                    ).on("click", partial(self.select_evidence_asset, identifier_id)):
                         ui.label(identifier_type).classes("evidence-identifier-type")
                         ui.label(value).classes("evidence-identifier-value")
 
@@ -3622,10 +3956,18 @@ class DashboardUI:
                 ui.label("LATEST EVIDENCE").classes("field-label")
                 ui.label(f"UP TO {EVIDENCE_LINK_LIMIT:02d} RECORDS").classes("settings-meta")
             with ui.element("div").classes("evidence-artifacts"):
-                for artifact_type, artifact_id, name, source, integrity in record["artifacts"]:
-                    with ui.element("button").classes("evidence-artifact").props(
-                        f'type=button aria-label="Open artifact {artifact_id}"'
-                    ):
+                for artifact_type, artifact_id, name, source, integrity, artifact_path in record["artifacts"]:
+                    artifact_row = ui.element("button" if artifact_path else "div").classes(
+                        "evidence-artifact" if artifact_path
+                        else "evidence-artifact evidence-artifact-static"
+                    )
+                    if artifact_path:
+                        artifact_row.props(
+                            f'type=button aria-label="Open artifact {artifact_id}"'
+                        ).on(
+                            "click", partial(self.open_evidence_artifact, artifact_path)
+                        )
+                    with artifact_row:
                         ui.label(artifact_type).classes("evidence-artifact-type")
                         with ui.element("div").classes("evidence-artifact-copy"):
                             ui.label(name).classes("evidence-artifact-name")
@@ -3770,6 +4112,29 @@ class DashboardUI:
             ui.checkbox("Preserve incomplete run artifacts", value=True).props("dense").classes("setting-check")
             ui.checkbox("Restore open project tabs on startup", value=True).props("dense").classes("setting-check")
 
+        settings = self.settings_store.settings
+        with ui.element("section").classes("settings-group"):
+            ui.label("PROJECT WORDLISTS").classes("settings-group-title")
+            self.web_wordlist_directory_field = self.render_setting_field(
+                "WEB CONTENT DIRECTORY",
+                settings.web_wordlist_directory,
+                placeholder="wordlists/web-content",
+            )
+            self.password_wordlist_directory_field = self.render_setting_field(
+                "PASSWORD DIRECTORY",
+                settings.password_wordlist_directory,
+                placeholder="wordlists/passwords",
+            )
+            ui.label(
+                "PROJECT-RELATIVE FALLBACKS / KALI SECLISTS REMAINS THE FIRST SOURCE WHEN INSTALLED"
+            ).classes("settings-note")
+            with ui.element("div").classes("settings-actions"):
+                ui.button(
+                    "SAVE WORDLIST PATHS",
+                    icon="save",
+                    on_click=self.save_wordlist_settings,
+                ).props("flat no-caps").classes("settings-action primary")
+
     def render_project_settings(self) -> None:
         self.render_settings_heading("Projects", "Open tabs and portable local project directories.")
         with ui.element("section").classes("settings-group"):
@@ -3801,7 +4166,70 @@ class DashboardUI:
                     "flat no-caps"
                 ).classes("settings-action")
 
+    def save_wordlist_settings(self) -> None:
+        try:
+            self.settings_store.update(
+                web_wordlist_directory=str(self.web_wordlist_directory_field.value or ""),
+                password_wordlist_directory=str(
+                    self.password_wordlist_directory_field.value or ""
+                ),
+            )
+            self.project_wordlist_root("web")
+            self.project_wordlist_root("password")
+            self._reset_ffuf_wordlist_defaults()
+            self._reset_password_wordlist_defaults()
+        except (OSError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        ui.notify("Saved project wordlist directories", type="positive")
+
+    def apply_proxy_preset(self, protocol: str, host: str, port: int) -> None:
+        try:
+            self.settings_store.update(
+                proxy_protocol=protocol, proxy_host=host, proxy_port=port
+            )
+        except (OSError, ValueError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        self.render_settings_content()
+
+    def save_proxy_settings(self) -> None:
+        try:
+            protocol = str(self.proxy_protocol_field.value or "").casefold()
+            host = str(self.proxy_host_field.value or "")
+            port = int(str(self.proxy_port_field.value or ""))
+            certificate = str(self.proxy_ca_field.value or "").strip()
+            ProxyConfig(protocol, host, port, certificate)
+            self.settings_store.update(
+                proxy_protocol=protocol,
+                proxy_host=host,
+                proxy_port=port,
+                proxy_ca_certificate=certificate,
+            )
+        except (OSError, ValueError, ExecutionError) as error:
+            ui.notify(str(error), type="negative")
+            return
+        ui.notify("Saved application proxy", type="positive")
+        asyncio.create_task(self.refresh_module_health())
+        self.render_topbar()
+        self.render_settings_content()
+
+    async def test_proxy_connection(self) -> None:
+        settings = self.settings_store.settings
+        try:
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(settings.proxy_host, settings.proxy_port),
+                timeout=5,
+            )
+            writer.close()
+            await writer.wait_closed()
+        except (OSError, TimeoutError) as error:
+            ui.notify(f"Proxy connection failed: {error}", type="negative")
+            return
+        ui.notify("Proxy TCP connection succeeded", type="positive")
+
     def render_proxy_settings(self) -> None:
+        settings = self.settings_store.settings
         self.render_settings_heading(
             "Proxy",
             "Route compatible launcher modules through an HTTP or SOCKS proxy.",
@@ -3815,41 +4243,41 @@ class DashboardUI:
 
             ui.label("LOCAL INTERCEPT PRESETS").classes("field-label proxy-preset-label")
             with ui.element("div").classes("proxy-presets"):
-                for label in (
+                ui.button(
                     "ZAP / 127.0.0.1:8080",
-                    "BURP / 127.0.0.1:8080",
-                    "REMOTE SOCKS / JUMPHOST",
-                    "CUSTOM",
-                ):
-                    ui.button(label, on_click=lambda: ui.notify(
-                        "Proxy presets are not connected yet"
-                    )).props("flat dense no-caps").classes("proxy-preset")
+                    on_click=partial(self.apply_proxy_preset, "http", "127.0.0.1", 8080),
+                ).props("flat dense no-caps").classes("proxy-preset")
+                ui.button(
+                    "SOCKS5 / 127.0.0.1:1080",
+                    on_click=partial(self.apply_proxy_preset, "socks5", "127.0.0.1", 1080),
+                ).props("flat dense no-caps").classes("proxy-preset")
 
             with ui.element("div").classes("settings-field-grid proxy-connection-grid"):
                 with ui.element("div").classes("settings-field"):
                     ui.label("PROTOCOL").classes("field-label")
-                    ui.select(["HTTP", "HTTPS", "SOCKS4", "SOCKS5"], value="HTTP").props(
+                    self.proxy_protocol_field = ui.select(
+                        {"http": "HTTP", "socks5": "SOCKS5"},
+                        value=settings.proxy_protocol,
+                    ).props(
                         "dense outlined options-dense"
                     ).classes("config-control settings-select-control")
-                self.render_setting_field("HOST", "127.0.0.1")
-                self.render_setting_field("PORT", "8080")
+                self.proxy_host_field = self.render_setting_field("HOST", settings.proxy_host)
+                self.proxy_port_field = self.render_setting_field("PORT", str(settings.proxy_port))
 
             with ui.element("div").classes("settings-actions"):
-                ui.button("TEST CONNECTION", icon="network_check", on_click=lambda: ui.notify(
-                    "Proxy connectivity testing is not connected yet"
-                )).props("flat no-caps").classes("settings-action primary")
+                ui.button(
+                    "SAVE", icon="save", on_click=self.save_proxy_settings
+                ).props("flat no-caps").classes("settings-action primary")
+                ui.button(
+                    "TEST CONNECTION", icon="network_check", on_click=self.test_proxy_connection
+                ).props("flat no-caps").classes("settings-action")
 
         with ui.element("section").classes("settings-group"):
-            ui.label("AUTHENTICATION AND TLS").classes("settings-group-title")
-            with ui.element("div").classes("settings-field-grid"):
-                with ui.element("div").classes("settings-field"):
-                    ui.label("AUTHENTICATION").classes("field-label")
-                    ui.select(["None", "Username / password"], value="None").props(
-                        "dense outlined options-dense"
-                    ).classes("config-control settings-select-control")
-                self.render_setting_field("USERNAME", "")
-            self.render_setting_field("PASSWORD", "", password=True)
-            self.render_setting_field("INTERCEPTION CA CERTIFICATE (OPTIONAL)", "")
+            ui.label("TLS").classes("settings-group-title")
+            self.proxy_ca_field = self.render_setting_field(
+                "INTERCEPTION CA CERTIFICATE (OPTIONAL)",
+                settings.proxy_ca_certificate,
+            )
             ui.label(
                 "HTTPS interception through ZAP, Burp, or another intercepting proxy requires the launcher "
                 "environment to trust that proxy's CA certificate."
@@ -3857,16 +4285,9 @@ class DashboardUI:
 
         with ui.element("section").classes("settings-group"):
             ui.label("ROUTING POLICY").classes("settings-group-title")
-            ui.checkbox("Proxy DNS through SOCKS5 when supported", value=True).props("dense").classes(
-                "setting-check"
-            )
-            ui.checkbox("Block launch when an enabled proxy cannot be honored", value=True).props(
-                "dense"
-            ).classes("setting-check")
-            self.render_setting_field("BYPASS TARGETS", "localhost, 127.0.0.1, ::1")
             ui.label(
-                "Proxy capability is adapter-specific. Raw sockets, DNS clients, and some scanners may not support "
-                "HTTP or SOCKS routing; NullBound must never imply that unsupported traffic is proxied."
+                "WHEN PROXY IS CHECKED, UNSUPPORTED TOOLS ARE BLOCKED BEFORE A RUN IS CREATED. "
+                "WHEN UNCHECKED, NULLBOUND REMOVES INHERITED PROXY ENVIRONMENT VARIABLES."
             ).classes("settings-note warning")
 
     # === START: MODULE SETTINGS ===
@@ -3908,6 +4329,7 @@ class DashboardUI:
             RunRequest(
                 module=module, profile=module.default_profile,
                 context=ExecutionContext(selection=TargetSelection.direct((Target.parse("example.com"),))),
+                proxy=self.proxy_config(),
             )
             for module in modules
         )
@@ -4288,5 +4710,10 @@ class DashboardUI:
 def build_ui(
     app_config: AppConfig | None = None,
     execution_manager: ExecutionManager | None = None,
+    settings_store: OperatorSettingsStore | None = None,
 ) -> None:
-    DashboardUI(app_config=app_config, execution_manager=execution_manager).build()
+    DashboardUI(
+        app_config=app_config,
+        execution_manager=execution_manager,
+        settings_store=settings_store,
+    ).build()

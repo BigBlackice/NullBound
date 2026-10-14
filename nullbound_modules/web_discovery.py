@@ -13,6 +13,7 @@ from nullbound_execution import (
     CommandSpec,
     ExecutionError,
     ExecutionManager,
+    ProxyConfig,
     RunManifest,
     RunRequest,
     RunState,
@@ -54,6 +55,30 @@ StageStarted = Callable[[int, int, RunManifest], None]
 
 
 @dataclass(frozen=True, slots=True)
+class DiscoveryProfile:
+    id: str
+    name: str
+    description: str
+    subfinder_profile: str
+
+
+WEB_DISCOVERY_PROFILES = (
+    DiscoveryProfile(
+        "standard", "Standard passive", "Default passive sources",
+        "Standard passive",
+    ),
+    DiscoveryProfile(
+        "broad", "Broad passive", "All configured passive sources",
+        "Broad passive",
+    ),
+    DiscoveryProfile(
+        "recursive", "Recursive passive", "Recursive-capable passive sources",
+        "Recursive passive",
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
 class WebDiscoveryResult:
     runs: tuple[RunManifest, ...]
     discovered_domains: int
@@ -74,6 +99,13 @@ class WebDiscoveryModule:
         self.execution_manager = execution_manager
         self.module_catalog = module_catalog
         self.parsers = parsers or ParserRegistry.native()
+
+    @staticmethod
+    def get_profile(profile_id: str) -> DiscoveryProfile:
+        try:
+            return next(profile for profile in WEB_DISCOVERY_PROFILES if profile.id == profile_id)
+        except StopIteration as error:
+            raise ScopeValidationError(f"unknown Web Discovery profile: {profile_id}") from error
 
     @staticmethod
     def supports_scope_rule(rule: ScopeRule) -> bool:
@@ -127,20 +159,27 @@ class WebDiscoveryModule:
         project_id: str,
         project_name: str,
         scope_enforced: bool,
+        profile_id: str = "standard",
         timeout_seconds: int | None = None,
+        proxy: ProxyConfig | None = None,
     ) -> tuple[tuple[str, CommandSpec], ...]:
         previews: list[tuple[str, CommandSpec]] = []
+        discovery_profile = self.get_profile(profile_id)
         for module_id in STAGE_MODULE_IDS:
             request = self._request(
+                discovery_profile,
                 module_id,
                 seeds,
                 project_id=project_id,
                 project_name=project_name,
                 scope_enforced=scope_enforced,
                 timeout_seconds=timeout_seconds,
+                proxy=proxy,
             )
-            adapter = self.execution_manager.adapters.get(request.module.adapter)
-            previews.append((request.module.bin, adapter.preview_command(request, request.module.path)))
+            previews.append((
+                request.module.bin,
+                self.execution_manager.preview_command(request, request.module.path),
+            ))
         return tuple(previews)
 
     async def run(
@@ -152,25 +191,31 @@ class WebDiscoveryModule:
         project_path: Path,
         scope_rules: tuple[ScopeRule, ...],
         scope_enforced: bool,
+        profile_id: str = "standard",
         timeout_seconds: int | None = None,
+        proxy: ProxyConfig | None = None,
         on_stage_started: StageStarted | None = None,
     ) -> WebDiscoveryResult:
         if not seeds:
             raise ScopeValidationError("Web Discovery needs at least one domain seed")
+        discovery_profile = self.get_profile(profile_id)
         await self._preflight(
+            discovery_profile,
             seeds,
             project_id=project_id,
             project_name=project_name,
             scope_enforced=scope_enforced,
             timeout_seconds=timeout_seconds,
+            proxy=proxy,
         )
 
         runs: list[RunManifest] = []
         excluded = 0
 
         subfinder = await self._run_stage(
-            0, seeds, project_id, project_name, project_path, scope_enforced,
+            discovery_profile, 0, seeds, project_id, project_name, project_path, scope_enforced,
             timeout_seconds, on_stage_started,
+            proxy,
         )
         runs.append(subfinder)
         discovered = self._targets_from_run(subfinder, "subfinder", {AssetKind.DOMAIN})
@@ -182,8 +227,9 @@ class WebDiscoveryModule:
             return WebDiscoveryResult(tuple(runs), len(discovered), 0, 0, excluded)
 
         dnsx = await self._run_stage(
-            1, dns_targets, project_id, project_name, project_path, scope_enforced,
+            discovery_profile, 1, dns_targets, project_id, project_name, project_path, scope_enforced,
             timeout_seconds, on_stage_started,
+            proxy,
         )
         runs.append(dnsx)
         resolved = self._targets_from_run(
@@ -197,8 +243,9 @@ class WebDiscoveryModule:
             )
 
         httpx = await self._run_stage(
-            2, http_targets, project_id, project_name, project_path, scope_enforced,
+            discovery_profile, 2, http_targets, project_id, project_name, project_path, scope_enforced,
             timeout_seconds, on_stage_started,
+            proxy,
         )
         runs.append(httpx)
         live = self._records(httpx, "httpx")
@@ -208,21 +255,25 @@ class WebDiscoveryModule:
 
     async def _preflight(
         self,
+        discovery_profile: DiscoveryProfile,
         targets: tuple[Target, ...],
         *,
         project_id: str,
         project_name: str,
         scope_enforced: bool,
         timeout_seconds: int | None,
+        proxy: ProxyConfig | None,
     ) -> None:
         requests = tuple(
             self._request(
+                discovery_profile,
                 module_id,
                 targets,
                 project_id=project_id,
                 project_name=project_name,
                 scope_enforced=scope_enforced,
                 timeout_seconds=timeout_seconds,
+                proxy=proxy,
             )
             for module_id in STAGE_MODULE_IDS
         )
@@ -239,6 +290,7 @@ class WebDiscoveryModule:
 
     async def _run_stage(
         self,
+        discovery_profile: DiscoveryProfile,
         stage_index: int,
         targets: tuple[Target, ...],
         project_id: str,
@@ -247,13 +299,15 @@ class WebDiscoveryModule:
         scope_enforced: bool,
         timeout_seconds: int | None,
         on_stage_started: StageStarted | None,
+        proxy: ProxyConfig | None,
     ) -> RunManifest:
         request = self._request(
-            STAGE_MODULE_IDS[stage_index], targets,
+            discovery_profile, STAGE_MODULE_IDS[stage_index], targets,
             project_id=project_id,
             project_name=project_name,
             scope_enforced=scope_enforced,
             timeout_seconds=timeout_seconds,
+            proxy=proxy,
         )
         run = await self.execution_manager.start(request, project_path)
         if on_stage_started is not None:
@@ -273,6 +327,7 @@ class WebDiscoveryModule:
 
     def _request(
         self,
+        discovery_profile: DiscoveryProfile,
         module_id: str,
         targets: tuple[Target, ...],
         *,
@@ -280,9 +335,20 @@ class WebDiscoveryModule:
         project_name: str,
         scope_enforced: bool,
         timeout_seconds: int | None,
+        proxy: ProxyConfig | None,
     ) -> RunRequest:
         module = self.module_catalog.get(module_id)
-        profile = HTTPX_DISCOVERY_PROFILE if module_id == "04" else module.default_profile
+        if module_id == "01":
+            profile = next(
+                (item for item in module.profiles if item.name == discovery_profile.subfinder_profile),
+                None,
+            )
+            if profile is None:
+                raise ScopeValidationError(
+                    f"Subfinder profile is unavailable: {discovery_profile.subfinder_profile}"
+                )
+        else:
+            profile = HTTPX_DISCOVERY_PROFILE if module_id == "04" else module.default_profile
         return RunRequest(
             module=module,
             profile=profile,
@@ -293,6 +359,7 @@ class WebDiscoveryModule:
                 scope_enforced=scope_enforced,
             ),
             timeout_seconds=timeout_seconds,
+            proxy=proxy,
         )
 
     def _records(self, run: RunManifest, parser_key: str):

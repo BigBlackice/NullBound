@@ -83,6 +83,7 @@ class RunStore:
             executable=command.executable,
             arguments=command.arguments,
             created_at=utc_now(),
+            proxy_url=request.proxy.url if request.proxy else None,
             timeout_seconds=request.timeout_seconds,
             evidence_state="pending" if context.project_id else "not_applicable",
             run_path=run_path,

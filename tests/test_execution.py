@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from nullbound_execution import (
     RunStore,
     ToolAdapter,
     HttpxAdapter,
+    ProxyConfig,
     discover_ffuf_wordlists,
     expand_argument_template,
 )
@@ -117,22 +119,35 @@ class AdapterTests(unittest.TestCase):
             "01": "example.com", "02": "api.example.com", "03": "192.0.2.10",
             "04": "https://example.com", "05": "example.com", "06": "example.com",
             "07": "https://example.com",
+            "08": "https://example.com", "09": "https://example.com/?id=1",
+            "10": "https://example.com/login",
         }
         artifact_flags = {
             "01": "-o", "02": "-o", "03": "-oX",
             "04": "-o", "05": "--o", "06": "-o", "07": "-o",
+            "08": "-jle", "09": "--output-dir", "10": "--artifact",
         }
         registry = AdapterRegistry()
 
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
+            sqlmap = root / "sqlmap.py"
+            brutepyweb = root / "webbruterv1.py"
+            sqlmap.write_text("print('sqlmap')\n", encoding="utf-8")
+            brutepyweb.write_text("print('brutepyweb')\n", encoding="utf-8")
             for module in catalog:
                 for profile in module.profiles:
                     with self.subTest(module=module.bin, profile=profile.name):
-                        options = (
-                            (("wordlist", str(root / "words.txt")),)
-                            if module.id == "07" else ()
-                        )
+                        if module.id == "07":
+                            options = (("wordlist", str(root / "words.txt")),)
+                        elif module.id == "10":
+                            options = (("password_file", str(root / "words.txt")),)
+                        else:
+                            options = ()
+                        if module.id in {"09", "10"}:
+                            payload = module.to_mapping()
+                            payload["path"] = str(sqlmap if module.id == "09" else brutepyweb)
+                            module = ModuleDefinition.from_mapping(payload)
                         (root / "words.txt").write_text("admin\n", encoding="utf-8")
                         request = RunRequest(
                             module=module,
@@ -149,7 +164,7 @@ class AdapterTests(unittest.TestCase):
                         self.assertEqual(command.executable, module.bin)
                         self.assertIn(artifact_flags[module.id], command.arguments)
                         self.assertNotIn(";", command.arguments)
-                        self.assertIn(command.output_format, {"json", "jsonl", "xml"})
+                        self.assertIn(command.output_format, {"json", "jsonl", "xml", "text"})
 
             dns_targets = root / "dnsx" / "inputs" / "targets.txt"
             self.assertEqual(dns_targets.read_text(encoding="utf-8"), "api.example.com\n")
@@ -163,6 +178,14 @@ class AdapterTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertEqual(adapter.parse_version([line]), expected)
+
+    def test_nuclei_version_parser_rejects_an_unrelated_executable(self) -> None:
+        adapter = AdapterRegistry().get("nuclei")
+        self.assertEqual(
+            adapter.parse_version(["[INF] Current nuclei version: v3.4.10 (latest)"]),
+            "v3.4.10",
+        )
+        self.assertIsNone(adapter.parse_version(["unrelated tool 1.0"]))
 
     def test_subfinder_writes_source_attributed_jsonl_without_private_state(self) -> None:
         module = load_default_catalog().get("01")
@@ -276,6 +299,57 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(command.executable, "httpx")
         self.assertIn(str(Path("<run>") / "artifacts" / "httpx.jsonl"), command.arguments)
 
+    def test_proxy_routing_is_explicit_and_disabled_runs_ignore_inherited_proxy(self) -> None:
+        module = load_default_catalog().get("04")
+        context = ExecutionContext(
+            selection=TargetSelection.direct((Target.parse("https://example.com"),))
+        )
+        with TemporaryDirectory() as directory:
+            manager = ExecutionManager(store=RunStore(Path(directory)))
+            enabled = manager.preview_command(RunRequest(
+                module, module.default_profile, context,
+                proxy=ProxyConfig("http", "127.0.0.1", 8080),
+            ), "httpx")
+            disabled = manager.preview_command(
+                RunRequest(module, module.default_profile, context), "httpx"
+            )
+
+        self.assertEqual(enabled.arguments[-2:], ("-proxy", "http://127.0.0.1:8080"))
+        self.assertIn(("HTTPS_PROXY", "http://127.0.0.1:8080"), enabled.environment)
+        self.assertIn(("NO_PROXY", "*"), disabled.environment)
+        self.assertIn(("HTTPS_PROXY", ""), disabled.environment)
+
+    def test_proxy_blocks_tools_that_cannot_honor_it(self) -> None:
+        module = load_default_catalog().get("02")
+        request = RunRequest(
+            module, module.default_profile,
+            ExecutionContext(selection=TargetSelection.direct((Target.parse("example.com"),))),
+            proxy=ProxyConfig("http", "127.0.0.1", 8080),
+        )
+        with TemporaryDirectory() as directory:
+            manager = ExecutionManager(store=RunStore(Path(directory)))
+            with self.assertRaisesRegex(ExecutionError, "cannot honor"):
+                manager.preview_command(request, "dnsx")
+
+    def test_run_manifest_records_the_enforced_proxy(self) -> None:
+        module = load_default_catalog().get("04")
+        request = RunRequest(
+            module, module.default_profile,
+            ExecutionContext(selection=TargetSelection.direct((Target.parse("https://example.com"),))),
+            proxy=ProxyConfig("http", "127.0.0.1", 8080),
+        )
+        with TemporaryDirectory() as directory:
+            store = RunStore(Path(directory))
+            run_id, run_path = store.reserve()
+            manifest = store.create(
+                run_id, run_path, request, CommandSpec("httpx", ("-u", "https://example.com/")),
+                "test",
+            )
+            loaded = store.load(run_path)
+
+        self.assertEqual(manifest.proxy_url, "http://127.0.0.1:8080")
+        self.assertEqual(loaded.proxy_url, manifest.proxy_url)
+
     def test_configured_executable_path_must_be_runnable(self) -> None:
         with TemporaryDirectory() as directory:
             executable = Path(directory) / "probe"
@@ -304,7 +378,7 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ExecutionError, "unknown module adapter"):
             AdapterRegistry().get("amass")
 
-    def test_setup_scripts_bootstrap_ffuf_and_not_amass(self) -> None:
+    def test_setup_scripts_bootstrap_external_tools_and_use_bundled_brutepyweb(self) -> None:
         setup_script = (
             Path(__file__).parents[1] / "scripts" / "setup-tools.ps1"
         ).read_text(encoding="utf-8")
@@ -314,8 +388,80 @@ class AdapterTests(unittest.TestCase):
 
         self.assertIn("projectdiscovery/subfinder", setup_script)
         self.assertIn("ffuf/ffuf", setup_script)
+        self.assertIn("projectdiscovery/nuclei", setup_script)
+        self.assertIn("recon_modules\\brutepyweb\\webbruterv1.py", setup_script)
+        self.assertNotIn("BigBlackice/brutepyweb", setup_script)
+        self.assertIn("sqlmapproject/sqlmap", setup_script)
         self.assertIn("github.com/ffuf/ffuf/v2@latest", linux_setup)
+        self.assertIn("projectdiscovery/nuclei", linux_setup)
+        self.assertIn("recon_modules/brutepyweb/webbruterv1.py", linux_setup)
+        self.assertNotIn("BigBlackice/brutepyweb", linux_setup)
         self.assertNotIn("owasp-amass/amass", setup_script)
+
+    def test_brutepyweb_baseline_is_tracked_in_the_module_tree(self) -> None:
+        module = load_default_catalog().get("10")
+        script = Path(__file__).parents[1] / module.path
+
+        self.assertEqual(module.path, "recon_modules/brutepyweb/webbruterv1.py")
+        self.assertTrue(script.is_file())
+
+
+    def test_brutepyweb_wrapper_preserves_matches_in_output_and_artifact(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = root / "fake_brute.py"
+            artifact = root / "result.jsonl"
+            wordlist = root / "passwords.txt"
+            wordlist.write_text("first\nswordfish\n", encoding="utf-8")
+            tool.write_text(
+                "print('[+] Candidate: status=200 length=20 password=first')\n"
+                "print('[+] Validated: status=302 length=12 signals=final-url,redirects password=swordfish')\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                (
+                    sys.executable, "scripts/brutepyweb_adapter.py",
+                    "--tool", str(tool), "--artifact", str(artifact), "--identity", "alice",
+                    "--", "-u", "https://example.com/login", "-p", str(wordlist),
+                ),
+                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                check=True,
+            )
+            stored = artifact.read_text(encoding="utf-8")
+
+        self.assertIn("password=swordfish", completed.stdout)
+        self.assertIn('"password": "swordfish"', stored)
+        self.assertIn('"identity": "alice"', stored)
+        self.assertIn('"wordlist_name": "passwords.txt"', stored)
+        self.assertIn('"wordlist_line": 2', stored)
+        self.assertIn('"classification": "validated"', stored)
+        self.assertIn('"classification": "candidate"', stored)
+        self.assertIn('"signals": ["final-url", "redirects"]', stored)
+
+    def test_brutepyweb_identity_is_submitted_as_the_username(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tool = root / "webbruterv1.py"
+            wordlist = root / "passwords.txt"
+            tool.write_text("print('brutepyweb')\n", encoding="utf-8")
+            wordlist.write_text("candidate\n", encoding="utf-8")
+            payload = load_default_catalog().get("10").to_mapping()
+            payload["path"] = str(tool)
+            module = ModuleDefinition.from_mapping(payload)
+            request = RunRequest(
+                module, module.default_profile,
+                ExecutionContext(selection=TargetSelection.direct((
+                    Target.parse("https://example.com/login"),
+                ))),
+                options=(("password_file", str(wordlist)), ("identity", "alice")),
+            )
+
+            command = AdapterRegistry().get("brutepyweb").build_command(
+                request, root / "run", sys.executable
+            )
+
+        username_index = command.arguments.index("--username")
+        self.assertEqual(command.arguments[username_index + 1], "alice")
 
 
 class ExecutionManagerTests(unittest.IsolatedAsyncioTestCase):

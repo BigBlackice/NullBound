@@ -99,6 +99,20 @@ class FakeExecutionManager:
 
 
 class WebDiscoveryModuleTests(unittest.IsolatedAsyncioTestCase):
+    def test_discovery_profile_selects_subfinder_profile_without_changing_stages(self) -> None:
+        with TemporaryDirectory() as temporary:
+            manager = FakeExecutionManager(Path(temporary))
+            module = WebDiscoveryModule(manager, load_default_catalog())  # type: ignore[arg-type]
+            request = module._request(
+                module.get_profile("broad"), "01", (Target.parse("example.com"),),
+                project_id="P-0001", project_name="Example", scope_enforced=False,
+                timeout_seconds=None, proxy=None,
+            )
+
+        self.assertEqual(request.profile.name, "Broad passive")
+        with self.assertRaisesRegex(ScopeValidationError, "unknown Web Discovery profile"):
+            module.get_profile("missing")
+
     def test_scope_seeds_accept_domains_and_urls_but_not_regex(self) -> None:
         rules = (
             ScopeRule(

@@ -9,6 +9,7 @@ from app_config import AppConfig
 from nullbound_evidence import ProjectRunIngestor
 from nullbound_execution import ExecutionManager
 from dashboard_ui import build_ui
+from operator_settings import OperatorSettingsStore
 from recon_modules import FAVICON_SVG
 
 
@@ -19,12 +20,18 @@ def run(argv: list[str] | None = None) -> None:
         print(f"WARNING: {config.remote_access_warning}", file=sys.stderr)
 
     execution_manager = ExecutionManager(post_run_processor=ProjectRunIngestor())
+    settings_store = OperatorSettingsStore()
     execution_manager.recover_incomplete()
     print("Jacking in...", flush=True)
     app.on_startup(lambda: print("NullBound ready!", flush=True))
 
     ui.run(
-        root=partial(build_ui, app_config=config, execution_manager=execution_manager),
+        root=partial(
+            build_ui,
+            app_config=config,
+            execution_manager=execution_manager,
+            settings_store=settings_store,
+        ),
         title="NULL//BOUND",
         favicon=FAVICON_SVG,
         dark=True,

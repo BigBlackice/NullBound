@@ -61,15 +61,18 @@ class ExecutionManager:
 
     async def start(self, request: RunRequest, project_path: Path | None = None) -> RunManifest:
         adapter = self.adapters.get(request.module.adapter)
+        adapter.validate_proxy(request)
         executable = adapter.resolve_executable(request)
-        version = await adapter.version(executable)
+        version = await adapter.identify(request, executable)
         if adapter.version_required and not version:
             raise ExecutionError(
                 f"{request.module.bin} did not identify as the expected tool; "
                 "check the configured executable path and version"
             )
         run_id, run_path = self.store.reserve(project_path)
-        command = adapter.build_command(request, run_path, executable)
+        command = adapter.route_proxy(
+            request, adapter.build_command(request, run_path, executable)
+        )
         manifest = self.store.create(run_id, run_path, request, command, version)
         self._runs[run_id] = manifest
         self._commands[run_id] = command
@@ -100,7 +103,7 @@ class ExecutionManager:
         self._cancel_requested.add(run_id)
         process = self._processes.get(run_id)
         if process is not None and process.returncode is None:
-            self._terminate_process(process)
+            await self._terminate_process(process)
         task = self._tasks.get(run_id)
         if task is not None and process is None:
             self._transition(manifest, RunState.CANCELLED, finished_at=utc_now())
@@ -137,8 +140,12 @@ class ExecutionManager:
         """Resolve a configured binary and report whether its adapter accepts it."""
         try:
             adapter = self.adapters.get(request.module.adapter)
+            try:
+                adapter.validate_proxy(request)
+            except ExecutionError as error:
+                return ToolHealth("INCOMPATIBLE", detail=str(error))
             executable = adapter.resolve_executable(request)
-            version = await adapter.version(executable)
+            version = await adapter.identify(request, executable)
             if adapter.version_required and not version:
                 return ToolHealth(
                     "INCOMPATIBLE", executable, None,
@@ -147,6 +154,16 @@ class ExecutionManager:
             return ToolHealth("AVAILABLE", executable, version, "Executable is ready.")
         except (ExecutionError, OSError) as error:
             return ToolHealth("MISSING", detail=str(error))
+
+    def preview_command(
+        self, request: RunRequest, executable: str | None = None
+    ) -> CommandSpec:
+        adapter = self.adapters.get(request.module.adapter)
+        adapter.validate_proxy(request)
+        command = adapter.preview_command(
+            request, executable or adapter.resolve_executable(request)
+        )
+        return adapter.route_proxy(request, command)
 
     def recover_incomplete(self, project_paths: tuple[Path, ...] = ()) -> tuple[RunManifest, ...]:
         """Fail stale persisted runs without touching processes owned by this manager."""
@@ -413,7 +430,7 @@ class ExecutionManager:
     async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:
             return
-        self._terminate_process(process)
+        await self._terminate_process(process)
         try:
             await asyncio.wait_for(process.wait(), timeout=5)
         except TimeoutError:
@@ -561,11 +578,33 @@ class ExecutionManager:
                 pass
 
     @staticmethod
-    def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+        if os.name != "nt":
+            try:
+                if process.pid:
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+            return
+        if process.pid:
+            helper: asyncio.subprocess.Process | None = None
+            try:
+                # The wrapper-based adapters can own a scanner child process.
+                # taskkill closes that tree; terminate below remains the fallback.
+                helper = await asyncio.create_subprocess_exec(
+                    "taskkill.exe", "/PID", str(process.pid), "/T", "/F",
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                await asyncio.wait_for(helper.wait(), timeout=5)
+            except (OSError, TimeoutError):
+                if helper is not None and helper.returncode is None:
+                    helper.kill()
+                    await helper.wait()
+                pass
         try:
-            if os.name != "nt" and process.pid:
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
+            process.terminate()
         except ProcessLookupError:
             pass

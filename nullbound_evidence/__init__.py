@@ -35,7 +35,10 @@ from .parsers import (
     HttpxJsonlParser,
     JsonLinesEnvelopeParser,
     NmapXmlParser,
+    NucleiJsonlParser,
     ParserRegistry,
+    BrutepywebJsonlParser,
+    SqlmapTextParser,
     SubfinderJsonlParser,
     TlsxJsonlParser,
 )
@@ -51,7 +54,8 @@ __all__ = [
     "FfufJsonParser",
     "FindingRecord", "FindingSeverity", "FindingState", "IngestionResult",
     "GauJsonlParser", "HttpxJsonlParser", "JsonLinesEnvelopeParser", "NORMALIZATION_VERSION",
-    "NmapXmlParser", "NormalizedRecord", "ParsedFinding", "ParsedRecord", "ParserRegistry",
+    "NmapXmlParser", "NucleiJsonlParser", "BrutepywebJsonlParser", "SqlmapTextParser",
+    "NormalizedRecord", "ParsedFinding", "ParsedRecord", "ParserRegistry",
     "ProjectDatabase", "ProjectRunIngestor", "RelationshipRecord", "ScopeDisposition", "SubfinderJsonlParser",
     "TlsxJsonlParser", "UrlHostCorrelation", "normalize_record", "normalize_value", "stable_id",
 ]

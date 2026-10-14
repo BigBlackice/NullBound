@@ -51,7 +51,9 @@ PACKAGES_DIR="$TOOLS_ROOT/packages"
 DOWNLOADS_DIR="$TOOLS_ROOT/downloads"
 NMAP_PREFIX="$TOOLS_ROOT/nmap"
 
-TOOLS=(subfinder dnsx nmap httpx gau ffuf tlsx)
+NATIVE_TOOLS=(subfinder dnsx nmap httpx gau ffuf tlsx nuclei)
+SCRIPT_TOOLS=(sqlmap brutepyweb)
+TOOLS=("${NATIVE_TOOLS[@]}" "${SCRIPT_TOOLS[@]}")
 declare -A GO_PACKAGES=(
     [subfinder]='github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest'
     [dnsx]='github.com/projectdiscovery/dnsx/cmd/dnsx@latest'
@@ -59,6 +61,7 @@ declare -A GO_PACKAGES=(
     [gau]='github.com/lc/gau/v2/cmd/gau@latest'
     [ffuf]='github.com/ffuf/ffuf/v2@latest'
     [tlsx]='github.com/projectdiscovery/tlsx/cmd/tlsx@latest'
+    [nuclei]='github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest'
 )
 declare -A GITHUB_REPOSITORIES=(
     [subfinder]='projectdiscovery/subfinder'
@@ -67,6 +70,14 @@ declare -A GITHUB_REPOSITORIES=(
     [gau]='lc/gau'
     [ffuf]='ffuf/ffuf'
     [tlsx]='projectdiscovery/tlsx'
+    [nuclei]='projectdiscovery/nuclei'
+)
+declare -A SCRIPT_REPOSITORIES=(
+    [sqlmap]='https://github.com/sqlmapproject/sqlmap.git'
+)
+declare -A SCRIPT_FILES=(
+    [sqlmap]='sqlmap.py'
+    [brutepyweb]='webbruterv1.py'
 )
 declare -A CONFIGURED_PATHS=()
 
@@ -116,6 +127,7 @@ version_pattern() {
         gau) printf '%s\n' '(gau|v[0-9]+\.)' ;;
         ffuf) printf '%s\n' 'ffuf' ;;
         tlsx) printf '%s\n' 'tlsx' ;;
+        nuclei) printf '%s\n' 'nuclei' ;;
     esac
 }
 
@@ -138,8 +150,35 @@ healthy_executable() {
     [[ $status -eq 0 ]] && grep -Eqi "$pattern" <<<"$output"
 }
 
+healthy_script_tool() {
+    local name="$1" script="$PACKAGES_DIR/$1/${SCRIPT_FILES[$1]}" output status
+    if [[ "$name" == 'brutepyweb' ]]; then
+        script="$PROJECT_ROOT/recon_modules/brutepyweb/webbruterv1.py"
+    fi
+    [[ -f "$script" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    set +e
+    if [[ "$name" == 'sqlmap' ]]; then
+        output="$(python3 "$script" --version 2>&1)"; status=$?
+        set -e; [[ $status -eq 0 ]] && grep -Eqi 'sqlmap' <<<"$output"
+    else
+        output="$(python3 "$script" -h 2>&1)"; status=$?
+        set -e; [[ $status -eq 0 ]] && grep -Eqi 'password-file' <<<"$output"
+    fi
+}
+
 find_tool() {
     local name="$1"
+    if [[ "$name" == 'brutepyweb' || -n "${SCRIPT_REPOSITORIES[$name]:-}" ]]; then
+        if healthy_script_tool "$name"; then
+            if [[ "$name" == 'brutepyweb' ]]; then
+                printf '%s\n' "$PROJECT_ROOT/recon_modules/brutepyweb/webbruterv1.py"
+            else
+                printf '%s\n' "$PACKAGES_DIR/$name/${SCRIPT_FILES[$name]}"
+            fi
+        fi
+        return
+    fi
     local configured="${CONFIGURED_PATHS[$name]:-}"
     local candidate
     for candidate in \
@@ -157,6 +196,20 @@ find_tool() {
         return 0
     fi
     return 1
+}
+
+install_script_tool() {
+    local name="$1" target="$PACKAGES_DIR/$1" staging
+    command -v git >/dev/null 2>&1 || return 1
+    staging="$(mktemp -d "$PACKAGES_DIR/$name.XXXXXX")"
+    step "Installing $name from its upstream Git repository"
+    git clone --depth 1 "${SCRIPT_REPOSITORIES[$name]}" "$staging"
+    [[ -f "$staging/${SCRIPT_FILES[$name]}" ]] || return 1
+    if [[ -e "$target" ]]; then
+        case "$target" in "$PACKAGES_DIR/"*) rm -r -- "$target" ;; *) return 1 ;; esac
+    fi
+    mv -- "$staging" "$target"
+    healthy_script_tool "$name"
 }
 
 step 'Checking NullBound module executables'
@@ -406,9 +459,17 @@ for tool in "${TOOLS[@]}"; do
         warn 'Nmap is missing but was skipped.'
         continue
     fi
+    if [[ "$tool" == 'brutepyweb' ]]; then
+        if healthy_script_tool "$tool"; then
+            continue
+        fi
+        failed+=("$tool")
+        warn 'The bundled Brutepyweb baseline failed its health check.'
+        continue
+    fi
 
     installed=0
-    if manager_has_package "$tool"; then
+    if [[ -z "${SCRIPT_REPOSITORIES[$tool]:-}" ]] && manager_has_package "$tool"; then
         step "Installing $tool with $PACKAGE_MANAGER"
         if manager_install "$tool" && find_tool "$tool" >/dev/null; then
             installed=1
@@ -416,7 +477,12 @@ for tool in "${TOOLS[@]}"; do
             warn "$PACKAGE_MANAGER did not provide a compatible $tool executable."
         fi
     fi
-    if ((installed == 0)) && [[ "$tool" != 'nmap' ]]; then
+    if ((installed == 0)) && [[ -n "${SCRIPT_REPOSITORIES[$tool]:-}" ]]; then
+        if install_script_tool "$tool"; then
+            installed=1
+        fi
+    fi
+    if ((installed == 0)) && [[ "$tool" != 'nmap' && -z "${SCRIPT_REPOSITORIES[$tool]:-}" ]]; then
         if install_from_go "$tool" || install_from_github_release "$tool"; then
             installed=1
         fi

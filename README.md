@@ -16,6 +16,8 @@ requiring a paid proxy or hosted service.
 - Add domains, IP addresses, CIDRs, URLs, wildcards, or regular expressions to
   project scope.
 - Filter Runs, Assets, and Findings by in-scope or out-of-scope state.
+- Mark findings as candidate, validated, false positive, or accepted risk without
+  changing their preserved evidence.
 - Create and edit tool launchers and scan profiles from the application.
 - Run the project-only Web Discovery module to pass reviewed scope seeds through
   Subfinder, dnsx, and httpx while retaining each tool as a separate auditable run.
@@ -25,6 +27,11 @@ requiring a paid proxy or hosted service.
   directory discovery from an operator-selected wordlist.
 - Reopen project tabs automatically after restarting NullBound. Projects you close
   stay closed.
+- Choose Standard, Broad, or Recursive passive profiles for Web Discovery.
+- Launch safe Nuclei checks, low-impact sqlmap detection, or a capped CSRF-aware
+  Brutepyweb password test as separate operator-controlled attack runs.
+- Enforce an application proxy for compatible tools; incompatible launchers are
+  blocked instead of silently bypassing it.
 
 Scope is advisory by default. An explicit deny rule only blocks a matching launch
 when you enable scope enforcement.
@@ -40,9 +47,12 @@ when you enable scope enforcement.
 | gau | Known URL collection from public archives |
 | ffuf | Directory and file discovery |
 | tlsx | TLS and certificate inspection |
+| Nuclei | Safe-template vulnerability matching |
+| sqlmap | Low-impact SQL injection detection |
+| Brutepyweb | Capped CSRF-aware password response testing |
 
-These tools are separate programs. NullBound can detect existing installations or
-install them with the included setup scripts.
+Brutepyweb is bundled with NullBound. The other tools are separate programs that
+NullBound can detect or install with the included setup scripts.
 
 ## Quick start on Linux
 
@@ -136,10 +146,10 @@ subdomains should be enumerated. The recursive directory chain also requires a
 local FFUF wordlist and an explicit depth from 1 to 10. On Kali, NullBound reads
 `/usr/share/seclists/Discovery/Web-Content`, defaults to
 `raft-medium-directories.txt`, and exposes the other text lists in the FFUF
-wordlist dropdown. Every project also has a recursive `wordlists/` folder for
-operator-supplied directory, password, or other lists. Those files are offered
-after SecLists and become FFUF's fallback when SecLists is unavailable. A custom
-absolute path can still be entered.
+wordlist dropdown. Every project has separate `wordlists/web-content/` and
+`wordlists/passwords/` folders. Their project-relative locations can be changed
+under **Settings > General**. Kali SecLists remains available when installed;
+project files provide the fallback, and a custom absolute path can still be entered.
 
 After discovery has populated **Assets**, select **Web Enumeration** on Launchpad.
 Choose one scope item and a tool chain. NullBound expands that scope root through
@@ -157,6 +167,8 @@ records together. By default they are created under:
   project.db
   scope.json
   wordlists/
+    web-content/
+    passwords/
   runs/
     RUN-YYYYMMDD-HHMMSS-XXXXXX/
       run.json
@@ -172,6 +184,23 @@ files; `project.db` contains the searchable asset and evidence index.
 
 Open project tabs are remembered in `~/.nullbound/workspace.json`. Closing a
 project tab removes it from the next-start list without deleting the project.
+
+### Retention, backup, and cleanup
+
+NullBound does not automatically expire project runs, artifacts, findings, or
+assets. Back up a project by closing NullBound and copying its entire project
+directory. Copying the whole directory keeps the manifest, scope, wordlists, run
+artifacts, and SQLite database together; copying only `project.db` may miss an
+active SQLite WAL file.
+
+Project deletion is deliberately left to the operator's normal filesystem tools.
+Closing a project tab never deletes it. Runs made without a project are the one
+exception: they use a process-temporary directory and disappear when NullBound
+exits unless they are attached while creating a project.
+
+Open a project in only one NullBound process at a time. SQLite serializes database
+writes, but this release does not lock the project manifest, scope document, and
+run directories across multiple application processes.
 
 ## Scope behavior
 
@@ -201,6 +230,31 @@ used for classification and filtering rather than silently preventing work.
 - The Bash tool bootstrapper currently supports Linux only. The NullBound
   application can run on macOS, but scanner tools must be installed manually and
   made available on `PATH`.
+- Nuclei is restricted to HTTP templates and excludes templates tagged intrusive,
+  denial-of-service, fuzzing, or brute force in the included profiles.
+  sqlmap runs at level/risk 1 without extraction or takeover flags. Brutepyweb is
+  capped by default, preserves matched passwords in local logs and artifacts, and
+  compares status, size, redirect, URL, and configured success signals against
+  known-invalid controls. Repeatable differentials are recorded as validated;
+  unconfirmed differences remain candidates. Finding details mask passwords by
+  default and provide reveal and copy controls. Project databases, run logs, and
+  artifacts still contain the plaintext values and must be handled as sensitive data.
+
+Scanner executables are downloaded only when the operator runs a setup script and
+are not part of the NullBound source distribution. See
+[`THIRD_PARTY.md`](THIRD_PARTY.md) before redistributing a prepared tool directory.
+
+## Proxy routing
+
+Configure the application proxy under **Settings > Proxy**, then use the top-bar
+Proxy checkbox to enforce or disable it. NullBound passes the proxy explicitly to
+tools that support the selected HTTP or SOCKS5 protocol and clears inherited proxy
+environment variables when the checkbox is off. A run is blocked when its adapter
+cannot honor the selected proxy, which is common for DNS and raw-socket tools.
+
+Proxy authentication is intentionally not stored in this release, because proxy
+credentials would otherwise leak into command previews and run manifests. A custom
+CA certificate can be selected for HTTPS interception.
 
 ## Network access
 
@@ -222,7 +276,5 @@ Run the test suite with:
 ```bash
 python -m unittest discover -s tests -v
 ```
-Proxy enforcement is not yet implemented.
-
 Planned features and longer-term performance work are tracked in
 [`todo.md`](todo.md).

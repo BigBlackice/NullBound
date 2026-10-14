@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from nullbound_scope import ScopeStore
 
 from .models import AssetKind, IngestionResult, ParsedRecord
-from .parsers import ParserRegistry
+from .parsers import ParserRegistry, SqlmapTextParser
 from .pipeline import EvidencePipeline
 from .store import EvidenceStore
 
@@ -28,6 +28,8 @@ class ProjectRunIngestor:
         "gau": "gau.jsonl",
         "ffuf": "ffuf.json",
         "tlsx": "tlsx.jsonl",
+        "nuclei": "nuclei.jsonl",
+        "brutepyweb": "brutepyweb.jsonl",
     }
 
     def __init__(self, parsers: ParserRegistry | None = None) -> None:
@@ -38,7 +40,10 @@ class ProjectRunIngestor:
             return None
         module_key = manifest.module_bin.casefold()
         try:
-            parser = self.parsers.get(module_key)
+            parser = (
+                SqlmapTextParser(self._first_url(manifest))
+                if module_key == "sqlmap" else self.parsers.get(module_key)
+            )
         except KeyError:
             # Runtime-defined modules may not have an evidence parser yet. Their
             # raw artifact remains available and the scan itself is still valid.
@@ -47,6 +52,10 @@ class ProjectRunIngestor:
         if artifact is None and module_key != "subfinder":
             return None
         records = parser.parse(artifact, run_id=manifest.id) if artifact is not None else ()
+        findings = (
+            parser.parse_findings(artifact, run_id=manifest.id)
+            if artifact is not None and hasattr(parser, "parse_findings") else ()
+        )
         if artifact is not None:
             relative_artifact = artifact.relative_to(project_path).as_posix()
             records = tuple(replace(record, artifact_path=relative_artifact) for record in records)
@@ -61,7 +70,7 @@ class ProjectRunIngestor:
             ))
         pipeline = EvidencePipeline(EvidenceStore(project_path))
         result = pipeline.ingest(
-            records, scope=ScopeStore(project_path).load(), parser=parser.key,
+            records, findings=findings, scope=ScopeStore(project_path).load(), parser=parser.key,
             source=f"run:{manifest.id}",
         )
         return self._summary(result)
@@ -74,6 +83,9 @@ class ProjectRunIngestor:
             raise ValueError("project run is not stored under a project runs directory")
         project_path = run_path.parent.parent.resolve()
         artifact_root = (run_path / "artifacts").resolve()
+        if module_key == "sqlmap":
+            console = (run_path / "console.log").resolve()
+            return project_path, console if console.is_file() else None
         candidates: list[Path] = []
         for record in manifest.artifacts:
             candidate = (run_path / record.path).resolve()
@@ -84,6 +96,13 @@ class ProjectRunIngestor:
             if candidate.name.casefold() == self._ARTIFACT_NAMES.get(module_key, ""):
                 candidates.append(candidate)
         return project_path, candidates[0] if candidates else None
+
+    @staticmethod
+    def _first_url(manifest: "RunManifest") -> str:
+        for target in manifest.targets:
+            if target.get("kind") == "url":
+                return str(target.get("normalized") or "")
+        return ""
 
     @staticmethod
     def _summary(result: IngestionResult) -> dict[str, int]:

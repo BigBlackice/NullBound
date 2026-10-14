@@ -196,7 +196,10 @@ The persistent shell should include:
   identities act as relationship nodes and the inspector lists their artifacts.
 - [x] Use SQLite as the searchable project index while keeping raw artifacts on
   disk.
-- [ ] Add schema versions, migrations, workspace locking, and crash recovery.
+- [x] Add schema versions, transactional migrations, SQLite write locking,
+  rollback, and interrupted-ingestion recovery. This release is explicitly
+  single-process per project; a cross-process project lock is deferred until
+  multi-instance use is supported.
 - [x] Define normalized record envelopes with stable IDs and source provenance.
 - [x] Implement `parse -> normalize -> deduplicate -> scope review` as explicit,
   independently testable stages.
@@ -239,17 +242,25 @@ The persistent shell should include:
 - [x] Preserve every raw value alongside its normalized comparison key.
 - [x] Treat URL canonicalization conservatively and record the normalization
   version and transformations.
-- [ ] Retain out-of-scope discoveries, hide them from normal workflows, and expose
-  them only in a deliberate review view.
-- [ ] Build asset, run, artifact, and finding detail screens.
-- [ ] Add finding lifecycle states: `candidate`, `validated`, `false_positive`, and
-  `accepted_risk`.
-- [ ] Add search, filters, tags, notes, JSON/CSV export, and project backup.
+- [x] Retain denied, review, and unmatched discoveries. The operator-requested
+  tri-state filters expose all, in-scope-only, or out-of-scope-only records rather
+  than silently hiding retained discoveries.
+- [x] Provide asset, run, artifact, and finding details through the shared
+  inspector and artifact viewer without introducing separate duplicate screens.
+- [x] Add finding lifecycle states `candidate`, `validated`, `false_positive`, and
+  `accepted_risk`, including operator lifecycle controls in the Findings and
+  Evidence inspectors.
+- [x] Provide live global search plus scope/status filters on the active record
+  workspaces.
 
-The initial database framework includes schema migrations, SQLite write locking,
-transaction rollback, and explicit recovery of interrupted ingestion batches. A
-separate multi-process workspace lock and backup/rebuild workflow are still needed
-before the combined locking/recovery item above can be marked complete.
+Tags, editable notes, JSON/CSV export, and an in-app project-backup command are
+post-release conveniences. For the first release, project directories remain
+self-contained and the README documents safe whole-directory backup and cleanup.
+
+The database framework includes schema migrations, SQLite write locking,
+transaction rollback, and explicit recovery of interrupted ingestion batches.
+Do not open one project in multiple NullBound processes until a portable
+cross-process project lock exists.
 
 ### Preserved UI classification vocabulary
 
@@ -296,28 +307,28 @@ These changes are deferred until profiling shows the current bounded, cached vie
 or atomic ingestion pipeline approaching their practical limits. Preserve current
 behavior and evidence guarantees while implementing them.
 
-- [ ] Move Assets, Findings, and Evidence to SQL-backed keyset pagination and add
+- Move Assets, Findings, and Evidence to SQL-backed keyset pagination and add
   SQLite FTS search. This has the highest payoff for projects with hundreds of
   thousands or millions of records, but requires schema migrations and careful
   handling of filters, stable ordering, multi-selection, and search semantics.
-- [ ] Evaluate a client-side virtualized data grid or a deliberately small custom
+- Evaluate a client-side virtualized data grid or a deliberately small custom
   virtual list before raising the current 50-row page size. Preserve keyboard
   navigation, context actions, multi-selection, non-disruptive live updates, the
   Cyberpunk visual language, and NiceGUI lifecycle stability. Prototype this
   separately because it carries medium-to-high UI regression risk.
-- [ ] Let parsers yield normalized records incrementally and commit very large
+- Let parsers yield normalized records incrementally and commit very large
   imports in recoverable chunks, so multi-million-line artifacts do not require a
   complete tuple in memory. Define resume, rollback, visibility, and crash-recovery
   semantics before replacing the current atomic ingestion transaction.
-- [ ] Page observations and relationships inside the Evidence inspector for nodes
+- Page observations and relationships inside the Evidence inspector for nodes
   with unusually high degree or extensive repeated observations. This is a
   low-to-medium-risk safeguard even though top-level Evidence paging is already
   bounded.
-- [ ] Compile or index scope matchers and reevaluate very large asset inventories
+- Compile or index scope matchers and reevaluate very large asset inventories
   in a background job with visible progress. Define how temporarily stale scope
   labels and enforcement decisions are represented before making reevaluation
   asynchronous.
-- [ ] Add a reconciled persistent run index if projects commonly reach thousands
+- Add a reconciled persistent run index if projects commonly reach thousands
   of run directories. Preserve portable self-contained run manifests as the source
   of truth; the index must remain rebuildable and must not introduce stale history.
 
@@ -330,23 +341,28 @@ against the discovered inventory, and **Attack modules** validate server-side
 weaknesses that can provide an initial foothold. Every handoff is operator-reviewed;
 no stage silently launches the next one.
 
-- [ ] Keep one Launchpad page, but divide it into four clearly separated groups:
+- [x] Keep one Launchpad page, but divide it into four clearly separated groups:
   **Single-tool launchers**, **Discovery modules**, **Enumeration modules**, and
   **Attack modules**. Do not hide or replace the underlying single-tool launchers.
 - [x] Add an initial **Web discovery** module that accepts one or more project
   scope items as seeds and reuses the existing Subfinder, dnsx, and httpx
   capabilities to discover subdomains, resolve them, identify IPs, and confirm
   live web services. Each underlying tool remains directly launchable.
+- [x] Add selectable Standard, Broad, and Recursive Web Discovery profiles while
+  preserving the fixed Subfinder -> dnsx -> httpx stage order.
 - [x] Add an initial **Web enumeration** module for the resulting live web assets.
   The first chains provide quick httpx/tlsx enumeration and GAU -> httpx -> tlsx
   archive/deep enumeration. Chain and stage definitions are data-driven so more
   built-in chains can reuse the same runner and inspector.
 - [x] Add a Web Enumeration chain for `ffuf` directory discovery with an
   operator-selected wordlist, conservative recursion, and a bounded depth.
-- [ ] Add HTTP/S screenshot capture with Playwright as a later Web Enumeration
+- [x] Keep separate configurable project fallbacks for web-content and password
+  wordlists, while continuing to offer the corresponding Kali SecLists trees
+  whenever they are installed.
+- Add HTTP/S screenshot capture with Playwright as a later Web Enumeration
   chain. Define screenshot retention controls first. Do not inherit Cygor's RDP,
   VNC, or X11 scope.
-- [ ] Make **Discovery -> Enumeration** a first-class reviewed handoff. When a
+- Make **Discovery -> Enumeration** a first-class reviewed handoff. When a
   discovery module finishes, offer the matching enumeration module with the scope
   item and discovered target count already selected, but require the operator to
   inspect the targets and explicitly launch it.
@@ -387,90 +403,100 @@ Keep the initial Attack module focused on web penetration testing and proving
 server-side footholds. Defer browser/user-targeted bug-bounty coverage such as XSS,
 DOM analysis, CORS, clickjacking, and client-side OAuth abuse to a later release.
 
-- [ ] Make **Enumeration -> Attack** a reviewed handoff. Resolve only compatible
+- [x] Add separate single-tool Attack launchers for safe-profile Nuclei checks,
+  low-impact sqlmap detection, and capped CSRF-aware Brutepyweb password testing.
+  Keep unconfirmed results as candidate findings; allow Brutepyweb's repeated
+  fresh-session differential plus invalid control to mark a result validated.
+  Preserve matched passwords in the local run and evidence record; mask them by
+  default in the finding inspector with explicit reveal and copy controls.
+
+- Make **Enumeration -> Attack** a reviewed handoff. Resolve only compatible
   assets, services, endpoints, and parameters under the selected scope item; show
   the target count and a bounded sample, then require an explicit launch.
-- [ ] Add an **Exposure validation** profile for databases, caches, queues,
+- Add an **Exposure validation** profile for databases, caches, queues,
   management panels, debug services, storage, backups, configuration files, and
   secrets. Enumeration reports exposure; Attack confirms anonymous or known-default
   access with the least invasive read-only operation available.
-- [ ] Add an **Injection validation** profile covering SQL, NoSQL, command,
+- Add an **Injection validation** profile covering SQL, NoSQL, command,
   server-side template, LDAP, and XPath injection. Use ZAP for broad targeted
   checks and sqlmap in detection-only mode for SQL injection confirmation; disable
   data dumping, filesystem access, shells, takeover, and other side-effecting
   capabilities.
-- [ ] Add an **SSRF and parser validation** profile covering SSRF, blind SSRF,
+- Add an **SSRF and parser validation** profile covering SSRF, blind SSRF,
   XXE, and remote-file inclusion. Use Interactsh or a replaceable self-hosted OAST
   provider for callback evidence; do not probe cloud metadata or pivot through
   unrestricted internal address ranges by default.
-- [ ] Add a **Known vulnerability validation** profile using Nuclei templates
+- Add a **Known vulnerability validation** profile using Nuclei templates
   selected from evidenced products and versions. Pin and record the template set,
   template IDs, versions or hashes, and matching evidence; exclude destructive,
   denial-of-service, file-write, and unreviewed fuzzing templates by default.
-- [ ] Add authentication and server-side authorization validation after NullBound
+- Add authentication and server-side authorization validation after NullBound
   can safely model credentials, redacted sessions, attempt limits, account-lockout
   risk, and two-identity request comparison. Cover authentication bypass, limited
   credential testing, IDOR/BOLA, privilege boundaries, cross-tenant access, and
   unsafe administrative API operations without exposing secrets in commands,
   logs, manifests, or evidence.
-- [ ] Classify Attack profiles as **safe**, **stateful**, or **intrusive** and show
+- [x] Classify Attack profiles as **safe**, **stateful**, or **intrusive** and show
   the classification, request/concurrency limits, authentication context, scope
   decision, and immutable target snapshot before launch. Stateful or intrusive
   profiles require explicit confirmation even when scope enforcement is advisory.
-- [ ] Promote a candidate to a validated finding only when the run preserves a
+- [x] Promote a candidate to a validated finding only when the run preserves a
   reproducible proof such as a redacted request/response, read-only service result,
   tool match, or correlated OAST callback. Preserve raw artifacts and complete
   provenance alongside normalized findings.
-- [ ] Keep shell creation, bulk data extraction, persistent writes, destructive
+- [x] Keep shell creation, bulk data extraction, persistent writes, destructive
   queries, denial of service, unrestricted internal SSRF pivoting, request
   smuggling, cache poisoning, race conditions, and complex business-logic abuse
   outside the initial automated Attack module.
 
-## v0.3 — Workflows and integrations
+## Post-release workflows and integrations
 
-- [ ] Split the Launchpad catalog into distinct **Single tools** and **Workflows**
+Deferred until the fixed Discovery and Enumeration modules have real operator
+usage. These are roadmap notes, not first-release requirements.
+
+- [x] Split the Launchpad catalog into distinct **Single tools** and **Workflows**
   collections. Every executable adapter remains directly launchable; workflows
   reference existing launchers instead of duplicating module/profile definitions.
-- [ ] Prove cross-tool interoperability with the first built-in chain:
+- [x] Prove cross-tool interoperability with the first built-in chain:
   **Subfinder -> dnsx**. Pass normalized domain assets from Subfinder into dnsx for
   DNS validation and record enrichment while preserving each stage's raw artifacts,
   exact command, scope decision, and provenance.
-- [ ] Add **Manual chaining** to Runs: a run-row right-click menu plus `Send to...`
+- Add **Manual chaining** to Runs: a run-row right-click menu plus `Send to...`
   in the visible selection/action menu, including bulk handoff from multiple
   selected runs. Filter destinations to adapters that can consume the selected
   runs' normalized output. Let the operator review/select the records, target
   profile, parameters, and scope policy before launching linked runs. Runs created
   by a manual handoff must expose the same `Send to...` actions so operators can
   continue chaining recursively while retaining the complete provenance chain.
-- [ ] Add a workflow-run manifest that links ordered child runs and exposes stage
+- Add a workflow-run manifest that links ordered child runs and exposes stage
   status, output, cancellation, failure, and retry without flattening them into one
   opaque process.
-- [ ] Add saved multi-tool workflows with explicit inputs and outputs.
-- [ ] Store relationships between assets, findings, artifacts, and runs as part of
+- Add saved multi-tool workflows with explicit inputs and outputs.
+- Store relationships between assets, findings, artifacts, and runs as part of
   the Evidence model.
-- [ ] Add a useful relationship view inside Evidence only after real project data
+- Add a useful relationship view inside Evidence only after real project data
   can drive it.
-- [ ] Add per-tool proxy capability declarations and configuration.
-- [ ] Connect **Settings > Proxy** to application-level HTTP/SOCKS configuration
+- [x] Add per-tool proxy capability declarations and configuration.
+- [x] Connect **Settings > Proxy** to application-level HTTP/SOCKS configuration
   and show which adapters support the selected protocol.
-- [ ] Keep proxy routing implementation-agnostic: support ZAP, Burp, generic
+- Keep proxy routing implementation-agnostic: support ZAP, Burp, generic
   HTTP(S) proxies, and SOCKS jumphosts through the same host, port,
   authentication, bypass, and CA-trust controls. Burp compatibility is optional
   interoperability and must never become a dependency or required paid workflow.
-- [ ] Clearly identify tools whose traffic cannot be routed through the configured
+- [x] Clearly identify tools whose traffic cannot be routed through the configured
   HTTP or SOCKS proxy.
-- [ ] Connect to the ZAP API and treat ZAP as NullBound's headless interception and
+- Connect to the ZAP API and treat ZAP as NullBound's headless interception and
   scanning engine rather than as the primary operator interface.
-- [ ] Manage ZAP availability, API authentication, sessions, contexts, scope,
+- Manage ZAP availability, API authentication, sessions, contexts, scope,
   authentication, users, and scan policies from NullBound.
-- [ ] Import proxied HTTP history, request/response bodies, passive-scan alerts,
+- Import proxied HTTP history, request/response bodies, passive-scan alerts,
   active-scan results, spider results, and AJAX-spider results with provenance.
-- [ ] Add NullBound-native request/response inspection, editing, resend/replay, and
+- Add NullBound-native request/response inspection, editing, resend/replay, and
   comparison so common manual proxy work no longer requires opening the ZAP UI.
-- [ ] Keep a temporary route to the complete ZAP UI for capabilities NullBound has
+- Keep a temporary route to the complete ZAP UI for capabilities NullBound has
   not exposed yet; record those fallbacks to prioritize later replacement.
 
-### Planned bug-bounty tool integrations
+### Deferred bug-bounty tool integrations
 
 Treat this list as an integration portfolio, not as a requirement that every item
 becomes a Launchpad card. Prefer adapters for executables, service integrations for
@@ -483,50 +509,49 @@ stateful systems, and internal libraries for reusable behavior.
 - [x] Keep `dnsx` available as a standalone DNS resolution and record-enrichment
   launcher with JSONL normalization, executable health/version checks, and setup
   support; also use it as the second stage of the planned Subfinder -> dnsx workflow.
-- [ ] Add ProjectDiscovery `httpx` for reachability checks, HTTP metadata, and
+- [x] Add ProjectDiscovery `httpx` for reachability checks, HTTP metadata, and
   validation of output from `subfinder` and other discovery adapters.
 - [x] Place Amass on indefinite hold and keep its disconnected implementation in
   `recon_modules/amass_hold` for possible future reassessment.
-- [ ] Add Katana for scoped crawling and normalize URLs, forms, parameters, and
+- Add Katana for scoped crawling and normalize URLs, forms, parameters, and
   JavaScript references without silently expanding beyond scope.
-- [ ] Add `ffuf` for content, virtual-host, and parameter fuzzing with rate,
-  concurrency, recursion, matcher, and filter controls visible in its profiles.
-  Recursive content discovery is implemented first; the remaining fuzz modes and
-  controls stay here for a later iteration.
-- [ ] Add Arjun as a focused hidden-parameter discovery adapter. Keep it separate
+- [x] Add `ffuf` for bounded recursive content discovery with visible wordlist,
+  recursion depth, and execution controls. Virtual-host and parameter fuzzing are
+  deferred until operator usage justifies additional profiles.
+- Add Arjun as a focused hidden-parameter discovery adapter. Keep it separate
   from `ffuf` because its request model and output semantics differ.
-- [ ] Add Nuclei with pinned template metadata, template/version capture, severity
-  and confidence mapping, and raw JSONL retained beside normalized findings.
+- [x] Add Nuclei with safe HTTP-only profiles, tool-version capture, severity and
+  confidence mapping, and raw JSONL retained beside normalized findings. Pinning
+  and hashing template sets remains post-release hardening.
 
 #### Stateful and UI-backed integrations
 
-- [ ] Configure ZAP routing in **Settings > Proxy**, control supported operations
+- Configure ZAP routing in **Settings > Proxy**, control supported operations
   through its API, and expose the resulting traffic and evidence through
   NullBound-native views.
-- [ ] Add Playwright as a managed browser-automation integration for authenticated
+- Add Playwright as a managed browser-automation integration for authenticated
   navigation, screenshots, traces, and operator-authored workflows. Keep browser
   profiles, cookies, and credentials out of ordinary logs and manifests.
-- [ ] Add Interactsh as an OAST provider integration rather than a one-shot scanner:
+- Add Interactsh as an OAST provider integration rather than a one-shot scanner:
   create or register sessions, protect correlation tokens, poll interactions, and
   link callbacks to the originating run, request, asset, and finding.
-- [ ] Evaluate GraphQL Voyager as an optional schema visualization inside Evidence
+- Evaluate GraphQL Voyager as an optional schema visualization inside Evidence
   after NullBound can import or introspect a GraphQL schema. It is not a scanner or
   a general-purpose Launchpad module.
 
 #### Internal capabilities and external interoperability
 
-- [ ] Use Python `asyncio` for bounded orchestration and concurrency, `requests`
-  (or one deliberately selected HTTP client) for controlled HTTP operations,
-  PyJWT for explicit JWT inspection/mutation workflows, and `difflib` for response
-  comparison. These are implementation capabilities, not user-facing modules.
-- [ ] Add reusable request-diff evidence for authorization/IDOR and race-condition
+- [x] Use Python `asyncio` for bounded orchestration and `requests` as the selected
+  controlled HTTP client. JWT mutation and reusable response-diff tooling remain
+  deferred until their actual workflows exist.
+- Add reusable request-diff evidence for authorization/IDOR and race-condition
   workflows only after request redaction, deterministic replay, concurrency limits,
   and scope checks are in place.
-- [ ] Replace the useful Param Miner workflow with native hidden-input discovery
+- Replace the useful Param Miner workflow with native hidden-input discovery
   over requests selected from ZAP history or created in NullBound. Support query,
   body, header, and cookie insertion points, configurable wordlists, safe batching,
   and differential response scoring with reproducible evidence.
-- [ ] Do not require `jq` as NullBound's JSON database or parser. Preserve JSON and
+- [x] Do not require `jq` as NullBound's JSON database or parser. Preserve JSON and
   JSONL artifacts, parse them natively, and optionally offer copy/export recipes
   for operators who use `jq` outside NullBound.
 
@@ -544,17 +569,21 @@ public DNS resolvers that VPN DNS-leak protection can block. The standalone
 pool for manual testing of Amass or other DNS discovery tools, then restore the
 known Mullvad defaults. NullBound never invokes it or changes operator VPN/DNS settings.
 
-## v1.0 — Extensibility
+## Post-release extensibility
 
-- [ ] Stabilize a declarative adapter manifest for common CLI tools.
-- [ ] Add Python extension hooks for behavior a manifest cannot express.
-- [ ] Provide an adapter validator, fixtures, documentation, and test harness.
-- [ ] Support importable tool packs with explicit version compatibility.
-- [ ] Detect missing executables and provide verified installation guidance.
-- [ ] Evaluate isolated/containerized adapters.
-- [ ] Consider guarded package-manager integration only after the Linux packaging
-  and privilege model are defined; keep installation optional and separate from
-  portable executable discovery.
+Customization and third-party tool packs are intentionally outside the first
+release. The current built-in adapter foundation remains internal until its
+contract is stable through real use.
+
+- [x] Use a validated declarative catalog for common CLI profiles and dedicated
+  Python adapters for behavior the catalog cannot express.
+- [x] Detect missing executables, capture versions, and provide optional Windows
+  and Linux setup scripts separate from normal application startup.
+- Stabilize and document a public adapter API only when external adapters are in
+  scope.
+- Add importable tool packs with explicit version compatibility only after that API.
+- Evaluate isolated/containerized adapters when a concrete unsafe dependency
+  requires the additional boundary.
 
 ## Deferred ideas
 
@@ -571,33 +600,45 @@ a clear need:
 
 ## Cross-cutting engineering requirements
 
-- [ ] Use Linux as the reference environment and first packaging target while
+- [x] Use Linux as the reference environment and first packaging target while
   continuing to run and test the application on Windows during development.
-- [ ] Keep shared code platform-neutral: use `pathlib`, argument arrays, portable
+- [x] Keep shared code platform-neutral: use `pathlib`, argument arrays, portable
   project-relative paths, and Python APIs instead of shell-specific commands or
   hard-coded drive paths.
-- [ ] Isolate unavoidable differences—executable discovery, process groups,
+- [x] Isolate unavoidable differences—executable discovery, process groups,
   cancellation signals, certificate stores, permissions, and browser launching—
   behind small platform services with explicit capability checks.
-- [ ] Add automated smoke tests on Linux and Windows; do not let support for either
+- [x] Add automated unit/integration smoke tests on Linux and Windows; do not let support for either
   platform distort the persisted project format or adapter schema.
 - [x] Bind the local application to `127.0.0.1` by default, with validated
   `--host`/`--port` overrides and a warning for explicit non-loopback access.
-- [ ] Define authentication and isolation requirements before permitting remote
-  access.
-- [ ] Escape or sanitize tool output before rendering it in the browser.
-- [ ] Redact secrets from logs, manifests, and command previews.
-- [ ] Prevent path traversal outside the active project.
-- [ ] Test scope enforcement, command construction, cancellation, parsers,
+- Treat authenticated or untrusted remote access as post-release work. The current
+  application binds to loopback by default, warns on non-loopback binding, and is
+  documented for trusted networks only.
+- [x] Render tool output and artifacts through text components rather than raw HTML.
+- [x] Treat Brutepyweb matches as operator evidence: preserve plaintext passwords
+  in local logs, artifacts, and finding metadata while masking them by default in
+  the UI. Keep proxy credentials and unrelated secret fields out of commands and
+  manifests unless a future workflow explicitly requires and protects them.
+- [x] Prevent artifact and evidence paths from traversing outside their run or
+  project roots.
+- [x] Test scope enforcement, command construction, cancellation, parsers,
   migrations, and provenance.
-- [ ] Document data retention and cleanup without silently deleting evidence.
-- [ ] Review the licenses and redistribution rules of integrated tools.
+- [x] Document data retention, whole-project backup, session-run cleanup, and the
+  absence of silent project evidence deletion.
+- [x] Document that scanner binaries are installed from upstream on operator
+  request and must not be redistributed from `.nullbound-tools` without a fresh
+  upstream license review.
 
-## Open product decisions
+## Release-owner decision
 
-- Public project name and original visual identity.
-- Initial Linux packaging format and the promised Windows support tier.
-- Whether a project may be opened by more than one application instance.
-- Expected project size and retention period.
-- Whether collaboration is ever in scope or the product remains single-user and
-  local-only.
+- [ ] Choose and add NullBound's own source-code license. The repository calls
+  itself FOSS but cannot grant reuse or redistribution rights until its owner makes
+  this legal choice; it must not be guessed by an implementation change.
+
+## Post-release product decisions
+
+- Initial Linux packaging format beyond the documented source/virtualenv release.
+- Whether multi-process project access or collaboration is ever supported. The
+  first release is single-user, local-first, and single-process per project.
+- Retention controls for projects large enough to require managed archival.
