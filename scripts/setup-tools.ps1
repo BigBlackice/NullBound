@@ -44,6 +44,7 @@ $VersionChecks = @{
     ffuf  = @{ Arguments = @('-V'); Pattern = '(?i)ffuf' }
     tlsx  = @{ Arguments = @('-version'); Pattern = '(?i)tlsx' }
     nuclei = @{ Arguments = @('-version'); Pattern = '(?i)nuclei' }
+    sqlmap = @{ Arguments = @('--version'); Pattern = '(?i)sqlmap' }
 }
 
 $PythonTools = @{
@@ -105,6 +106,18 @@ function Find-ToolExecutable {
         [string]$ConfiguredPath
     )
 
+    $resolvedToolsRoot = [System.IO.Path]::GetFullPath($ToolsRoot).TrimEnd('\') + '\'
+    $commands = Get-Command "$Name.exe" -CommandType Application -All -ErrorAction SilentlyContinue
+    foreach ($command in $commands) {
+        $source = [System.IO.Path]::GetFullPath($command.Source)
+        if (
+            -not $source.StartsWith($resolvedToolsRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+            (Test-ToolExecutable -Name $Name -Path $source)
+        ) {
+            return $source
+        }
+    }
+
     $localCandidates = @(
         (Join-Path $BinPath "$Name.exe"),
         (Join-Path $NmapPath "$Name.exe")
@@ -133,17 +146,16 @@ function Find-ToolExecutable {
         }
     }
 
-    $command = Get-Command "$Name.exe" -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($command -and (Test-ToolExecutable -Name $Name -Path $command.Source)) {
-        return $command.Source
-    }
     return $null
 }
 
 function Find-PythonTool {
     param([Parameter(Mandatory = $true)][string]$Name)
     $definition = $PythonTools[$Name]
+    if (-not $definition.ContainsKey('Bundled')) {
+        $pathExecutable = Find-ToolExecutable -Name $Name -ConfiguredPath $null
+        if ($pathExecutable) { return $pathExecutable }
+    }
     $script = if ($definition.ContainsKey('Bundled')) {
         Join-Path $ProjectRoot $definition.Bundled
     } else {
@@ -399,7 +411,7 @@ function Add-ToolDirectoriesToPath {
     $processEntries = @($env:Path -split ';' | Where-Object { $_ })
     foreach ($directory in $directoriesToAdd) {
         if ($processEntries -notcontains $directory) {
-            $processEntries = @($directory) + $processEntries
+            $processEntries += $directory
         }
     }
     $env:Path = $processEntries -join ';'

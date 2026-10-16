@@ -112,7 +112,7 @@ fi
 
 version_arguments() {
     case "$1" in
-        nmap|gau) printf '%s\n' '--version' ;;
+        nmap|gau|sqlmap) printf '%s\n' '--version' ;;
         ffuf) printf '%s\n' '-V' ;;
         *) printf '%s\n' '-version' ;;
     esac
@@ -128,6 +128,7 @@ version_pattern() {
         ffuf) printf '%s\n' 'ffuf' ;;
         tlsx) printf '%s\n' 'tlsx' ;;
         nuclei) printf '%s\n' 'nuclei' ;;
+        sqlmap) printf '%s\n' 'sqlmap' ;;
     esac
 }
 
@@ -169,18 +170,30 @@ healthy_script_tool() {
 
 find_tool() {
     local name="$1"
-    if [[ "$name" == 'brutepyweb' || -n "${SCRIPT_REPOSITORIES[$name]:-}" ]]; then
+    if [[ "$name" == 'brutepyweb' ]]; then
         if healthy_script_tool "$name"; then
-            if [[ "$name" == 'brutepyweb' ]]; then
-                printf '%s\n' "$PROJECT_ROOT/recon_modules/brutepyweb/webbruterv1.py"
-            else
-                printf '%s\n' "$PACKAGES_DIR/$name/${SCRIPT_FILES[$name]}"
-            fi
+            printf '%s\n' "$PROJECT_ROOT/recon_modules/brutepyweb/webbruterv1.py"
         fi
         return
     fi
-    local configured="${CONFIGURED_PATHS[$name]:-}"
-    local candidate
+    local configured="${CONFIGURED_PATHS[$name]:-}" candidate directory
+    while IFS= read -r directory; do
+        [[ -n "$directory" ]] || continue
+        case "$directory" in
+            "$BIN_DIR"|"$NMAP_PREFIX/bin") continue ;;
+        esac
+        candidate="$directory/$name"
+        if healthy_executable "$name" "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(printf '%s' "$PATH" | tr ':' '\n')
+    if [[ -n "${SCRIPT_REPOSITORIES[$name]:-}" ]]; then
+        if healthy_script_tool "$name"; then
+            printf '%s\n' "$PACKAGES_DIR/$name/${SCRIPT_FILES[$name]}"
+        fi
+        return
+    fi
     for candidate in \
         "$BIN_DIR/$name" \
         "$NMAP_PREFIX/bin/$name" \
@@ -190,11 +203,6 @@ find_tool() {
             return 0
         fi
     done
-    candidate="$(command -v "$name" 2>/dev/null || true)"
-    if [[ -n "$candidate" ]] && healthy_executable "$name" "$candidate"; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
     return 1
 }
 
@@ -233,7 +241,7 @@ if ((CHECK_ONLY)); then
 fi
 
 mkdir -p -- "$BIN_DIR" "$PACKAGES_DIR" "$DOWNLOADS_DIR"
-export PATH="$BIN_DIR:$NMAP_PREFIX/bin:$PATH"
+export PATH="$PATH:$BIN_DIR:$NMAP_PREFIX/bin"
 
 PACKAGE_MANAGER=''
 if command -v apt-get >/dev/null 2>&1; then
@@ -500,7 +508,7 @@ done
 
 if ((PERSIST_PATH)); then
     profile_path="${NULLBOUND_SHELL_PROFILE:-$HOME/.profile}"
-    path_line="export PATH=\"$BIN_DIR:$NMAP_PREFIX/bin:\$PATH\" # NullBound tools"
+    path_line="export PATH=\"\$PATH:$BIN_DIR:$NMAP_PREFIX/bin\" # NullBound tools"
     if [[ ! -f "$profile_path" ]] || ! grep -Fqx "$path_line" "$profile_path"; then
         printf '\n%s\n' "$path_line" >> "$profile_path"
     fi

@@ -22,6 +22,29 @@ SECLISTS_WEB_CONTENT_ROOT = Path("/usr/share/seclists/Discovery/Web-Content")
 SECLISTS_PASSWORD_ROOT = Path("/usr/share/seclists/Passwords")
 DEFAULT_FFUF_WORDLIST = "raft-medium-directories.txt"
 DEFAULT_PASSWORD_WORDLIST = "10-million-password-list-top-10000.txt"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_TOOLS_ROOT = PROJECT_ROOT / ".nullbound-tools"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _which_outside_local_tools(command: str) -> str | None:
+    path_entries = (
+        entry.strip('"')
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry
+    )
+    system_path = os.pathsep.join(
+        entry for entry in path_entries
+        if not _is_within(Path(entry), LOCAL_TOOLS_ROOT)
+    )
+    return shutil.which(command, path=system_path)
 
 
 def _discover_wordlists(
@@ -123,12 +146,16 @@ class ToolAdapter(ABC):
         has_path = Path(configured).is_absolute() or any(x in configured for x in ("/", "\\"))
         if has_path:
             path = Path(configured).expanduser().resolve(strict=False)
+            if _is_within(path, LOCAL_TOOLS_ROOT):
+                system_executable = _which_outside_local_tools(request.module.bin)
+                if system_executable:
+                    return system_executable
             if not path.is_file():
                 raise ExecutionError(f"executable does not exist: {path}")
             if not os.access(path, os.X_OK):
                 raise ExecutionError(f"executable is not runnable: {path}")
             return str(path)
-        resolved = shutil.which(configured)
+        resolved = _which_outside_local_tools(configured) or shutil.which(configured)
         if not resolved:
             raise ExecutionError(f"{request.module.bin} is unavailable; configure its executable path")
         return resolved
@@ -514,6 +541,17 @@ class SqlmapAdapter(PythonScriptAdapter):
     proxy_protocols = ("http",)
     proxy_argument = "--proxy"
 
+    def resolve_executable(self, request: RunRequest) -> str:
+        return _which_outside_local_tools(request.module.bin) or super().resolve_executable(request)
+
+    def version_arguments(self) -> tuple[str, ...]:
+        return self.version_flags
+
+    async def identify(self, request: RunRequest, executable: str) -> str | None:
+        if Path(executable).resolve(strict=False) != Path(sys.executable).resolve(strict=False):
+            return await self.version(executable)
+        return await super().identify(request, executable)
+
     def build_command(self, request: RunRequest, run_path: Path, executable: str) -> CommandSpec:
         targets = request.context.selection.targets
         if len(targets) != 1 or targets[0].kind is not TargetKind.URL:
@@ -523,9 +561,14 @@ class SqlmapAdapter(PythonScriptAdapter):
         )
         arguments = (*arguments, *self._option_arguments(request))
         output = run_path / "artifacts" / "sqlmap"
+        script = (
+            (str(self.script_path(request)),)
+            if Path(executable).resolve(strict=False) == Path(sys.executable).resolve(strict=False)
+            else ()
+        )
         return CommandSpec(
             executable,
-            (str(self.script_path(request)), *arguments, "--output-dir", str(output)),
+            (*script, *arguments, "--output-dir", str(output)),
             "text",
         )
 

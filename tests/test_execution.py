@@ -367,6 +367,61 @@ class AdapterTests(unittest.TestCase):
                 with self.assertRaisesRegex(ExecutionError, "not runnable"):
                     DeclarativeAdapter().resolve_executable(request)
 
+    def test_local_tool_path_falls_back_to_system_path(self) -> None:
+        original = request_for("print('unused')")
+        module = ModuleDefinition.from_mapping({
+            **original.module.to_mapping(),
+            "bin": "probe",
+            "path": str(Path(__file__).parents[1] / ".nullbound-tools" / "bin" / "probe"),
+            "adapter": "declarative",
+            "profiles": [{"name": "Default", "arguments": ["{targets}"]}],
+        })
+        request = RunRequest(module, module.default_profile, original.context)
+
+        with patch("nullbound_execution.adapters._which_outside_local_tools", return_value="/usr/bin/probe"):
+            self.assertEqual(DeclarativeAdapter().resolve_executable(request), "/usr/bin/probe")
+
+    def test_sqlmap_uses_path_executable_without_python_script_prefix(self) -> None:
+        module = load_default_catalog().get("09")
+        request = RunRequest(
+            module, module.default_profile,
+            ExecutionContext(selection=TargetSelection.direct((
+                Target.parse("https://example.com/?id=1"),
+            ))),
+        )
+        adapter = AdapterRegistry().get("sqlmap")
+
+        with patch("nullbound_execution.adapters._which_outside_local_tools", return_value="/usr/bin/sqlmap"):
+            executable = adapter.resolve_executable(request)
+            command = adapter.build_command(request, Path("run"), executable)
+
+        self.assertEqual(executable, "/usr/bin/sqlmap")
+        self.assertEqual(command.executable, executable)
+        self.assertNotIn("sqlmap.py", command.arguments)
+        self.assertIn("--output-dir", command.arguments)
+
+    def test_sqlmap_uses_local_script_only_when_path_has_no_executable(self) -> None:
+        with TemporaryDirectory() as directory:
+            script = Path(directory) / "sqlmap.py"
+            script.write_text("print('sqlmap')\n", encoding="utf-8")
+            payload = load_default_catalog().get("09").to_mapping()
+            payload["path"] = str(script)
+            module = ModuleDefinition.from_mapping(payload)
+            request = RunRequest(
+                module, module.default_profile,
+                ExecutionContext(selection=TargetSelection.direct((
+                    Target.parse("https://example.com/?id=1"),
+                ))),
+            )
+            adapter = AdapterRegistry().get("sqlmap")
+
+            with patch("nullbound_execution.adapters._which_outside_local_tools", return_value=None):
+                executable = adapter.resolve_executable(request)
+                command = adapter.build_command(request, Path(directory) / "run", executable)
+
+        self.assertEqual(executable, sys.executable)
+        self.assertEqual(command.arguments[0], str(script.resolve()))
+
     def test_httpx_version_parser_skips_the_ascii_banner(self) -> None:
         version = HttpxAdapter().parse_version([
             "    __    __  __       _  __",
@@ -396,6 +451,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("projectdiscovery/nuclei", linux_setup)
         self.assertIn("recon_modules/brutepyweb/webbruterv1.py", linux_setup)
         self.assertNotIn("BigBlackice/brutepyweb", linux_setup)
+        self.assertIn('export PATH="$PATH:$BIN_DIR:$NMAP_PREFIX/bin"', linux_setup)
         self.assertNotIn("owasp-amass/amass", setup_script)
 
     def test_brutepyweb_baseline_is_tracked_in_the_module_tree(self) -> None:
